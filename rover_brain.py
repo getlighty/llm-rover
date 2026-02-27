@@ -49,7 +49,7 @@ if os.path.exists(_env_file):
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-3.1-pro-preview"
-GEMINI_LIVE_MODEL = "gemini-2.0-flash-live-001"
+GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 GEMINI_TTS_VOICE = "Puck"  # Puck=male, Kore=female, Enceladus=male alt
 GEMINI_TTS_VOICE_MAP = {"troy": "Puck", "hannah": "Kore", "austin": "Enceladus"}
@@ -4000,6 +4000,10 @@ def main():
             model=GEMINI_LIVE_MODEL,
             tool_dispatch_fn=xai_tool_dispatch,
             result_queue=llm_result_queue,
+            playback_device=USB_PLAYBACK,
+            voice=GEMINI_TTS_VOICE,
+            mic_mute_fn=voice._mic_mute if voice else None,
+            mic_unmute_fn=voice._mic_unmute if voice else None,
         )
         gemini_live.start()
         print(f"[gemini-live] WebSocket client started ({GEMINI_LIVE_MODEL})")
