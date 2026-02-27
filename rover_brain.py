@@ -3915,8 +3915,23 @@ def main():
         """Dispatch xAI function tool calls to rover hardware/logic. Returns JSON string."""
         try:
             if fn_name == "send_rover_commands":
-                cmds = args.get("commands", [])
+                raw_cmds = args.get("commands", [])
                 dur = args.get("duration", 0)
+                # Normalize commands: Gemini sometimes sends strings or dicts with quoted keys
+                cmds = []
+                for c in raw_cmds:
+                    if isinstance(c, str):
+                        try:
+                            c = json.loads(c)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                    if isinstance(c, dict):
+                        # Fix quoted keys: {"\"T\"": 133} -> {"T": 133}
+                        fixed = {}
+                        for k, v in c.items():
+                            clean_k = k.strip('"')
+                            fixed[clean_k] = v
+                        cmds.append(fixed)
                 parsed = {"commands": cmds, "speak": "", "duration": dur}
                 execute_response(parsed, source="xai")
                 return json.dumps({"status": "ok", "commands_sent": len(cmds)})
@@ -4049,6 +4064,8 @@ def main():
                 if gemini_live and gemini_live.is_connected:
                     gemini_live.send_text(user_input)
                     print(f"[llm-thread] → Gemini Live (WebSocket)")
+                    # Signal main loop: handled via Live (audio plays directly)
+                    llm_result_queue.put("__LIVE__")
                     llm_busy = False
                     continue
 
@@ -4060,6 +4077,7 @@ def main():
                     if gemini_live.is_connected:
                         gemini_live.send_text(user_input)
                         print(f"[llm-thread] → Gemini Live (reconnected)")
+                        llm_result_queue.put("__LIVE__")
                         llm_busy = False
                         continue
 
@@ -4167,6 +4185,8 @@ def main():
             while not llm_result_queue.empty():
                 try:
                     raw = llm_result_queue.get_nowait()
+                    if raw == "__LIVE__":
+                        continue  # Gemini Live handled via audio
                     parsed = parse_llm_response(raw)
                     if parsed:
                         execute_response(parsed)
@@ -4377,7 +4397,11 @@ def main():
                 # Check for LLM response
                 try:
                     raw = llm_result_queue.get(timeout=0.3)
-                    pass  # no terminal clearing needed under journald
+                    # Gemini Live handled it — audio plays directly, skip parse
+                    if raw == "__LIVE__":
+                        print("[gemini-live] Response via audio")
+                        got_response = True
+                        break
                     parsed = parse_llm_response(raw)
                     if parsed:
                         # Silent response = LLM ignoring noise

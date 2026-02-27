@@ -254,6 +254,9 @@ class GeminiLiveClient:
         self._connected = False
         self._connected_since = 0
 
+        # Startup greeting
+        self._greet_pending = True
+
         # Audio playback
         self._aplay_proc = None
         self._aplay_stdin = None
@@ -407,6 +410,21 @@ class GeminiLiveClient:
             else:
                 log.warning(f"Expected setupComplete, got: {list(msg.keys())}")
                 return
+
+            # Send startup greeting on first connect only
+            if self._greet_pending:
+                greeting = {
+                    "client_content": {
+                        "turns": [{"role": "user", "parts": [
+                            {"text": "[System: you just booted up. Say hello briefly.]"}
+                        ]}],
+                        "turn_complete": True,
+                    }
+                }
+                await ws.send(json.dumps(greeting))
+                self._messages_sent += 1
+                self._greet_pending = False
+                log.info("[tx] Sent startup greeting")
 
             # Create async send queue
             send_queue = asyncio.Queue()
