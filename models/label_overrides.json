@@ -1,0 +1,21 @@
+{
+  "window": "shelving unit",
+  "box": "parts organizer",
+  "parts organizer": "round bed or dog bed",
+  "monitor": "desk lamp",
+  "shelving unit": "parts organizer",
+  "desk": "workbench",
+  "desk lamp": "monitor",
+  "wall": "pegboard",
+  "pegboard": "tool pegboard",
+  "bag": "parts organizer",
+  "bowl": "trash can",
+  "cabinet": "workbench",
+  "floor": "wooden floor/deck",
+  "trash can": "bowl",
+  "wooden floor/deck": "floor",
+  "workbench": "desk",
+  "cup": "rover/robot base",
+  "dog bowl": "bowl",
+  "shelf": "bookcase"
+}
