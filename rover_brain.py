@@ -1445,6 +1445,7 @@ class HumanTracker:
         self._spatial_map = None     # SpatialMap reference (set from main)
         self._pose = None            # PoseTracker reference (set from main)
         self._track_history = []     # recent LLM tracking decisions for context
+        self.yolo_detector = None    # LocalDetector for YOLO overlay (set from main)
         self._start_bg_capture()
 
     def _start_bg_capture(self):
@@ -1479,6 +1480,13 @@ class HumanTracker:
                     time.sleep(0.05)
                     continue
                 frame_count += 1
+                # YOLO overlay every 3rd frame
+                if self.yolo_detector and frame_count % 3 == 0:
+                    try:
+                        self.yolo_detector.detect(frame)
+                        self.yolo_detector.draw(frame)
+                    except Exception:
+                        pass
                 _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 with self._frame_lock:
                     self._jpeg_frame = jpg.tobytes()
@@ -2659,14 +2667,18 @@ def main():
         tracker.start()
     VideoServer(tracker).start()
 
-    # --- Local object detector disabled — LLM handles all recognition ---
-    local_detector = None
+    # --- Local object detector (YOLO blue basket + LLM for everything else) ---
+    try:
+        from local_detector import LocalDetector
+        local_detector = LocalDetector("models/yolov8n-blue-basket.pt", conf=0.50)
+    except Exception as _det_err:
+        print(f"[detector] YOLO init failed: {_det_err}")
+        local_detector = None
     visual_servo = None
     LABEL_OVERRIDES = {}
     world_map = None
     path_planner = None
     path_follower = None
-    print("[detector] YOLO disabled — LLM-only recognition")
     spatial_map = SpatialMap()
 
     # --- Pose Tracker ---
@@ -2762,6 +2774,7 @@ def main():
     tracker._llm_vision_fn = _tracker_vision
     tracker._spatial_map = spatial_map
     tracker._pose = pose
+    tracker.yolo_detector = local_detector
     print(f"[tracker] LLM-guided tracking enabled ({model})")
 
     # --- Dedicated orchestrator LLM (goal evaluation, no shared history) ---
@@ -3528,6 +3541,13 @@ def main():
             _all_prompts.update(_load_prompts(_ppath))
             print(f"[search] Loaded prompts from {_pf}")
 
+    # --- Visual Servo (YOLO 10Hz approach) ---
+    if local_detector:
+        from visual_servo import VisualServo
+        visual_servo = VisualServo(rover, local_detector, tracker,
+                                   emergency_event=emergency_event)
+        print("[servo] VisualServo ready")
+
     search_engine = SearchEngine(
         rover=rover,
         tracker=tracker,
@@ -3537,16 +3557,20 @@ def main():
         parse_fn=parse_llm_response,
         voice_fn=voice.speak if voice else None,
         prompts=_all_prompts,
+        detector=local_detector,
+        emergency_event=emergency_event,
     )
-    print(f"[search] SearchEngine ready (prompts: {list(_all_prompts.keys())})")
+    print(f"[search] SearchEngine ready (prompts: {list(_all_prompts.keys())}, "
+          f"yolo={'ON' if local_detector else 'OFF'})")
 
     def systematic_search(target_name, original_input):
         """Thin wrapper — delegates to SearchEngine."""
         return search_engine.search(target_name)
 
     def navigate_to_object(target_name, original_input):
-        """Thin wrapper — delegates to SearchEngine."""
-        return search_engine.navigate_to(target_name)
+        """Thin wrapper — delegates to SearchEngine.search_and_approach."""
+        result = search_engine.search_and_approach(target_name, visual_servo=visual_servo)
+        return result.get("reached", False)
 
 
     # --- Calibration mode: slow movements, no speech, voice-controlled ---
@@ -3692,19 +3716,15 @@ def main():
                 target = args.get("target", "")
                 if not target:
                     return json.dumps({"error": "No target specified"})
-                success = navigate_to_object(target, f"navigate to {target}")
-                return json.dumps({"success": bool(success), "target": target})
+                result = search_engine.search_and_approach(target, visual_servo=visual_servo)
+                return json.dumps(result)
 
             elif fn_name == "search_for":
                 target = args.get("target", "")
                 if not target:
                     return json.dumps({"error": "No target specified"})
-                found = systematic_search(target, f"search for {target}")
-                if found:
-                    # Automatically navigate to the found object
-                    success = navigate_to_object(target, f"navigate to {target}")
-                    return json.dumps({"found": True, "navigated": bool(success), "target": target})
-                return json.dumps({"found": False, "target": target})
+                found = search_engine.search(target)
+                return json.dumps({"found": bool(found), "target": target})
 
             elif fn_name == "remember":
                 note = args.get("note", "")

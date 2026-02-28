@@ -163,7 +163,7 @@ GEMINI_TOOLS = [
             },
             {
                 "name": "search_for",
-                "description": "Search for an object by sweeping the camera, then automatically drive to it if found. Returns found status and navigation result.",
+                "description": "Search for an object by sweeping the camera. Finds and aligns toward it but does NOT drive to it. Use navigate_to to drive there.",
                 "parameters": {
                     "type": "object",
                     "properties": {

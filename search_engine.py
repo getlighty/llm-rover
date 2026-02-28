@@ -152,7 +152,8 @@ class SearchEngine:
     """
 
     def __init__(self, rover, tracker, pose, spatial_map,
-                 llm_vision_fn, parse_fn, voice_fn=None, prompts=None):
+                 llm_vision_fn, parse_fn, voice_fn=None, prompts=None,
+                 detector=None, emergency_event=None):
         """
         Args:
             rover: Serial command sender (rover.send(json_dict))
@@ -163,6 +164,8 @@ class SearchEngine:
             parse_fn: Callable(raw: str) -> dict or None (JSON parser)
             voice_fn: Optional callable(text: str) for speech output
             prompts: Dict of prompt templates from load_prompts()
+            detector: Optional LocalDetector for YOLO-based fast detection
+            emergency_event: Optional threading.Event — abort when set
         """
         self.rover = rover
         self.tracker = tracker
@@ -172,6 +175,11 @@ class SearchEngine:
         self._parse = parse_fn
         self.voice = voice_fn or (lambda t: None)
         self.prompts = prompts or {}
+        self.detector = detector
+        self._emergency = emergency_event
+
+    def _stopped(self):
+        return self._emergency is not None and self._emergency.is_set()
 
     def _llm(self, prompt, jpeg):
         """Call LLM vision and parse response. Returns dict or None."""
@@ -182,6 +190,23 @@ class SearchEngine:
             print(f"[search] LLM error: {e}")
             return None
 
+    def _yolo_check(self, target):
+        """Run YOLO detector on current frame. Returns detection dict or None."""
+        if not self.detector:
+            return None
+        jpeg = self.tracker.get_jpeg()
+        if not jpeg:
+            return None
+        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return None
+        dets = self.detector.detect(frame)
+        hit = self.detector.find(target, dets)
+        if hit:
+            print(f"[search] YOLO found '{hit['name']}' conf={hit['conf']:.0%} "
+                  f"cx={hit['cx']:.2f}")
+        return hit
+
     # ── PUBLIC API ─────────────────────────────────────────────
 
     def search(self, target: str) -> bool:
@@ -189,6 +214,7 @@ class SearchEngine:
         Find target object. Returns True if found and body aligned.
 
         Flow:
+          0. YOLO quick-check on current frame (0 LLM calls)
           1. Check spatial map (0 LLM calls)
           2. Scan front hemisphere with priority positions
           3. If not found, rotate body 180° and scan again
@@ -197,11 +223,27 @@ class SearchEngine:
         self.voice(f"Searching for {target}.")
         self.tracker.pause(300)
 
-        # ── Step 1: Spatial map lookup (free) ──
+        # ── Step 0: YOLO instant check (free) ──
+        yolo_hit = self._yolo_check(target)
+        if yolo_hit:
+            print(f"[search] YOLO short-circuit: '{target}' found immediately")
+            return self._finalize(target)
+
+        # If YOLO knows this target, skip spatial map (headings drift)
+        # and go straight to YOLO-assisted scan
+        _yolo_knows = False
+        if self.detector:
+            tgt = target.lower().strip()
+            for cn in self.detector.class_names:
+                if tgt in cn.lower() or cn.lower() in tgt:
+                    _yolo_knows = True
+                    break
+
+        # ── Step 1: Spatial map lookup (free) — skip if YOLO handles this target ──
         name, entry = self.spatial_map.find(target)
         hint_world_pan = None
 
-        if entry and not self.spatial_map.is_stale(entry):
+        if not _yolo_knows and entry and not self.spatial_map.is_stale(entry):
             # Fresh hit — just look there
             wp = entry.get("world_pan")
             if wp is not None:
@@ -223,8 +265,7 @@ class SearchEngine:
             # Not actually there anymore — fall through to scan
             print(f"[search] Spatial map hit but not confirmed, scanning")
 
-        elif entry:
-            # Stale hit — use as priority hint
+        elif not _yolo_knows and entry:
             hint_world_pan = entry.get("world_pan")
             if hint_world_pan is None:
                 hint_world_pan = self.pose.body_yaw + entry.get("pan", 0)
@@ -247,23 +288,55 @@ class SearchEngine:
         self._move_gimbal(0, 0)
         return False
 
-    def navigate_to(self, target: str) -> bool:
-        """
-        Find target, align body, then drive toward it with LLM steering.
-        Returns True if reached or max steps hit, False if lost.
-        """
-        print(f"[nav] Navigate to '{target}'")
+    def search_and_approach(self, target, visual_servo=None):
+        """Search for target, then drive to it using best available method.
 
-        # Find it first (search aligns body too)
+        Returns dict: {found, reached, target, method}
+        """
+        result = {"found": False, "reached": False, "target": target, "method": "none"}
+
         if not self.search(target):
-            return False
+            return result
+        result["found"] = True
+
+        if self._stopped():
+            return result
+
+        self.voice(f"Going to {target}.")
+
+        # Try YOLO visual servo first (10Hz P-control)
+        if visual_servo is not None:
+            yolo_hit = self._yolo_check(target)
+            if yolo_hit:
+                print(f"[nav] Visual servo for '{target}'")
+                reached = visual_servo.approach(target)
+                result["reached"] = reached
+                result["method"] = "visual_servo"
+                return result
+            print(f"[nav] YOLO can't track '{target}', LLM fallback")
+
+        # Fallback: LLM steering (1Hz)
+        reached = self._llm_approach(target)
+        result["reached"] = reached
+        result["method"] = "llm_steering"
+        return result
+
+    def _llm_approach(self, target: str) -> bool:
+        """Drive toward target with LLM steering (1Hz).
+        Caller must have already found and aligned to target.
+        Returns True if reached, False if lost.
+        """
+        print(f"[nav] LLM approach '{target}'")
 
         # Drive loop
-        self.voice(f"Going to {target}.")
         self._send_wheels(NAV_SPEED, NAV_SPEED)
         prev_jpeg = None
 
         for step in range(NAV_MAX_STEPS):
+            if self._stopped():
+                self._send_wheels(0, 0)
+                return False
+
             time.sleep(NAV_CHECK_INTERVAL)
 
             jpeg = self.tracker.get_jpeg()
@@ -272,21 +345,38 @@ class SearchEngine:
                 self._send_wheels(0, 0)
                 break
 
-            if not frame_changed(prev_jpeg, jpeg):
-                print(f"[nav] Step {step}: frame unchanged, keeping course")
-                continue  # Scene unchanged, stay on course
-            prev_jpeg = jpeg
+            # YOLO fast steering: always run when available (fast enough)
+            yolo_hit = self._yolo_check(target)
+            if yolo_hit:
+                cx = yolo_hit["cx"]  # 0..1, 0.5 = centered
+                bw = yolo_hit["bw"]  # bbox width fraction
+                visible = True
+                close = bw > 0.30
+                if cx < 0.35:
+                    direction = "left"
+                elif cx > 0.65:
+                    direction = "right"
+                else:
+                    direction = "center"
+                print(f"[nav] Step {step} (YOLO): cx={cx:.2f} bw={bw:.2f} "
+                      f"dir={direction} close={close}")
+            else:
+                # LLM fallback — only call if frame actually changed
+                if not frame_changed(prev_jpeg, jpeg):
+                    print(f"[nav] Step {step}: frame unchanged, keeping course")
+                    continue
+                prev_jpeg = jpeg
 
-            result = self._check_frame(target, "steer")
-            if result is None:
-                continue
+                result = self._check_frame(target, "steer")
+                if result is None:
+                    continue
 
-            visible = result.get("v", result.get("visible", False))
-            close = result.get("close", False)
-            direction = result.get("dir", result.get("direction", "center"))
-            size = result.get("size", "small")
-            print(f"[nav] Step {step}: vis={visible} close={close} "
-                  f"dir={direction} size={size}")
+                visible = result.get("v", result.get("visible", False))
+                close = result.get("close", False)
+                direction = result.get("dir", result.get("direction", "center"))
+                size = result.get("size", "small")
+                print(f"[nav] Step {step}: vis={visible} close={close} "
+                      f"dir={direction} size={size}")
 
             if close:
                 self._send_wheels(0, 0)
@@ -333,6 +423,10 @@ class SearchEngine:
         llm_calls = 0
 
         for pan, tilt in positions:
+            if self._stopped():
+                self._send_wheels(0, 0)
+                break
+
             if llm_calls >= MAX_SCAN_POSITIONS:
                 print(f"[search] Hit max scan positions ({MAX_SCAN_POSITIONS})")
                 break
@@ -343,6 +437,16 @@ class SearchEngine:
             checked.add(key)
 
             self._move_gimbal(pan, tilt)
+
+            # YOLO pre-filter: if detector knows this object, skip LLM
+            yolo_hit = self._yolo_check(target)
+            if yolo_hit:
+                print(f"[search] YOLO found '{target}' at pan={pan} tilt={tilt} "
+                      f"(0 extra LLM calls)")
+                if self._finalize(target):
+                    print(f"[search] Done in {llm_calls} LLM calls (YOLO assist)")
+                    return True, hints_collected
+
             result = self._check_frame(target, "scout")
             llm_calls += 1
 

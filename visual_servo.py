@@ -25,16 +25,18 @@ class VisualServo:
     2. Wheel driving: forward speed + differential steering from gimbal pan offset
     """
 
-    def __init__(self, rover, detector, tracker):
+    def __init__(self, rover, detector, tracker, emergency_event=None):
         """
         Args:
             rover: RoverSerial instance (sends JSON commands to ESP32)
             detector: LocalDetector instance (runs YOLOv8)
             tracker: HumanTracker instance (owns camera, provides get_jpeg())
+            emergency_event: Optional threading.Event — abort when set
         """
         self.rover = rover
         self.detector = detector
         self.tracker = tracker
+        self._emergency_event = emergency_event
 
         # --- Gimbal P-control gains ---
         self.gimbal_gain_x = 40.0   # degrees per unit error (0..1 range)
@@ -84,6 +86,11 @@ class VisualServo:
             voice.speak(f"Going to {target_name}.")
 
         while self._running and step < self.MAX_STEPS:
+            if self._emergency_event and self._emergency_event.is_set():
+                self.rover.send({"T": 1, "L": 0, "R": 0})
+                print("[servo] Emergency stop")
+                return False
+
             step += 1
 
             # Get frame
@@ -185,96 +192,3 @@ class VisualServo:
         """Abort the approach."""
         self._running = False
 
-    def scan_and_find(self, target_name, voice=None):
-        """Sweep gimbal to find target, then approach it.
-
-        Combines systematic gimbal sweep with local detection (no LLM needed).
-        Returns True if found and arrived, False otherwise.
-        """
-        PAN_STEPS = [-120, -80, -40, 0, 40, 80, 120]
-        TILT_STEPS = [0, 25]
-
-        print(f"[servo] Scanning for '{target_name}'")
-        if voice:
-            voice.speak(f"Looking for {target_name}.")
-
-        for tilt in TILT_STEPS:
-            for pan in PAN_STEPS:
-                if not self._running:
-                    return False
-
-                self.rover.send({"T": 133, "X": pan, "Y": tilt,
-                                 "SPD": 300, "ACC": 20})
-                time.sleep(0.6)  # let gimbal settle
-
-                # Capture and detect
-                jpeg = self.tracker.get_jpeg()
-                if not jpeg:
-                    continue
-                frame = cv2.imdecode(
-                    np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                if frame is None:
-                    continue
-
-                detections = self.detector.detect(frame)
-                target = self.detector.find(target_name, detections)
-
-                if target:
-                    bw = target["bw"]
-                    dist = target.get("dist_m", "?")
-                    print(f"[servo] Found '{target_name}' at pan={pan} tilt={tilt} "
-                          f"bw={bw:.2f} dist={dist}m")
-                    if voice:
-                        voice.speak(f"Found {target_name}.")
-                    # Set gimbal state and start approach
-                    self.pan = pan
-                    self.tilt = tilt
-                    return self.approach(target_name, voice=voice)
-
-                # Log what we did see
-                if detections:
-                    names = [d["name"] for d in detections]
-                    print(f"[servo] pan={pan} tilt={tilt}: {names} (no {target_name})")
-
-        # Not found in sweep — try rotating body 180 and sweep again
-        print(f"[servo] '{target_name}' not found forward, rotating 180deg")
-        self.rover.send({"T": 133, "X": 0, "Y": 0, "SPD": 300, "ACC": 20})
-        time.sleep(0.3)
-        self.rover.send({"T": 1, "L": -0.35, "R": 0.35})
-        time.sleep(1.5)  # ~180 degrees at 120 deg/s
-        self.rover.send({"T": 1, "L": 0, "R": 0})
-        time.sleep(0.5)
-
-        for tilt in TILT_STEPS:
-            for pan in PAN_STEPS:
-                if not self._running:
-                    return False
-
-                self.rover.send({"T": 133, "X": pan, "Y": tilt,
-                                 "SPD": 300, "ACC": 20})
-                time.sleep(0.6)
-
-                jpeg = self.tracker.get_jpeg()
-                if not jpeg:
-                    continue
-                frame = cv2.imdecode(
-                    np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                if frame is None:
-                    continue
-
-                detections = self.detector.detect(frame)
-                target = self.detector.find(target_name, detections)
-
-                if target:
-                    print(f"[servo] Found '{target_name}' at pan={pan} tilt={tilt} (rear)")
-                    if voice:
-                        voice.speak(f"Found {target_name}.")
-                    self.pan = pan
-                    self.tilt = tilt
-                    return self.approach(target_name, voice=voice)
-
-        print(f"[servo] '{target_name}' not found after 360 sweep")
-        self.rover.send({"T": 133, "X": 0, "Y": 0, "SPD": 200, "ACC": 10})
-        if voice:
-            voice.speak(f"Couldn't find {target_name}.")
-        return False

@@ -53,6 +53,7 @@ KNOWN_WIDTHS = {
     "phone": 0.07, "bag": 0.30, "plant": 0.20, "window": 1.00,
     "toolbox": 0.40, "tool": 0.15, "screwdriver": 0.03, "drill": 0.15,
     "wheel": 0.15, "robot": 0.30, "speaker": 0.20, "camera": 0.08,
+    "blue basket": 0.35,
 }
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
@@ -161,6 +162,13 @@ class LocalDetector:
             import torch
             from ultralytics import YOLO
             self._ultralytics_model = YOLO(model_path)
+            # Read class names from model (handles custom-trained models)
+            if hasattr(self._ultralytics_model, "names") and self._ultralytics_model.names:
+                self.class_names = list(self._ultralytics_model.names.values())
+                if len(self.class_names) == 1:
+                    self._model_label = f"YOLOv8-{self.class_names[0]}"
+                else:
+                    self._model_label = f"YOLOv8-custom({len(self.class_names)}cls)"
             if torch.cuda.is_available():
                 self._ultralytics_model.to("cuda")
                 self.backend = "PyTorch GPU"
