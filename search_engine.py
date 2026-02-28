@@ -210,9 +210,16 @@ class SearchEngine:
                 relative_pan = entry.get("pan", 0)
             self._move_gimbal(relative_pan, entry["tilt"])
             result = self._check_frame(target, "check")
-            if result and result.get("found"):
-                print(f"[search] Phase 1: fresh spatial map hit for '{name}'")
-                return self._finalize(target)
+            if result:
+                found_flag = result.get("found", False)
+                if not found_flag:
+                    for obj in result.get("objects", []):
+                        if target.lower() in obj.lower() or obj.lower() in target.lower():
+                            found_flag = True
+                            break
+                if found_flag:
+                    print(f"[search] Phase 1: fresh spatial map hit for '{name}'")
+                    return self._finalize(target)
             # Not actually there anymore — fall through to scan
             print(f"[search] Spatial map hit but not confirmed, scanning")
 
@@ -349,7 +356,20 @@ class SearchEngine:
                 self.spatial_map.update(objects, wp, tilt)
                 print(f"[search] Mapped at world_pan={wp}°: {objects}")
 
-            if result.get("found"):
+            # Check if found — either LLM flagged it, or target appears
+            # in the objects list (LLM sometimes lists it but forgets to
+            # set found=true)
+            found_flag = result.get("found", False)
+            if not found_flag and objects:
+                tgt = target.lower()
+                for obj in objects:
+                    if tgt in obj.lower() or obj.lower() in tgt:
+                        found_flag = True
+                        print(f"[search] Target '{target}' detected in objects "
+                              f"list as '{obj}' (LLM missed found=true)")
+                        break
+
+            if found_flag:
                 print(f"[search] FOUND '{target}' at pan={pan} tilt={tilt} "
                       f"(llm_call #{llm_calls})")
                 if self._finalize(target):
