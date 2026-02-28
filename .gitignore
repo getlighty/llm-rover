@@ -16,3 +16,5 @@ spatial_map.json
 learned_commands.json
 calibration_points.txt
 notes.txt
+runs/
+dataset/
