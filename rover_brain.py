@@ -49,7 +49,7 @@ if os.path.exists(_env_file):
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-3.1-pro-preview"
-GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+GEMINI_LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
 GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 GEMINI_TTS_VOICE = "Puck"  # Puck=male, Kore=female, Enceladus=male alt
 GEMINI_TTS_VOICE_MAP = {"troy": "Puck", "hannah": "Kore", "austin": "Enceladus"}
