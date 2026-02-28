@@ -163,7 +163,7 @@ GEMINI_TOOLS = [
             },
             {
                 "name": "search_for",
-                "description": "Systematically sweep the gimbal to search for a named object. Checks all angles. Returns whether the object was found and its location.",
+                "description": "Search for an object by sweeping the camera, then automatically drive to it if found. Returns found status and navigation result.",
                 "parameters": {
                     "type": "object",
                     "properties": {

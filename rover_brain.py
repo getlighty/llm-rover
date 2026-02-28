@@ -429,18 +429,33 @@ class SpatialMap:
         self._map = {}
         self._load()
 
-    def update(self, objects, pan, tilt, world_pan=None):
-        """Store/update objects at given gimbal position."""
+    def update(self, objects, world_pan, tilt, **_kw):
+        """Store/update objects at absolute world heading.
+
+        Args:
+            objects: list of object name strings
+            world_pan: absolute heading (body_yaw + cam_pan)
+            tilt: gimbal tilt angle
+        """
         now = time.time()
         for obj in objects:
             key = obj.lower().strip()
             if not key or len(key) < 2:
                 continue
-            entry = {"pan": round(pan, 1), "tilt": round(tilt, 1), "time": now}
-            if world_pan is not None:
-                entry["world_pan"] = round(world_pan, 1)
-            self._map[key] = entry
+            self._map[key] = {
+                "world_pan": round(float(world_pan), 1),
+                "tilt": round(float(tilt), 1),
+                "time": now,
+            }
         self._save()
+
+    def gimbal_pan_for(self, entry, body_yaw):
+        """Convert stored world_pan to relative gimbal angle for current body heading."""
+        wp = entry.get("world_pan")
+        if wp is None:
+            # Legacy entry with only relative pan
+            return entry.get("pan", 0)
+        return ((wp - body_yaw + 180) % 360) - 180
 
     def find(self, query):
         """Look up an object. Returns (name, entry) or (None, None)."""
@@ -472,8 +487,8 @@ class SpatialMap:
             age = int(now - e["time"])
             age_str = f"{age}s ago" if age < 60 else f"{age // 60}m ago"
             stale = " (stale)" if self.is_stale(e) else ""
-            wp = f", world_pan={e['world_pan']}" if "world_pan" in e else ""
-            lines.append(f"  - {name}: pan={e['pan']}, tilt={e['tilt']}{wp} ({age_str}{stale})")
+            wp = e.get("world_pan", e.get("pan", "?"))
+            lines.append(f"  - {name}: heading={wp}°, tilt={e['tilt']}° ({age_str}{stale})")
         return "## Spatial Map (objects I've seen)\n" + "\n".join(lines)
 
     def _save(self):
@@ -553,6 +568,10 @@ class PoseTracker:
             "cam_tilt": round(self.cam_tilt, 1),
             "world_pan": round(self.world_pan, 1),
         }
+
+    def after_body_turn(self, degrees):
+        """Update heading after a known body rotation. No spatial map changes needed."""
+        self.body_yaw = ((self.body_yaw + degrees + 180) % 360) - 180
 
     def reset_yaw(self):
         """Reset body yaw to 0 (e.g. after manual repositioning)."""
@@ -1424,6 +1443,7 @@ class HumanTracker:
         self._llm_vision_fn = None  # chat_with_image(prompt, jpeg_bytes) -> str
         self._llm_hint_cooldown = 0  # throttle LLM calls during scan
         self._spatial_map = None     # SpatialMap reference (set from main)
+        self._pose = None            # PoseTracker reference (set from main)
         self._track_history = []     # recent LLM tracking decisions for context
         self._start_bg_capture()
 
@@ -1645,10 +1665,12 @@ class HumanTracker:
                 age = int(now - e.get("time", 0))
                 age_str = f"{age}s ago" if age < 60 else f"{age // 60}m ago"
                 # How far from current gimbal position
-                pan_diff = e['pan'] - self.pan_angle
+                stored_pan = self._spatial_map.gimbal_pan_for(
+                    e, self._pose.body_yaw if self._pose else 0)
+                pan_diff = stored_pan - self.pan_angle
                 tilt_diff = e['tilt'] - self.tilt_angle
                 context_parts.append(
-                    f"MEMORY: I last saw '{name}' at pan={e['pan']}°, "
+                    f"MEMORY: I last saw '{name}' at pan={stored_pan:.0f}°, "
                     f"tilt={e['tilt']}° ({age_str}). That is "
                     f"{pan_diff:+.0f}° pan and {tilt_diff:+.0f}° tilt "
                     f"from where I'm looking now.")
@@ -1848,8 +1870,11 @@ class HumanTracker:
                     last_status = "tracking"
                     self.rover.send({"T": 1, "L": 0, "R": 0})
                     if self._spatial_map:
+                        wp = self.pan_angle
+                        if self._pose:
+                            wp = self._pose.body_yaw + self.pan_angle
                         self._spatial_map.update(["person"],
-                            self.pan_angle, self.tilt_angle)
+                            wp, self.tilt_angle)
                     self._track_history.clear()
 
                 if not headlight_on:
@@ -2573,6 +2598,7 @@ def parse_llm_response(raw):
     return None
 
 
+
 # =====================================================================
 # Main Application
 # =====================================================================
@@ -2735,6 +2761,7 @@ def main():
         return r.json()["choices"][0]["message"]["content"]
     tracker._llm_vision_fn = _tracker_vision
     tracker._spatial_map = spatial_map
+    tracker._pose = pose
     print(f"[tracker] LLM-guided tracking enabled ({model})")
 
     # --- Dedicated orchestrator LLM (goal evaluation, no shared history) ---
@@ -3024,8 +3051,8 @@ def main():
             pan = getattr(execute_response, '_pan', 0.0)
             tilt = getattr(execute_response, '_tilt', 0.0)
             wp = pose.body_yaw + pan
-            spatial_map.update(objects, pan, tilt, world_pan=wp)
-            print(f"[spatial] Mapped at pan={pan}, tilt={tilt}, world_pan={wp:.1f}: {objects}")
+            spatial_map.update(objects, wp, tilt)
+            print(f"[spatial] Mapped at world_pan={wp:.1f}, tilt={tilt}: {objects}")
 
     def observation_loop(initial_parsed, original_input):
         """Execute commands with visual feedback. LLM sees camera after each step."""
@@ -3143,8 +3170,9 @@ def main():
                 # 2. Check spatial map
                 obj_name, entry = spatial_map.find(target_lower)
                 if obj_name and not spatial_map.is_stale(entry):
-                    pan, tilt = entry["pan"], entry["tilt"]
-                    rover.send({"T": 133, "X": pan, "Y": tilt, "SPD": 200, "ACC": 10})
+                    pan = spatial_map.gimbal_pan_for(entry, pose.body_yaw)
+                    tilt = entry["tilt"]
+                    rover.send({"T": 133, "X": round(pan, 1), "Y": tilt, "SPD": 200, "ACC": 10})
                     time.sleep(0.8)
                     return True, f"Found {obj_name} in spatial map"
 
@@ -3488,334 +3516,38 @@ def main():
         final = _speak_summary(goal, step_log, jpeg)
         return final or initial_parsed
 
-    # --- Systematic search: sweep gimbal + rotate body to find objects ---
-    SEARCH_PAN_STEPS = [-135, -90, -45, 0, 45, 90, 135]
-    SEARCH_TILT_STEPS = [0, 30]
-    SEARCH_GIMBAL_SPD = 300
+    # --- Search engine: unified priority-scan + LLM-guided navigation ---
+    from search_engine import SearchEngine, load_prompts as _load_prompts
+
+    # Load prompt templates
+    _prompts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
+    _all_prompts = {}
+    for _pf in ("search.md", "nav.md"):
+        _ppath = os.path.join(_prompts_dir, _pf)
+        if os.path.exists(_ppath):
+            _all_prompts.update(_load_prompts(_ppath))
+            print(f"[search] Loaded prompts from {_pf}")
+
+    search_engine = SearchEngine(
+        rover=rover,
+        tracker=tracker,
+        pose=pose,
+        spatial_map=spatial_map,
+        llm_vision_fn=_tracker_vision,
+        parse_fn=parse_llm_response,
+        voice_fn=voice.speak if voice else None,
+        prompts=_all_prompts,
+    )
+    print(f"[search] SearchEngine ready (prompts: {list(_all_prompts.keys())})")
 
     def systematic_search(target_name, original_input):
-        """Sweep gimbal systematically to find target_name. Returns True if found."""
-        print(f"[search] Starting systematic search for '{target_name}'")
-        if voice:
-            voice.speak(f"Searching for {target_name}.")
-
-        tracker.pause(300)  # keep tracker paused during search
-
-        def _sweep_hemisphere(label):
-            """Sweep all pan/tilt positions. Returns True if target found."""
-            for tilt in SEARCH_TILT_STEPS:
-                for pan in SEARCH_PAN_STEPS:
-                    # Move gimbal
-                    rover.send({"T": 133, "X": pan, "Y": tilt,
-                                "SPD": SEARCH_GIMBAL_SPD, "ACC": 20})
-                    pose.cam_pan = pan
-                    pose.cam_tilt = tilt
-                    # Wait for gimbal to settle
-                    time.sleep(0.6)
-
-                    # Capture frame
-                    jpeg = tracker.get_jpeg()
-                    if not jpeg:
-                        print(f"[search] No camera frame at pan={pan} tilt={tilt}")
-                        continue
-
-                    # Ask LLM if target is visible
-                    wp = round(pose.world_pan, 1)
-                    prompt = (
-                        f"You are searching for: {target_name}. "
-                        f"Camera at pan={pan}, tilt={tilt}, world_pan={wp}. "
-                        f"Look at this image. Reply ONLY with JSON:\n"
-                        f'{{"found": true/false, "objects": ["list","visible","objects"]}}\n'
-                        f"List ALL notable objects you can identify, not just the target."
-                    )
-                    print(f"[search] Checking pan={pan} tilt={tilt} ({label})")
-
-                    try:
-                        if hasattr(llm, 'chat_with_image'):
-                            raw = llm.chat_with_image(prompt, jpeg)
-                        else:
-                            raw = llm.chat(prompt)
-
-                        # Parse response
-                        parsed = parse_llm_response(raw)
-                        if parsed:
-                            # Map all visible objects
-                            objects = parsed.get("objects", [])
-                            if objects:
-                                spatial_map.update(objects, pan, tilt,
-                                                   world_pan=wp)
-                                print(f"[search] Mapped: {objects}")
-
-                            if parsed.get("found"):
-                                print(f"[search] FOUND '{target_name}' at pan={pan} tilt={tilt}")
-                                return True
-                    except Exception as e:
-                        print(f"[search] LLM error: {e}")
-                        continue
-            return False
-
-        def _center_and_align(found_pan, found_tilt):
-            """After finding object: ask LLM to center it, then align body."""
-            cam_pan = found_pan
-            cam_tilt = found_tilt
-
-            # Ask LLM to fine-tune centering (up to 3 rounds)
-            for i in range(3):
-                time.sleep(0.5)
-                jpeg = tracker.get_jpeg()
-                if not jpeg or not hasattr(llm, 'chat_with_image'):
-                    break
-                prompt = (
-                    f"You are looking at '{target_name}'. Your head is at "
-                    f"pan={cam_pan}°, tilt={cam_tilt}°. "
-                    f"Is '{target_name}' centered in this image? "
-                    f"If yes: {{\"centered\": true}}\n"
-                    f"If no, adjust gimbal to center it: "
-                    f"{{\"centered\": false, \"commands\": "
-                    f"[{{\"T\":133,\"X\":<pan>,\"Y\":<tilt>,\"SPD\":100,\"ACC\":10}}]}}\n"
-                    f"Reply with ONLY the JSON."
-                )
-                try:
-                    raw = llm.chat_with_image(prompt, jpeg)
-                    parsed = parse_llm_response(raw)
-                    if not parsed:
-                        break
-                    if parsed.get("centered"):
-                        break
-                    cmds = parsed.get("commands", [])
-                    for c in cmds:
-                        if isinstance(c, dict) and c.get("T") == 133:
-                            cam_pan = c.get("X", cam_pan)
-                            cam_tilt = c.get("Y", cam_tilt)
-                            rover.send(c)
-                            print(f"[search] Centering: pan={cam_pan} tilt={cam_tilt}")
-                except Exception as e:
-                    print(f"[search] Center error: {e}")
-                    break
-
-            # Align body to gimbal pan, counter-rotate gimbal to 0
-            if abs(cam_pan) > 5:
-                rot_time = max(0.2, min(5.0, abs(cam_pan) / TURN_RATE_DPS))
-                sign = 1 if cam_pan > 0 else -1
-                gimbal_spd = max(50, int(abs(cam_pan) / rot_time))
-                print(f"[search] Aligning body {cam_pan:.0f}° ({rot_time:.1f}s)")
-                rover.send({"T": 1, "L": TURN_SPEED * sign,
-                            "R": -TURN_SPEED * sign})
-                rover.send({"T": 133, "X": 0, "Y": cam_tilt,
-                            "SPD": gimbal_spd, "ACC": 10})
-                time.sleep(rot_time)
-                rover.send({"T": 1, "L": 0, "R": 0})
-                time.sleep(0.3)
-                pose.cam_pan = 0
-                print("[search] Body aligned, gimbal centered")
-
-        def _found_and_center():
-            """Center on target, align body, save to spatial map."""
-            if voice:
-                voice.speak(f"Found {target_name}.")
-            last_pan = pose.cam_pan
-            last_tilt = pose.cam_tilt
-            _center_and_align(last_pan, last_tilt)
-            # Save to spatial map with original search name so navigate can find it
-            final_pan = pose.cam_pan
-            final_tilt = pose.cam_tilt
-            spatial_map.update([target_name], final_pan, final_tilt,
-                               world_pan=round(pose.world_pan, 1))
-            print(f"[search] Saved '{target_name}' at pan={final_pan} tilt={final_tilt}")
-
-        # Sweep forward hemisphere
-        if _sweep_hemisphere("forward"):
-            _found_and_center()
-            return True
-
-        # Not found forward — rotate body ~180 degrees
-        print("[search] Not found in forward hemisphere, rotating 180 degrees")
-        rotation_time = 180.0 / TURN_RATE_DPS
-        rover.send({"T": 133, "X": 0, "Y": 0, "SPD": 300, "ACC": 20})
-        time.sleep(0.3)
-        rover.send({"T": 1, "L": -TURN_SPEED, "R": TURN_SPEED})  # spin left
-        time.sleep(rotation_time)
-        rover.send({"T": 1, "L": 0, "R": 0})
-        time.sleep(0.5)
-
-        # Sweep rear hemisphere (now facing us)
-        if _sweep_hemisphere("rear"):
-            _found_and_center()
-            return True
-
-        # Not found at all
-        print(f"[search] '{target_name}' not found after full 360 sweep")
-        if voice:
-            voice.speak(f"Couldn't find {target_name}.")
-        rover.send({"T": 133, "X": 0, "Y": 0, "SPD": 200, "ACC": 10})
-        return False
-
-    # --- Navigate to object: LLM-only step loop ---
-    NAV_DRIVE_SPEED = 0.12       # very slow continuous creep
-    NAV_STEER_OFFSET = 0.06      # gentle steering correction
-    NAV_LLM_INTERVAL = 1.0       # seconds between LLM checks (while moving)
-    NAV_MAX_STEPS = 30
+        """Thin wrapper — delegates to SearchEngine."""
+        return search_engine.search(target_name)
 
     def navigate_to_object(target_name, original_input):
-        """Find an object and drive toward it. LLM decides every step. No movement without LLM OK."""
-        print(f"[nav] Navigate to '{target_name}'")
-        if voice:
-            voice.speak(f"Going to {target_name}.")
+        """Thin wrapper — delegates to SearchEngine."""
+        return search_engine.navigate_to(target_name)
 
-        tracker.pause(300)
-
-        # --- Step 1: Find the object ---
-        obj_name, entry = spatial_map.find(target_name)
-        if not obj_name or spatial_map.is_stale(entry):
-            found = systematic_search(target_name, original_input)
-            if not found:
-                return False
-            obj_name, entry = spatial_map.find(target_name)
-            if not obj_name:
-                print("[nav] Can't find in spatial map after search")
-                return False
-
-        target_pan = entry["pan"]
-        target_tilt = entry["tilt"]
-        print(f"[nav] Target '{obj_name}' at pan={target_pan} tilt={target_tilt}")
-
-        # --- Step 2: Slowly center object in camera ---
-        # Move gimbal in small increments toward the target, letting it settle
-        cam_pan = 0.0  # gimbal starts centered from startup calibration
-        cam_tilt = 0.0
-        PAN_STEP = 15  # degrees per increment
-        TILT_STEP = 10
-        print(f"[nav] Centering camera on target (pan={target_pan}, tilt={target_tilt})")
-        while abs(cam_pan - target_pan) > PAN_STEP or abs(cam_tilt - target_tilt) > TILT_STEP:
-            if cam_pan < target_pan - PAN_STEP:
-                cam_pan += PAN_STEP
-            elif cam_pan > target_pan + PAN_STEP:
-                cam_pan -= PAN_STEP
-            else:
-                cam_pan = target_pan
-            if cam_tilt < target_tilt - TILT_STEP:
-                cam_tilt += TILT_STEP
-            elif cam_tilt > target_tilt + TILT_STEP:
-                cam_tilt -= TILT_STEP
-            else:
-                cam_tilt = target_tilt
-            rover.send({"T": 133, "X": round(cam_pan, 1), "Y": round(cam_tilt, 1),
-                         "SPD": 80, "ACC": 10})
-            time.sleep(0.4)
-        # Final position
-        rover.send({"T": 133, "X": target_pan, "Y": target_tilt, "SPD": 80, "ACC": 10})
-        time.sleep(0.8)
-        cam_pan = target_pan
-        print(f"[nav] Camera centered at pan={cam_pan} tilt={target_tilt}")
-
-        # --- Step 3: Align body with camera simultaneously ---
-        # Body rotates by cam_pan degrees. Gimbal counter-rotates from cam_pan to 0
-        # at the same time, so the camera stays pointed at the object throughout.
-        # Turn convention (matches fast commands): right = L+/R-, left = L-/R+
-        if abs(cam_pan) > 5:
-            rotation_time = max(0.2, min(5.0, abs(cam_pan) / TURN_RATE_DPS))
-            sign = 1 if cam_pan > 0 else -1  # +1 = turn right, -1 = turn left
-            gimbal_spd = max(50, int(abs(cam_pan) / rotation_time))
-            print(f"[nav] Aligning body {cam_pan:.0f} deg ({rotation_time:.1f}s, gimbal counter-rotates)")
-            # Both fire together: body turns, gimbal sweeps to 0
-            rover.send({"T": 1, "L": TURN_SPEED * sign, "R": -TURN_SPEED * sign})
-            rover.send({"T": 133, "X": 0, "Y": target_tilt, "SPD": gimbal_spd, "ACC": 10})
-            time.sleep(rotation_time)
-            rover.send({"T": 1, "L": 0, "R": 0})
-            time.sleep(0.3)
-            cam_pan = 0.0
-            print("[nav] Body aligned, gimbal centered")
-
-        # --- Step 4: Continuous drive with LLM course corrections ---
-        print(f"[nav] Starting continuous nav (max {NAV_MAX_STEPS} checks)")
-
-        # Start driving straight — wheels stay on until we explicitly stop
-        rover.send({"T": 1, "L": round(NAV_DRIVE_SPEED, 2), "R": round(NAV_DRIVE_SPEED, 2)})
-        last_check = time.monotonic()
-
-        for step in range(NAV_MAX_STEPS):
-            # Sleep only the remaining interval; LLM call time counts toward it.
-            # Poll in 0.1s chunks so emergency "stop" is responsive.
-            while True:
-                if emergency_event.is_set():
-                    rover.send({"T": 1, "L": 0, "R": 0})
-                    print("[nav] Emergency stop during navigation")
-                    emergency_event.clear()
-                    return False
-                remaining = NAV_LLM_INTERVAL - (time.monotonic() - last_check)
-                if remaining <= 0:
-                    break
-                time.sleep(min(remaining, 0.1))
-
-            last_check = time.monotonic()
-
-            jpeg = tracker.get_jpeg()
-            if not jpeg:
-                print("[nav] No camera frame")
-                rover.send({"T": 1, "L": 0, "R": 0})
-                break
-
-            prompt = (
-                f"I'm a ground rover driving toward '{target_name}' right now. "
-                f"Camera pan={round(cam_pan,1)}. "
-                f'JSON only: {{"v":true/false,"close":true/false,"dir":"left"/"right"/"center","size":"small"/"medium"/"large"}}'
-            )
-
-            try:
-                if hasattr(llm, 'chat_with_image'):
-                    raw = llm.chat_with_image(prompt, jpeg)
-                else:
-                    raw = llm.chat(prompt)
-                parsed = parse_llm_response(raw)
-            except Exception as e:
-                print(f"[nav] Step {step} LLM error: {e}")
-                continue
-
-            if not parsed:
-                print(f"[nav] Step {step} unparseable")
-                continue
-
-            visible = parsed.get("v", parsed.get("visible", False))
-            close = parsed.get("close", False)
-            direction = parsed.get("dir", parsed.get("direction", "center"))
-            size = parsed.get("size", "small")
-
-            elapsed = time.monotonic() - last_check
-            print(f"[nav] Step {step}: vis={visible} close={close} dir={direction} size={size} llm={elapsed:.1f}s")
-
-            if close:
-                rover.send({"T": 1, "L": 0, "R": 0})
-                print(f"[nav] Arrived at {target_name}!")
-                if voice:
-                    voice.speak(f"I'm at the {target_name}.")
-                return True
-
-            if not visible:
-                rover.send({"T": 1, "L": 0, "R": 0})
-                print(f"[nav] Lost {target_name}, stopping")
-                if voice:
-                    voice.speak(f"I lost sight of {target_name}.")
-                return False
-
-            # --- Adjust course without stopping ---
-            if direction == "left":
-                L = NAV_DRIVE_SPEED - NAV_STEER_OFFSET
-                R = NAV_DRIVE_SPEED + NAV_STEER_OFFSET
-            elif direction == "right":
-                L = NAV_DRIVE_SPEED + NAV_STEER_OFFSET
-                R = NAV_DRIVE_SPEED - NAV_STEER_OFFSET
-            else:
-                L = NAV_DRIVE_SPEED
-                R = NAV_DRIVE_SPEED
-
-            rover.send({"T": 1, "L": round(L, 2), "R": round(R, 2)})
-
-        # --- Max steps ---
-        rover.send({"T": 1, "L": 0, "R": 0})
-        print(f"[nav] Max steps reached")
-        if voice:
-            voice.speak(f"I drove toward {target_name} as far as I could.")
-        return True
 
     # --- Calibration mode: slow movements, no speech, voice-controlled ---
     CALIB_SPEED = 0.1   # very slow m/s
@@ -3968,7 +3700,11 @@ def main():
                 if not target:
                     return json.dumps({"error": "No target specified"})
                 found = systematic_search(target, f"search for {target}")
-                return json.dumps({"found": bool(found), "target": target})
+                if found:
+                    # Automatically navigate to the found object
+                    success = navigate_to_object(target, f"navigate to {target}")
+                    return json.dumps({"found": True, "navigated": bool(success), "target": target})
+                return json.dumps({"found": False, "target": target})
 
             elif fn_name == "remember":
                 note = args.get("note", "")
@@ -3989,7 +3725,7 @@ def main():
                              "heading": round(p["heading"], 1)},
                     "tracker": tracker.status,
                     "speed_scale": rover.speed_scale,
-                    "spatial_objects": len(spatial_map._objects) if hasattr(spatial_map, '_objects') else 0,
+                    "spatial_objects": len(spatial_map._map),
                 }
                 return json.dumps(status)
 
@@ -4335,12 +4071,13 @@ def main():
             if spatial_match:
                 obj_name, entry = spatial_map.find(query)
                 if obj_name and not spatial_map.is_stale(entry):
-                    pan, tilt = entry["pan"], entry["tilt"]
+                    pan = spatial_map.gimbal_pan_for(entry, pose.body_yaw)
+                    tilt = entry["tilt"]
                     age = int(time.time() - entry["time"])
-                    print(f'[spatial] Found "{obj_name}" at pan={pan}, tilt={tilt} ({age}s ago)')
+                    print(f'[spatial] Found "{obj_name}" at pan={round(pan,1)}, tilt={tilt} ({age}s ago)')
                     tracker.pause(30)
                     response = {
-                        "commands": [{"T": 133, "X": pan, "Y": tilt, "SPD": 200, "ACC": 10}],
+                        "commands": [{"T": 133, "X": round(pan, 1), "Y": tilt, "SPD": 200, "ACC": 10}],
                         "speak": f"I remember seeing {obj_name} over here.",
                         "observe": True,
                     }
@@ -4357,7 +4094,9 @@ def main():
                         if obj_name2:
                             tracker.pause(30)
                             response = {
-                                "commands": [{"T": 133, "X": entry2["pan"], "Y": entry2["tilt"],
+                                "commands": [{"T": 133,
+                                              "X": round(spatial_map.gimbal_pan_for(entry2, pose.body_yaw), 1),
+                                              "Y": entry2["tilt"],
                                               "SPD": 200, "ACC": 10}],
                                 "speak": f"Found {obj_name2} over here.",
                                 "observe": True,
