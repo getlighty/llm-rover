@@ -12,13 +12,20 @@ Usage:
 """
 
 import os, sys, json, re, time, signal, subprocess, threading, queue
+import collections
 import importlib
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
+import math
 
 import serial
 import cv2
 import numpy as np
+
+# ── Extracted modules ──────────────────────────────────────────────────
+
+import audio
+import prompts
+import reflection
+import web_ui
 
 # ── Config ──────────────────────────────────────────────────────────────
 
@@ -35,17 +42,85 @@ if os.path.exists(_env_file):
                 _k, _v = _line.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
 
-# Load provider from CLI arg
+# ── Log Event Bus ──────────────────────────────────────────────────────
+
+_log_events = collections.deque(maxlen=500)
+_log_lock = threading.Lock()
+
+def log_event(category, data):
+    """Append a structured log event and print to stdout."""
+    entry = {"ts": time.time(), "cat": category, "data": data}
+    with _log_lock:
+        _log_events.append(entry)
+    print(f"[{category}] {data}", flush=True)
+
+def get_log_events_since(last_ts):
+    """Return list of events newer than last_ts."""
+    with _log_lock:
+        return [e for e in _log_events if e["ts"] > last_ts]
+
+# ── Provider Loading ───────────────────────────────────────────────────
+
+# Load provider from CLI arg (sets initial LLM provider)
 _provider_name = sys.argv[1] if len(sys.argv) > 1 else "groq"
 provider = importlib.import_module(f"provider_{_provider_name}")
 
+# Decoupled STT / LLM / TTS modules
+stt_mod = importlib.import_module("stt_groq")
+llm_mod = provider  # reuse provider_*.call_llm()
+tts_mod = importlib.import_module("tts_groq")
+
+_stt_name = "groq"
+_llm_name = _provider_name
+_tts_name = "groq"
+
+AVAILABLE_PROVIDERS = {
+    "stt": ["groq"],
+    "llm": ["groq", "xai", "anthropic", "ollama"],
+    "tts": ["groq", "elevenlabs"],
+}
+
+def set_provider(kind, name):
+    """Hot-swap a provider at runtime. kind = 'stt'|'llm'|'tts'."""
+    global stt_mod, llm_mod, tts_mod, _stt_name, _llm_name, _tts_name
+    if kind == "stt":
+        mod = importlib.import_module(f"stt_{name}")
+        importlib.reload(mod)
+        stt_mod = mod
+        _stt_name = name
+    elif kind == "llm":
+        mod = importlib.import_module(f"provider_{name}")
+        importlib.reload(mod)
+        llm_mod = mod
+        _llm_name = name
+    elif kind == "tts":
+        mod = importlib.import_module(f"tts_{name}")
+        importlib.reload(mod)
+        tts_mod = mod
+        _tts_name = name
+    else:
+        raise ValueError(f"Unknown provider kind: {kind}")
+    log_event("system", f"Switched {kind} to {name}")
+
 SERIAL_PORT = "/dev/ttyTHS1"
 SERIAL_BAUD = 115200
-IDENTITY_FILE = os.path.join(ROVER_DIR, "identity.md")
-MEMORY_FILE = os.path.join(ROVER_DIR, "memory.md")
 
 MAX_OBSERVE_ROUNDS = 15
 STOP_WORDS = {"stop", "halt", "freeze", "emergency"}
+desk_mode = False  # When True, all wheel commands (T=1) are blocked
+stt_enabled = True  # When False, voice_thread skips STT (mic muted)
+
+def _check_floor(resp):
+    """Auto-toggle desk_mode based on LLM's on_floor field."""
+    global desk_mode
+    on_floor = resp.get("on_floor")
+    if on_floor is None:
+        return
+    new_mode = not on_floor
+    if new_mode != desk_mode:
+        desk_mode = new_mode
+        log_event("system", f"Auto desk mode: {'ON (elevated)' if desk_mode else 'OFF (on floor)'}")
+
 HALLUCINATIONS = {
     ".", "..", "...", "Thank you.", "Thanks for watching.",
     "Bye.", "Thank you for watching.", "Subscribe.",
@@ -53,6 +128,37 @@ HALLUCINATIONS = {
     "Hmm.", "Mm-hmm.", "Uh-huh.", "Oh.", "Ah.",
     "So.", "Well.", "Right.", "Sure.", "OK.",
 }
+
+import re as _re
+
+def _is_gibberish(text):
+    """Return True if STT text looks like noise/bleed rather than a real command."""
+    stripped = text.strip().rstrip(".")
+    # Too short after stripping punctuation
+    if len(stripped) < 3:
+        return True
+    # Single word that isn't a plausible command
+    words = stripped.split()
+    if len(words) == 1 and stripped.lower() not in (
+        "stop", "halt", "go", "forward", "backward", "back", "left", "right",
+        "spin", "look", "scan", "hello", "hi", "hey", "help", "status",
+        "faster", "slower", "lights", "dance", "explore", "navigate",
+        "where", "what", "who", "why", "how", "cancel", "quiet", "reset",
+        "yes", "no", "come", "stay", "wait", "move", "turn", "park",
+    ):
+        return True
+    # Mostly non-ASCII → likely non-English STT artifact
+    ascii_chars = sum(1 for c in stripped if c.isascii())
+    if len(stripped) > 0 and ascii_chars / len(stripped) < 0.7:
+        return True
+    # Mostly non-alpha (sound effects like "Pfff", "Tss", random chars)
+    alpha_chars = sum(1 for c in stripped if c.isalpha())
+    if len(stripped) > 3 and alpha_chars / len(stripped) < 0.5:
+        return True
+    # Repetitive single-char patterns like "aaah", "pfff", "shhh"
+    if len(words) == 1 and len(stripped) >= 3 and len(set(stripped.lower())) <= 2:
+        return True
+    return False
 
 # ── Serial ──────────────────────────────────────────────────────────────
 
@@ -62,7 +168,7 @@ class Serial:
         self._lock = threading.Lock()
         time.sleep(0.1)
         self.ser.reset_input_buffer()
-        print(f"[serial] Opened {port} @ {baud}")
+        log_event("system", f"Serial opened {port} @ {baud}")
 
     def _send_raw(self, cmd):
         """Send a command without acquiring the lock (caller must hold it)."""
@@ -70,11 +176,14 @@ class Serial:
             # Pauses are handled in execute() to keep them interruptible
             return
         if isinstance(cmd, dict) and cmd.get("T") == 1:
+            if desk_mode and (cmd.get("L", 0) != 0 or cmd.get("R", 0) != 0):
+                log_event("system", "Desk mode: wheel command blocked")
+                return
             cmd = dict(cmd, L=-cmd.get("R", 0), R=-cmd.get("L", 0))
         raw = json.dumps(cmd) + "\n"
         self.ser.write(raw.encode("utf-8"))
         self.ser.readline()
-        print(f"  -> {json.dumps(cmd)}")
+        log_event("serial", json.dumps(cmd))
 
     def send(self, cmd):
         with self._lock:
@@ -91,7 +200,7 @@ class Serial:
         except Exception:
             pass
         self.ser.close()
-        print("[serial] Closed")
+        log_event("system", "Serial closed")
 
 # ── Camera ──────────────────────────────────────────────────────────────
 
@@ -109,7 +218,7 @@ class Camera:
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
-        print("[camera] Ready (640x480)")
+        log_event("system", "Camera ready (640x480)")
 
     def _capture_loop(self):
         while self._running:
@@ -146,57 +255,7 @@ class Camera:
     def close(self):
         self._running = False
         self.cap.release()
-        print("[camera] Closed")
-
-# ── Video Stream Server ─────────────────────────────────────────────────
-
-_camera_ref = None  # set in main()
-
-class StreamHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/snap":
-            jpg = _camera_ref.get_jpeg() if _camera_ref else None
-            if jpg:
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(jpg)))
-                self.end_headers()
-                self.wfile.write(jpg)
-            else:
-                self.send_error(503)
-        elif self.path == "/stream":
-            self.send_response(200)
-            self.send_header("Content-Type",
-                             "multipart/x-mixed-replace; boundary=frame")
-            self.end_headers()
-            try:
-                while True:
-                    jpg = _camera_ref.get_jpeg() if _camera_ref else None
-                    if jpg:
-                        self.wfile.write(b"--frame\r\n")
-                        self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                        self.wfile.write(f"Content-Length: {len(jpg)}\r\n\r\n".encode())
-                        self.wfile.write(jpg)
-                        self.wfile.write(b"\r\n")
-                    time.sleep(0.1)  # ~10 fps stream
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-        else:
-            self.send_error(404)
-
-    def log_message(self, format, *args):
-        pass  # suppress request logs
-
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-
-def start_stream_server(cam, port=8090):
-    global _camera_ref
-    _camera_ref = cam
-    server = ThreadedHTTPServer(("0.0.0.0", port), StreamHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    print(f"[stream] http://localhost:{port}/stream  /snap")
+        log_event("system", "Camera closed")
 
 # ── Smart Flash Snapshot ────────────────────────────────────────────────
 
@@ -213,276 +272,13 @@ def snap_with_flash(cam, ser):
     brightness = float(np.mean(img)) if img is not None else 255.0
 
     if brightness < LOW_LIGHT_THRESHOLD:
-        print(f"[flash] Low light ({brightness:.0f}), lights on for snap")
+        log_event("system", f"Flash: low light ({brightness:.0f})")
         ser.send({"T": 132, "IO4": 255, "IO5": 255})
         time.sleep(0.15)  # let lights illuminate
         frame = cam.snap()
         ser.send({"T": 132, "IO4": 0, "IO5": 0})
         return frame
     return cam.snap()
-
-# ── Audio Input ─────────────────────────────────────────────────────────
-
-def find_mic():
-    result = subprocess.run(["arecord", "-l"], capture_output=True, text=True)
-    mic_card = None
-    fallback = None
-    for line in result.stdout.splitlines():
-        if "card" in line and "USB" in line:
-            card_num = line.split("card")[1].split(":")[0].strip()
-            if "Camera" in line:
-                mic_card = card_num
-            elif fallback is None:
-                fallback = card_num
-    card = mic_card or fallback
-    if card is None:
-        raise RuntimeError("No USB mic found")
-    dev = f"plughw:{card},0"
-    subprocess.run(["amixer", "-c", card, "cset", "numid=2", "on"],
-                   capture_output=True)
-    print(f"[mic] Found ALSA device {dev} (unmuted)")
-    return dev, card
-
-def find_speaker():
-    try:
-        out = subprocess.check_output(["aplay", "-l"], text=True)
-        for line in out.splitlines():
-            if "USB" in line and "card" in line:
-                card = line.split("card ")[1].split(":")[0]
-                dev = line.split("device ")[1].split(":")[0]
-                spk = f"plughw:{card},{dev}"
-                print(f"[speaker] Found {spk}")
-                return spk
-    except Exception:
-        pass
-    return "plughw:1,0"
-
-def listen(mic_device, abort_event=None):
-    rate = 48000
-    chunk_sec = 0.5
-    chunk_samples = int(rate * chunk_sec)
-    silence_thresh = 0.03
-    min_speech = 2
-    max_speech = 240
-    silence_after_long = 4   # 2s silence for longer utterances
-    silence_after_short = 2  # 1s silence for short bursts (e.g. "stop")
-    short_threshold = 4      # <= 4 speech chunks (2s) = short utterance
-
-    proc = subprocess.Popen(
-        ["arecord", "-D", mic_device, "-f", "S16_LE", "-r", str(rate),
-         "-c", "1", "-t", "raw", "--buffer-size", str(chunk_samples)],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-    speech_chunks = []
-    speech_started = False
-    silent_count = 0
-
-    try:
-        while True:
-            if abort_event and abort_event.is_set():
-                return None
-            raw = proc.stdout.read(chunk_samples * 2)
-            if len(raw) < chunk_samples * 2:
-                break
-            chunk = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            rms = float(np.sqrt(np.mean(chunk ** 2)))
-
-            if rms > silence_thresh:
-                if not speech_started:
-                    speech_started = True
-                    print("[voice] Hearing speech...", flush=True)
-                speech_chunks.append(chunk)
-                silent_count = 0
-            elif speech_started:
-                speech_chunks.append(chunk)
-                silent_count += 1
-                # Short utterance = shorter silence wait (faster stop detection)
-                needed = silence_after_short if len(speech_chunks) <= short_threshold else silence_after_long
-                if silent_count >= needed:
-                    break
-            if len(speech_chunks) >= max_speech:
-                break
-    finally:
-        proc.kill()
-        proc.wait()
-
-    if len(speech_chunks) < min_speech:
-        return None
-    return np.concatenate(speech_chunks)
-
-# ── System Prompt ───────────────────────────────────────────────────────
-
-def build_system_prompt():
-    parts = []
-    if os.path.exists(IDENTITY_FILE):
-        with open(IDENTITY_FILE) as f:
-            parts.append(f.read().strip())
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE) as f:
-            parts.append(f.read().strip())
-    parts.append("""## Response Format
-Reply with ONLY a single-line compact JSON object. No newlines inside the JSON. No markdown fences.
-{"commands":[<ESP32 JSON cmds>],"speak":"<5 words max>","observe":true/false,"remember":"<optional note>","landmarks":[{"name":"<what>","pan":<gimbal angle when seen>,"dist":"<near/mid/far>"},...]}
-
-Use {"_pause": <seconds>} in the commands array to insert delays between commands.
-
-## Body Size — Know Your Limits
-You are 26cm wide, 35cm long, 20cm tall (without gimbal). With gimbal raised: 30cm tall.
-- You CANNOT fit through gaps narrower than 30cm.
-- Chair legs, narrow spaces between furniture, gaps under low shelves — you will get stuck.
-- Before driving into a space, estimate if you fit. If it looks tight, DON'T try — go around.
-- If a doorway or corridor looks narrow, slow down and center yourself carefully.
-- You are low to the ground — you can go UNDER tables (if >25cm clearance) but NOT between tight chair legs.
-
-## CRITICAL: Camera ≠ Body Direction
-Your camera is on the gimbal (your head). When your head is panned, the camera does NOT face the same direction as your body.
-- Wheels move the BODY: forward (L+,R+) = body's front direction, backward (L-,R-) = body's rear.
-- The camera shows what your HEAD sees, which may be sideways or behind you.
-- If gimbal is at pan=0: camera and body face the same way. Wheels work as expected.
-- If gimbal is at pan=90 (looking right): the camera sees what's to your RIGHT. Driving "forward" (L+,R+) moves the body PERPENDICULAR to what the camera sees (body goes left relative to camera view).
-- If gimbal is at pan=120 (looking back-right): driving "backward" (L-,R-) actually moves TOWARD what the camera sees.
-
-**RULE: Before sending wheel commands, ALWAYS check your current gimbal pan angle.**
-- If pan ≠ 0, you MUST first align your body to face the camera direction (incremental turning as described below), THEN drive.
-- NEVER send wheel commands based on what you see in the camera unless pan=0. What you see and where your body drives are DIFFERENT when the head is rotated.
-- To move AWAY from something you see with pan≠0: first align body to face it (turn toward it), THEN back up.
-- To move TOWARD something you see with pan≠0: first align body to face it (turn toward it), THEN drive forward.
-
-## ESP32 Commands
-- Wheels: {"T":1, "L":<m/s>, "R":<m/s>} — max 1.0, default slow 0.2, negative=backward
-- Gimbal (your head): {"T":133, "X":<pan -180..180>, "Y":<tilt -30..90>, "SPD":<50-500>, "ACC":<10-30>}
-- Gimbal stop: {"T":135}
-- Lights: {"T":132, "IO4":<base 0-255>, "IO5":<head 0-255>}
-- OLED: {"T":3, "lineNum":<0-3>, "Text":"<max 16 chars>"}
-- Feedback: {"T":130}
-- Emergency stop: {"T":0}
-
-## Turning Toward Objects — BODY follows CAMERA, never the reverse
-CRITICAL RULE: The gimbal (camera/head) finds the target. Then the BODY rotates to match. NEVER reset the gimbal to 0 first — that loses sight of the target and the body drives into whatever it was already facing.
-
-### Process:
-1. Gimbal finds target at pan=X. KEEP the gimbal there — it's your eyes on the target.
-2. ROTATE THE BODY toward where the gimbal is pointing. Turn duration = |X| / 120 seconds.
-   - Gimbal panned RIGHT (X>0): body turns right → {"T":1,"L":0.15,"R":-0.15}
-   - Gimbal panned LEFT (X<0): body turns left → {"T":1,"L":-0.15,"R":0.15}
-3. WHILE the body turns, SIMULTANEOUSLY reduce gimbal pan to keep the target in view.
-4. AFTER the body has finished turning, THEN set gimbal to 0. Now body faces the target.
-5. Drive forward.
-
-### Example: door seen at pan=50 (right)
-Step 1 — body turns right, gimbal compensates to hold target:
-  {"T":1,"L":0.15,"R":-0.15}, {"_pause":0.4}, {"T":1,"L":0,"R":0}, {"T":133,"X":0,"Y":0,"SPD":150,"ACC":15} → observe=true
-Step 2 — verify target is ahead, then drive:
-  {"T":1,"L":0.1,"R":0.1} → observe=true
-
-### WRONG (never do this):
-  {"T":133,"X":0,"Y":0,...} THEN {"T":1,"L":0.1,"R":0.1}  ← WRONG: resets camera first, body drives wherever it was facing, target is lost.
-
-### Key rules:
-- Body ALWAYS follows camera. Camera NEVER follows body.
-- Don't reset gimbal to 0 until the body has turned to match.
-- Good enough is good enough — don't over-align, but always turn the body first.
-
-## Gimbal Tracking During Navigation
-When navigating toward a goal (door, hallway, object), KEEP the gimbal pointed at the target while driving. Do NOT reset to 0,0 and drive blind.
-- If the exit/target is at pan=20 right, keep gimbal at X=20 while steering the body right with differential drive to close the angle.
-- Only set gimbal to 0 when the body is already aimed at the target (pan is near 0 naturally).
-- This way you ALWAYS have eyes on the target. If you lose sight, stop and scan to reacquire.
-- Think of it like looking where you want to go while steering — you don't stare straight ahead and hope.
-
-## Spatial Memory — Landmarks
-Every observe round, log what you see in the "landmarks" field. Each entry:
-- "name": what it is (door, wall, chair, bag, person, hallway, open space)
-- "pan": the gimbal pan angle when you saw it (this is the heading relative to your body)
-- "dist": "near" (<50cm), "mid" (50cm-2m), "far" (>2m)
-
-Example: {"landmarks":[{"name":"door","pan":45,"dist":"mid"},{"name":"wall","pan":-30,"dist":"near"},{"name":"open hallway","pan":90,"dist":"far"}]}
-
-Use your accumulated landmarks to navigate:
-- You scanned left and saw a wall at pan=-60. You scanned right and saw a door at pan=50. Now you KNOW the door is to your right — head there.
-- If you drove forward and the door was at pan=50 last round, it's probably still roughly to your right. Steer toward it.
-- Landmarks persist in conversation history, so you can reference what you saw earlier even if you can't see it now.
-- Update landmarks each round — distances and angles change as you move.
-
-## Observe Mode
-Set "observe": true when you need to SEE the result before deciding next.
-Your commands execute, a fresh camera frame is captured, and you get called again.
-Use for: looking around, searching, navigating, checking results.
-Max 5 rounds per cycle. Set observe to false (or omit) on your final round.
-When observe returns an image: if the target is visible, note its pan angle from your landmarks, steer body toward it.
-
-## Task Persistence
-When given a complex goal (e.g. "find a way out", "go to the kitchen", "find the door"), PERSIST across observe rounds. Do NOT give up after one scan. Strategy:
-1. Quick scan: one look left, center, right to get bearings (1-2 rounds max).
-2. Make your BEST GUESS about which direction leads to the goal — even if you can't see it yet. Use common sense:
-   - Doors and hallways likely lead to other rooms.
-   - Open space = good direction to explore.
-   - "Kitchen", "bathroom", "bedroom" — guess based on typical house layout and any clues (sounds, light, floor type).
-   - If you see a corridor or doorway, go through it — it probably leads somewhere useful.
-3. COMMIT and START MOVING. Do not over-scan. Pick a direction and go.
-4. Drive a short distance (0.1 m/s for 1-2 seconds), then observe again.
-5. Repeat: after each drive, re-evaluate. Adjust course toward the goal.
-6. If blocked, try a different direction — but always keep moving.
-7. Keep going until the goal is reached or you've exhausted all options.
-
-IMPORTANT: You will almost NEVER see the target immediately. That's fine — use spatial reasoning and intuition to navigate toward it. Don't say "I can't see it" and stop. Instead, pick the most promising direction and drive. Explore actively. A wrong guess that keeps you moving is better than standing still scanning endlessly.
-
-## Stuck Recovery
-The system monitors your camera frames. If the scene hasn't changed for 3+ rounds, you'll see:
-** STUCK DETECTED **
-This means your wheel commands are NOT working — you're physically blocked or spinning in place.
-Recovery strategy:
-1. BACK UP first: {"T":1,"L":-0.15,"R":-0.15}, {"_pause":1.5}, {"T":1,"L":0,"R":0}
-2. Turn your body 90-180 degrees away from the obstacle.
-3. Try a COMPLETELY different direction — not a small adjustment.
-4. If stuck twice in a row, do a full 180 and go the opposite way.
-NEVER repeat the same commands that got you stuck. Each stuck warning means you must change strategy drastically.
-
-## Continuous Movement During Navigation
-When navigating, do NOT stop between observe rounds to think. Keep moving at a slow crawl speed (0.1 m/s) while you evaluate the next frame. Only stop wheels when you need to:
-- Make a sharp turn (> 45 degrees)
-- You are about to physically collide (obstacle fills >80% of frame, almost touching)
-- You've arrived at the goal
-For each observe round during navigation, END your commands with slow forward motion: {"T":1,"L":0.1,"R":0.1} — do NOT add a stop command after it. The next observe round will adjust or stop if needed. This keeps the rover flowing smoothly instead of jerky stop-start.
-
-## Wall & Obstacle Avoidance
-- Only back up when you are ACTUALLY about to collide — an obstacle fills >80% of the frame AND is clearly within 15cm (you can barely see any floor in front of you).
-- People, pets, furniture that are visible but clearly 50cm+ away are NOT a collision threat. Drive past them or steer around — do NOT back away.
-- To steer around obstacles: use differential wheel speeds. Curve left: {"T":1,"L":0.05,"R":0.15}. Curve right: {"T":1,"L":0.15,"R":0.05}.
-- Prefer open space, but don't be afraid of objects at a distance. Only react when things are VERY close.
-- Be OPTIMISTIC: if there's a gap, try it. If something is far away, keep driving toward your goal.
-- Backing up is a LAST RESORT — only when physically touching or about to touch something. Otherwise steer around.
-
-## Rules
-- Always include physical expression (nod, look, tilt) in commands — you're a robot, move your head
-- "speak" max 5 words — terse, robotic
-- Default wheel speed 0.2 m/s for general commands, 0.1 m/s during autonomous navigation
-- GIMBAL TRACKS THE TARGET while navigating. Keep your eyes on the goal. Body steers to follow.
-- Only set gimbal to 0 when body already faces the target (pan angle is near 0).
-- Only back up if physically blocked (obstacle fills >80% of frame, no visible floor ahead)
-- Lights: off by default. System flashes them automatically for camera in dark conditions. But if the USER asks for lights on/off, obey with {"T":132,"IO4":<0-255>,"IO5":<0-255>}
-- NEVER fabricate what you see. If unclear, say so. Only describe what's actually in the image.
-
-## Examples
-- "nod" → {"commands":[{"T":133,"X":0,"Y":30,"SPD":300,"ACC":20},{"_pause":0.3},{"T":133,"X":0,"Y":-10,"SPD":300,"ACC":20},{"_pause":0.3},{"T":133,"X":0,"Y":0,"SPD":200,"ACC":10}],"speak":"Sure."}
-- "look around" → {"commands":[{"T":133,"X":-60,"Y":0,"SPD":200,"ACC":15}],"speak":"Looking.","observe":true}
-- "go forward" → {"commands":[{"T":1,"L":0.2,"R":0.2},{"_pause":2},{"T":1,"L":0,"R":0}],"speak":"Moving."}
-- "find the door" → {"commands":[{"T":133,"X":-90,"Y":0,"SPD":200,"ACC":15}],"speak":"Searching.","observe":true}
-- target at pan=40 (right), body turns right FIRST → {"commands":[{"T":1,"L":0.15,"R":-0.15},{"_pause":0.35},{"T":1,"L":0,"R":0},{"T":133,"X":0,"Y":0,"SPD":150,"ACC":15}],"speak":"Turning.","observe":true}
-- target at pan=-60 (left), body turns left FIRST → {"commands":[{"T":1,"L":-0.15,"R":0.15},{"_pause":0.5},{"T":1,"L":0,"R":0},{"T":133,"X":0,"Y":0,"SPD":150,"ACC":15}],"speak":"Turning.","observe":true}
-- wall too close → {"commands":[{"T":1,"L":-0.15,"R":-0.15},{"_pause":1.0},{"T":1,"L":0,"R":0}],"speak":"Backing up.","observe":true}
-
-## Mid-Plan User Messages
-Sometimes the user will speak to you DURING an observe loop. Their message appears as:
-** USER SAID (mid-plan): "..." **
-
-How to handle:
-- Minor adjustments ("turn right", "slower", "look up"): incorporate into your next commands without abandoning the plan.
-- Questions ("what do you see?", "where are we?"): answer in "speak" AND continue the plan.
-- Contradictions ("actually go left"): adjust your plan direction. Don't restart from scratch — just change course.
-- The user's original request is still your primary goal unless they explicitly say otherwise.
-- If in doubt, keep going with the plan and acknowledge the user's input in "speak".""")
-    return "\n\n".join(parts)
 
 # ── LLM wrapper ─────────────────────────────────────────────────────────
 
@@ -491,20 +287,20 @@ history = []
 def call_llm(text, jpeg_bytes):
     """Call provider LLM, parse JSON response."""
     global history
-    system = build_system_prompt()
+    system = prompts.build_system_prompt()
 
     history.append({"role": "user", "content": text})
     if len(history) > 10:
         history = history[-10:]
 
     try:
-        reply = provider.call_llm(text, jpeg_bytes, system, history)
+        reply = llm_mod.call_llm(text, jpeg_bytes, system, history)
     except Exception as e:
-        print(f"[llm] Error: {e}")
+        log_event("error", f"LLM error: {e}")
         reply = json.dumps({"commands": [], "speak": "LLM error."})
 
     history.append({"role": "assistant", "content": reply})
-    print(f"[llm] {reply}")
+    log_event("llm", reply)
 
     # Parse — strip fences, find outermost {}, attempt repair
     clean = reply.strip()
@@ -528,36 +324,73 @@ def call_llm(text, jpeg_bytes):
         return json.loads(repaired)
     except json.JSONDecodeError:
         pass
-    print(f"[llm] Failed to parse JSON: {clean[:200]}")
+    log_event("error", f"JSON parse failed: {clean[:200]}")
     return {"commands": [], "speak": "Hmm."}
+
 
 # ── Command Execution ───────────────────────────────────────────────────
 
-def _interruptible_sleep(secs, stop_event=None):
+def _interruptible_sleep(secs, stop_ev=None):
     """Sleep in small increments, checking stop_event."""
     elapsed = 0.0
     while elapsed < secs:
-        if stop_event and stop_event.is_set():
+        if stop_ev and stop_ev.is_set():
             return True  # interrupted
         time.sleep(min(0.1, secs - elapsed))
         elapsed += 0.1
     return False
 
-def execute(ser, commands, stop_event=None):
-    last_pan, last_tilt = 0.0, 0.0
+DRIVE_PAN_LIMIT = 30  # max |pan| degrees to allow forward/backward driving
+WHEEL_SEP = 0.20      # meters between left/right wheels
+
+def execute(ser, commands, stop_ev=None):
+    global _gimbal_pan
+    last_pan = _gimbal_pan  # start from actual current gimbal position
+    last_tilt = 0.0
+    pending_spin = None     # (L, R) of a spin command awaiting its _pause
+
     for cmd in commands:
-        if stop_event and stop_event.is_set():
+        if stop_ev and stop_ev.is_set():
             ser.stop()
             return
         # Handle _pause without holding serial lock
         if "_pause" in cmd:
             secs = float(cmd["_pause"])
             if secs > 0:
-                print(f"  (_pause {secs:.2f}s)")
-                if _interruptible_sleep(secs, stop_event):
+                log_event("serial", f"_pause {secs:.2f}s")
+                if _interruptible_sleep(secs, stop_ev):
                     ser.stop()
                     return
+                # Auto-compensate gimbal after body spin to keep camera steady
+                if pending_spin is not None:
+                    sp_l, sp_r = pending_spin
+                    omega = (sp_r - sp_l) / WHEEL_SEP  # rad/s
+                    body_delta_deg = math.degrees(omega * secs)
+                    new_pan = last_pan - body_delta_deg
+                    new_pan = max(-180, min(180, new_pan))
+                    if abs(new_pan - last_pan) > 2:
+                        gimbal_cmd = {"T": 133, "X": round(new_pan, 1),
+                                      "Y": last_tilt, "SPD": 300, "ACC": 20}
+                        ser.send(gimbal_cmd)
+                        log_event("system",
+                            f"Gimbal compensate: body turned {body_delta_deg:+.0f}°, "
+                            f"pan {last_pan:.0f}→{new_pan:.0f}°")
+                        last_pan = round(new_pan, 1)
+                        _gimbal_pan = last_pan
+                    pending_spin = None
             continue
+        # Safety: block forward/backward driving when head is turned sideways
+        if isinstance(cmd, dict) and cmd.get("T") == 1:
+            l, r = cmd.get("L", 0), cmd.get("R", 0)
+            if l != 0 or r != 0:
+                is_spin = (l != 0 and r != 0 and (l > 0) != (r > 0))
+                if is_spin:
+                    pending_spin = (l, r)
+                elif abs(last_pan) > DRIVE_PAN_LIMIT:
+                    log_event("system",
+                        f"Blocked drive: head at pan={last_pan:.0f}° "
+                        f"(limit ±{DRIVE_PAN_LIMIT}°). Align head first.")
+                    continue
         ser.send(cmd)
         t = cmd.get("T")
         if t == 133:
@@ -566,18 +399,26 @@ def execute(ser, commands, stop_event=None):
             spd = cmd.get("SPD", 200)
             dist = abs(new_pan - last_pan) + abs(new_tilt - last_tilt)
             wait = max(0.15, dist / max(spd, 1) * 1.1)
-            if _interruptible_sleep(wait, stop_event):
+            if _interruptible_sleep(wait, stop_ev):
                 ser.stop()
                 return
             last_pan, last_tilt = new_pan, new_tilt
+            _gimbal_pan = last_pan  # sync to global for radar
+        elif t == 1:
+            # Non-spin wheel command clears pending_spin
+            l, r = cmd.get("L", 0), cmd.get("R", 0)
+            if not (l != 0 and r != 0 and (l > 0) != (r > 0)):
+                pending_spin = None
 
 # ── Memory ──────────────────────────────────────────────────────────────
+
+MEMORY_FILE = os.path.join(ROVER_DIR, "memory.md")
 
 def save_memory(note):
     ts = time.strftime("%Y-%m-%d %H:%M")
     with open(MEMORY_FILE, "a") as f:
         f.write(f"- {note} [{ts}]\n")
-    print(f"[memory] Saved: {note}")
+    log_event("system", f"Memory saved: {note}")
 
 # ── Stuck Detection ────────────────────────────────────────────────────
 
@@ -607,6 +448,11 @@ def frame_similarity(jpg_a, jpg_b):
 
 CANCEL_WORDS = {"cancel", "forget it", "nevermind", "never mind", "abort"}
 
+# Negative feedback detection
+NEGATIVE_WORDS = {"wrong", "bad", "nope"}
+NEGATIVE_PHRASES = ("not that", "other one", "wrong way", "wrong one",
+                    "not there", "why did you", "no no", "what are you doing")
+
 interrupt_queue = queue.Queue()   # voice thread → run_plan (inject messages)
 command_queue = queue.Queue()     # voice thread → main loop (new commands)
 plan_active = threading.Event()   # True while observe loop is running
@@ -615,12 +461,124 @@ stop_event = threading.Event()    # Signals immediate stop to executor
 # Will be set in main() so voice_thread can call ser.stop() directly
 _ser_ref = None
 
+# ── 2D World Map ──────────────────────────────────────────────────────
+
+_map_lock = threading.Lock()
+_landmarks = {}       # name → {"name","x","y","type","ts"}
+_rover_x = 0.0        # world position meters
+_rover_y = 0.0
+_rover_heading = 0.0  # radians, 0 = +Y (forward at boot)
+_gimbal_pan = 0.0     # degrees
+LANDMARK_MAX_AGE = 300  # 5 minutes
+
+def _dist_to_meters(d):
+    """Convert dist field to meters. Accepts number or legacy string."""
+    if isinstance(d, (int, float)):
+        return float(d)
+    return {"near": 0.4, "mid": 1.2, "far": 2.5}.get(str(d), 1.2)
+
+def _update_pose_from_commands(commands):
+    """Dead-reckon rover position from wheel commands."""
+    global _rover_x, _rover_y, _rover_heading
+    WHEEL_SEP = 0.20  # meters between left/right wheels
+    for cmd in commands:
+        if not isinstance(cmd, dict):
+            continue
+        if cmd.get("T") == 1:
+            L = cmd.get("L", 0)
+            R = cmd.get("R", 0)
+            if L == 0 and R == 0:
+                continue
+            # Find the associated _pause duration
+            idx = commands.index(cmd)
+            dt = 0.0
+            for j in range(idx + 1, len(commands)):
+                c2 = commands[j]
+                if isinstance(c2, dict) and "_pause" in c2:
+                    dt = float(c2["_pause"])
+                    break
+            if dt == 0:
+                dt = 0.3  # default if no pause follows
+            v = (L + R) / 2.0
+            omega = (R - L) / WHEEL_SEP
+            _rover_heading += omega * dt
+            _rover_x += v * dt * math.sin(_rover_heading)
+            _rover_y += v * dt * math.cos(_rover_heading)
+
+def _update_landmarks(resp):
+    """Convert LLM body-relative x,y landmarks to world coords and merge."""
+    now = time.time()
+    commands = resp.get("commands", [])
+    lm = resp.get("landmarks")
+    if lm and isinstance(lm, list):
+        with _map_lock:
+            for entry in lm:
+                name = entry.get("name", "")
+                if not name:
+                    continue
+                bx = float(entry.get("x", 0))
+                by = float(entry.get("y", 0))
+                if "pan" in entry and ("x" not in entry or "y" not in entry):
+                    pan_deg = entry.get("pan", 0)
+                    dist_m = _dist_to_meters(entry.get("dist", 1.2))
+                    bx = dist_m * math.sin(math.radians(pan_deg))
+                    by = dist_m * math.cos(math.radians(pan_deg))
+                cos_h = math.cos(_rover_heading)
+                sin_h = math.sin(_rover_heading)
+                wx = _rover_x + bx * cos_h + by * sin_h
+                wy = _rover_y - bx * sin_h + by * cos_h
+                _landmarks[name] = {
+                    "name": name,
+                    "x": round(wx, 2), "y": round(wy, 2),
+                    "type": entry.get("type", "object"),
+                    "ts": now,
+                }
+            stale = [k for k, v in _landmarks.items() if now - v["ts"] > LANDMARK_MAX_AGE]
+            for k in stale:
+                del _landmarks[k]
+    # Update rover pose AFTER placing landmarks at current position
+    _update_pose_from_commands(commands)
+
+def _get_map_state():
+    now = time.time()
+    with _map_lock:
+        lm = []
+        for v in _landmarks.values():
+            entry = dict(v)
+            entry["age"] = now - v["ts"]
+            lm.append(entry)
+        return {
+            "landmarks": lm,
+            "rover": {"x": _rover_x, "y": _rover_y,
+                       "heading": math.degrees(_rover_heading),
+                       "gimbal_pan": _gimbal_pan},
+        }
+
+def _truncate_after_first_gimbal(commands):
+    """Keep only up to the first gimbal move + its pause. Returns truncated list."""
+    truncated = []
+    gimbal_seen = False
+    for cmd in commands:
+        truncated.append(cmd)
+        if isinstance(cmd, dict) and cmd.get("T") == 133:
+            if gimbal_seen:
+                truncated.pop()
+                break
+            gimbal_seen = True
+        elif gimbal_seen and "_pause" not in (cmd if isinstance(cmd, dict) else {}):
+            break
+    return truncated
+
+def _speak(text, spk, mic_card):
+    """Speak with TTS via audio module."""
+    audio.speak(text, tts_mod, spk, mic_card, log_fn=log_event)
+
 def _clean_words(text):
     """Strip punctuation and return lowercase word set."""
     return set(re.sub(r'[^\w\s]', '', text.lower()).split())
 
 def classify_interrupt(text):
-    """Classify an interrupt: stop / cancel / override / inject."""
+    """Classify an interrupt: stop / cancel / feedback_negative / override / inject."""
     words = _clean_words(text)
     if words & STOP_WORDS:
         return "stop"
@@ -631,6 +589,12 @@ def classify_interrupt(text):
     for phrase in ("forget it", "never mind"):
         if phrase in lower:
             return "cancel"
+    # Check for negative feedback
+    if words & NEGATIVE_WORDS:
+        return "feedback_negative"
+    for phrase in NEGATIVE_PHRASES:
+        if phrase in lower:
+            return "feedback_negative"
     first_word = re.sub(r'[^\w]', '', text.lower().split()[0]) if text.strip() else ""
     action_starters = {"go", "find", "navigate", "drive", "turn", "look",
                        "move", "come", "search", "back", "reverse"}
@@ -641,24 +605,30 @@ def classify_interrupt(text):
 def voice_thread(mic_dev, mic_card):
     """Always-on listener. Routes messages to interrupt_queue or command_queue."""
     while True:
-        audio = listen(mic_dev)
-        if audio is None:
+        if not stt_enabled:
+            time.sleep(0.5)
+            continue
+        audio_data = audio.listen(mic_dev)
+        if audio_data is None:
             continue
 
         try:
-            text = provider.transcribe(audio)
+            text = stt_mod.transcribe(audio_data)
         except Exception as e:
-            print(f"[stt] Error: {e}")
+            log_event("error", f"STT error: {e}")
             continue
 
         if not text or text in HALLUCINATIONS or len(text) <= 2:
             continue
+        if _is_gibberish(text):
+            log_event("heard", f"(ignored gibberish) {text}")
+            continue
 
-        print(f'[heard] "{text}"')
+        log_event("heard", text)
 
         if plan_active.is_set():
             kind = classify_interrupt(text)
-            print(f"[interrupt] {kind}: {text}")
+            log_event("interrupt", f"{kind}: {text}")
 
             if kind == "stop":
                 stop_event.set()
@@ -675,13 +645,20 @@ def voice_thread(mic_dev, mic_card):
                 stop_event.set()
                 command_queue.put(text)
 
+            elif kind == "feedback_negative":
+                # Inject into plan AND flag for reflection
+                interrupt_queue.put(text)
+
             elif kind == "inject":
                 interrupt_queue.put(text)
         else:
             command_queue.put(text)
 
 def run_plan(text, ser, cam, spk, mic_card):
-    """Execute an LLM command cycle with interruptible observe loop."""
+    """Execute an LLM command cycle with interruptible observe loop.
+
+    Returns metadata dict: {original_text, feedback, stuck_count, rounds, interrupted}
+    """
     plan_active.set()
     stop_event.clear()
     # Drain any stale interrupts
@@ -691,67 +668,108 @@ def run_plan(text, ser, cam, spk, mic_card):
         except queue.Empty:
             break
 
+    # Tracking for reflection
+    plan_feedback = []       # negative feedback texts
+    total_stuck_events = 0   # number of stuck detections
+    plan_history = []        # brief round summaries
+
     frame = snap_with_flash(cam, ser)
     if frame is None:
         plan_active.clear()
-        return
+        return {"original_text": text, "feedback": [], "stuck_count": 0,
+                "rounds": 0, "interrupted": False, "history": []}
 
     resp = call_llm(text, frame)
+    _check_floor(resp)
+    _update_landmarks(resp)
     commands = resp.get("commands", [])
     say = resp.get("speak", "")
     observe = resp.get("observe", False)
     remember = resp.get("remember")
 
+    if observe and commands:
+        commands = _truncate_after_first_gimbal(commands)
+
     if say:
-        try:
-            provider.speak(say, spk, mic_card)
-        except Exception as e:
-            print(f"[tts] {e}")
+        _speak(say, spk, mic_card)
+        plan_history.append(f"Said: {say}")
     if remember:
         save_memory(remember)
 
+    # Init local gimbal tracking from the first response's commands
     gimbal_pan, gimbal_tilt = 0.0, 0.0
+    for cmd in commands:
+        if isinstance(cmd, dict) and cmd.get("T") == 133:
+            gimbal_pan = cmd.get("X", gimbal_pan)
+            gimbal_tilt = cmd.get("Y", gimbal_tilt)
     round_num = 0
     prev_frame = frame          # for stuck detection
     similar_count = 0           # consecutive similar frames
     wheels_were_active = False  # did last command set include wheel motion?
+    was_interrupted = False
 
     while True:
         if stop_event.is_set():
-            print("[plan] Interrupted — stopping.")
+            log_event("plan", "Interrupted — stopping.")
             ser.stop()
+            was_interrupted = True
             plan_active.clear()
-            return
+            return {"original_text": text, "feedback": plan_feedback,
+                    "stuck_count": total_stuck_events, "rounds": round_num,
+                    "interrupted": True, "history": plan_history}
+
+        # During observe rounds, truncate after the first gimbal move
+        if observe and commands:
+            commands = _truncate_after_first_gimbal(commands)
 
         # Track gimbal + check for wheel commands + detect turning
+        # Also build action summary for the LLM to understand what happened
         wheels_were_active = False
         is_turning = False
+        action_parts = []
         for cmd in commands:
             if isinstance(cmd, dict):
                 if cmd.get("T") == 133:
                     gimbal_pan = cmd.get("X", gimbal_pan)
                     gimbal_tilt = cmd.get("Y", gimbal_tilt)
+                    action_parts.append(f"Head moved to pan={gimbal_pan:.0f}°")
                 if cmd.get("T") == 1:
                     l, r = cmd.get("L", 0), cmd.get("R", 0)
-                    if l != 0 or r != 0:
-                        wheels_were_active = True
-                    # Opposite signs = body rotation
-                    if l != 0 and r != 0 and (l > 0) != (r > 0):
+                    if l == 0 and r == 0:
+                        action_parts.append("Wheels stopped")
+                    elif l != 0 and r != 0 and (l > 0) != (r > 0):
                         is_turning = True
+                        wheels_were_active = True
+                        direction = "right" if l > 0 else "left"
+                        action_parts.append(f"Body spun {direction}")
+                    elif l != 0 or r != 0:
+                        wheels_were_active = True
+                        if l > 0 and r > 0:
+                            if abs(l - r) < 0.03:
+                                action_parts.append(f"Drove forward at {(l+r)/2:.2f} m/s")
+                            elif l > r:
+                                action_parts.append(f"Curved right at {(l+r)/2:.2f} m/s")
+                            else:
+                                action_parts.append(f"Curved left at {(l+r)/2:.2f} m/s")
+                        elif l < 0 and r < 0:
+                            action_parts.append(f"Backed up at {abs((l+r)/2):.2f} m/s")
+        last_action = "; ".join(action_parts) if action_parts else "No commands"
 
         execute(ser, commands, stop_event)
 
         if stop_event.is_set():
             ser.stop()
             plan_active.clear()
-            return
+            return {"original_text": text, "feedback": plan_feedback,
+                    "stuck_count": total_stuck_events, "rounds": round_num,
+                    "interrupted": True, "history": plan_history}
 
         if not observe:
             break
 
         round_num += 1
         if round_num >= MAX_OBSERVE_ROUNDS:
-            print("[plan] Max observe rounds reached.")
+            log_event("plan", "Max observe rounds reached.")
             break
 
         # Skip delay during active turning — send frame ASAP
@@ -761,7 +779,9 @@ def run_plan(text, ser, cam, spk, mic_card):
         if stop_event.is_set():
             ser.stop()
             plan_active.clear()
-            return
+            return {"original_text": text, "feedback": plan_feedback,
+                    "stuck_count": total_stuck_events, "rounds": round_num,
+                    "interrupted": True, "history": plan_history}
 
         frame = snap_with_flash(cam, ser)
         if frame is None:
@@ -775,35 +795,42 @@ def run_plan(text, ser, cam, spk, mic_card):
         else:
             thresh = STUCK_SIM_STATIC
             needed = STUCK_ROUNDS_STATIC
-        print(f"[sim] {sim:.3f} thresh={thresh} wheels={'ON' if wheels_were_active else 'off'}")
+        log_event("system", f"sim={sim:.3f} thresh={thresh} wheels={'ON' if wheels_were_active else 'off'}")
         if sim >= thresh:
             similar_count += 1
         else:
             similar_count = 0
         prev_frame = frame
-        stuck = similar_count >= needed
+        stuck = similar_count >= needed and not desk_mode
         if stuck:
-            print(f"[STUCK] {similar_count} rounds (wheels={'ON' if wheels_were_active else 'off'}, sim={sim:.3f})")
+            total_stuck_events += 1
+            log_event("stuck", f"{similar_count} rounds (wheels={'ON' if wheels_were_active else 'off'}, sim={sim:.3f})")
+            plan_history.append(f"Stuck #{total_stuck_events}")
 
         # Drain injected messages
         injected = []
         while not interrupt_queue.empty():
             try:
-                injected.append(interrupt_queue.get_nowait())
+                msg = interrupt_queue.get_nowait()
+                injected.append(msg)
+                # Check if this is negative feedback
+                msg_kind = classify_interrupt(msg)
+                if msg_kind == "feedback_negative":
+                    plan_feedback.append(msg)
+                    plan_history.append(f"Negative feedback: {msg}")
             except queue.Empty:
                 break
 
         drive_hint = ""
         if is_turning:
             drive_hint = (
-                f"You just turned (gimbal at pan={gimbal_pan:.0f}). "
-                f"Keep gimbal tracking the target. Steer body to close the angle. "
-                f"Don't reset gimbal to 0 until body faces the target. ")
+                f"You just spun the body. Center your head (pan→0), "
+                f"then observe to confirm the target is ahead before driving. ")
         elif round_num <= 2:
             drive_hint = "Survey first — pan head to find the best route. "
         elif round_num <= 4:
-            drive_hint = ("You've scanned enough. Now COMMIT: pick the best direction, "
-                          "align body, and START DRIVING at 0.1 m/s. ")
+            drive_hint = ("You've scanned enough. Now COMMIT: align body to target, "
+                          "center head, confirm target is ahead, then drive at 0.1 m/s. ")
         else:
             drive_hint = ("Keep driving toward the goal at 0.1 m/s. "
                           "Only stop if wall fills >60% of frame. ")
@@ -813,7 +840,7 @@ def run_plan(text, ser, cam, spk, mic_card):
             stuck_hint = (
                 f"\n\n** PUSHING AGAINST OBSTACLE ({similar_count} rounds, wheels ON but no movement) ** "
                 f"You are driving into something and NOT moving. STOP wheels immediately. "
-                f"BACK UP: {'{'}\"T\":1,\"L\":-0.15,\"R\":-0.15{'}'}, then turn 90-180 degrees "
+                f"BACK UP: {{\"T\":1,\"L\":-0.15,\"R\":-0.15}}, then turn 90-180 degrees "
                 f"and try a COMPLETELY different direction. Do NOT keep driving forward.")
         elif stuck:
             stuck_hint = (
@@ -830,31 +857,79 @@ def run_plan(text, ser, cam, spk, mic_card):
                 f"If it's a minor adjustment, adapt. "
                 f"If it contradicts your goal, acknowledge and adjust.")
 
+        # Use actual gimbal position from execute() (single source of truth)
+        actual_pan = _gimbal_pan
+        gimbal_pan = actual_pan  # sync local tracking
+
+        # Camera sees in direction: body + gimbal_pan
+        # Wheels drive along: body direction (pan=0)
+        if abs(actual_pan) <= 30:
+            look_vs_drive = "Camera and wheels face the SAME direction. You can drive toward what you see."
+        else:
+            look_vs_drive = (
+                f"Camera is pointed {abs(actual_pan):.0f}° {'right' if actual_pan > 0 else 'left'} "
+                f"of your body. Wheels will NOT drive toward what you see. "
+                f"You MUST spin body to align, center head, and confirm before driving.")
+
+        # Scene change from stuck detection
+        if sim < 0.7:
+            scene_change = "Scene changed significantly from last frame."
+        elif sim < STUCK_SIM_DRIVING:
+            scene_change = "Scene changed slightly from last frame."
+        else:
+            scene_change = "Scene looks almost identical to last frame."
+
         prompt = (
-            f"[Observe round {round_num}/{MAX_OBSERVE_ROUNDS}] "
-            f"Head at pan={gimbal_pan:.0f}, tilt={gimbal_tilt:.0f}. "
-            f'Original request: "{text}". '
+            f'** YOUR CURRENT TASK: "{text}" **\n\n'
+            f"[Observe round {round_num}/{MAX_OBSERVE_ROUNDS}]\n"
+            f"Last action: {last_action}\n"
+            f"Result: {scene_change}\n"
+            f"Gimbal: pan={actual_pan:.0f}°, tilt={gimbal_tilt:.0f}°\n"
+            f"{look_vs_drive}\n\n"
             f"{drive_hint}"
-            f"If target visible: keep gimbal on it, steer body toward it. "
-            f"End commands with motion toward goal unless blocked."
+            f"This is a NEW camera frame taken AFTER your last commands. "
+            f"Evaluate: does it match your task? Is the path clear? "
+            f"Only drive if confirmed."
             f"{stuck_hint}{user_context}")
 
         resp = call_llm(prompt, frame)
+        _check_floor(resp)
+        _update_landmarks(resp)
         commands = resp.get("commands", [])
         say = resp.get("speak", "")
         observe = resp.get("observe", False)
         remember = resp.get("remember")
 
         if say:
-            try:
-                provider.speak(say, spk, mic_card)
-            except Exception as e:
-                print(f"[tts] {e}")
+            _speak(say, spk, mic_card)
+            plan_history.append(f"Round {round_num}: {say}")
         if remember:
             save_memory(remember)
 
-    # Execute final commands if not already done in last round
     plan_active.clear()
+    return {"original_text": text, "feedback": plan_feedback,
+            "stuck_count": total_stuck_events, "rounds": round_num,
+            "interrupted": was_interrupted, "history": plan_history}
+
+# ── Provider/state helpers for web_ui ──────────────────────────────────
+
+def _get_providers():
+    return {
+        "current": {"stt": _stt_name, "llm": _llm_name, "tts": _tts_name},
+        "available": AVAILABLE_PROVIDERS,
+        "desk_mode": desk_mode,
+        "stt_enabled": stt_enabled,
+    }
+
+def _set_desk_mode(val):
+    global desk_mode
+    desk_mode = val
+    log_event("system", f"Desk mode: {'ON' if desk_mode else 'OFF'}")
+
+def _set_stt_enabled(val):
+    global stt_enabled
+    stt_enabled = val
+    log_event("system", f"STT: {'ON' if stt_enabled else 'OFF'}")
 
 # ── Main Loop ───────────────────────────────────────────────────────────
 
@@ -866,14 +941,33 @@ def main():
     ser = Serial()
     _ser_ref = ser
     cam = Camera()
-    start_stream_server(cam)
-    mic_dev, mic_card = find_mic()
-    spk = find_speaker()
 
-    print(f"[provider] {provider.NAME}")
+    # Initialize and start web UI
+    web_ui.init(
+        camera=cam, serial=ser,
+        get_log_events_since=get_log_events_since,
+        get_map_state=_get_map_state,
+        log_event=log_event,
+        set_provider=set_provider,
+        get_providers=_get_providers,
+        set_desk_mode=_set_desk_mode,
+        set_stt_enabled=_set_stt_enabled,
+        plan_active=plan_active,
+        stop_event=stop_event,
+        command_queue=command_queue,
+        interrupt_queue=interrupt_queue,
+        classify_interrupt=classify_interrupt,
+    )
+    web_ui.start_server()
+
+    mic_dev, mic_card = audio.find_mic()
+    spk = audio.find_speaker()
+
+    log_event("system", f"LLM provider: {llm_mod.NAME}")
+    log_event("system", f"STT: {stt_mod.NAME}, TTS: {tts_mod.NAME}")
 
     def cleanup(*_):
-        print("\n[shutdown]")
+        log_event("system", "Shutdown")
         stop_event.set()
         ser.close()
         cam.close()
@@ -889,19 +983,12 @@ def main():
     vt = threading.Thread(target=voice_thread, args=(mic_dev, mic_card), daemon=True)
     vt.start()
 
-    print("\n=== rover_brain_llm ready ===\n")
+    log_event("system", "rover_brain_llm ready")
 
-    # Startup greeting
-    frame = snap_with_flash(cam, ser)
-    if frame:
-        resp = call_llm("You just booted up. Greet briefly and look around with a head movement.", frame)
-        execute(ser, resp.get("commands", []))
-        try:
-            provider.speak(resp.get("speak", "Online."), spk, mic_card)
-        except Exception as e:
-            print(f"[tts] {e}")
+    # Startup greeting — runs through run_plan for proper scan truncation
+    run_plan("You just booted up. Greet briefly and look around with a head movement.", ser, cam, spk, mic_card)
 
-    # Main loop — wait for commands from voice thread
+    # Main loop — wait for commands from voice thread or web UI
     while True:
         try:
             text = command_queue.get(timeout=0.5)
@@ -913,8 +1000,32 @@ def main():
             ser.stop()
             continue
 
-        print(f"[plan] Starting: {text}")
-        run_plan(text, ser, cam, spk, mic_card)
+        log_event("plan", f"Starting: {text}")
+        result = run_plan(text, ser, cam, spk, mic_card)
+
+        # ── Post-plan reflection ──
+        if result is None:
+            continue
+
+        trigger = None
+        if result["feedback"]:
+            trigger = "feedback_negative"
+        elif result["stuck_count"] >= 3:
+            trigger = "stuck_repeated"
+        elif result["interrupted"] and result["rounds"] > 0:
+            trigger = "cancelled"
+
+        if trigger:
+            log_event("system", f"Reflecting on plan (trigger={trigger})")
+            def _do_reflect(req=result["original_text"], trig=trigger,
+                            fb=list(result["feedback"]),
+                            sc=result["stuck_count"],
+                            hist=list(result.get("history", []))):
+                reflection.reflect(
+                    req, trig, feedback=fb, stuck_count=sc,
+                    history=hist, log_fn=log_event)
+            t = threading.Thread(target=_do_reflect, daemon=True)
+            t.start()
 
 if __name__ == "__main__":
     main()
