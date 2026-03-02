@@ -11,7 +11,8 @@
 ## Hardware Specs
 - **Wheels**: 6x 65mm diameter, skid-steer differential drive
 - **Max speed**: 1.0 m/s (but default to 0.20 m/s — Ovi's preference)
-- **Turn rate**: ~120 deg/s at 0.35 m/s wheel speed
+- **Body size**: 25cm wide, 35cm long
+- **Turn rate**: ~200 deg/s at 0.35 m/s wheel speed (encoder-guided)
 - **Gimbal**: Pan -180..+180, Tilt -30..+90, SPD 50-500, ACC 10-30
 - **Camera**: USB 640x480 @ 30fps, wide-angle lens (~65 deg horizontal FOV)
 - **Lights**: Base (IO4) + Head (IO5), 0-255 PWM
@@ -108,6 +109,15 @@
 - `approach(target_name)` — drive toward detected object
 - `scan_and_find(target_name)` — sweep, find, then approach
 - Proportional gimbal + wheel control at ~10Hz
+- Floor obstacle check via FloorNavigator during approach
+
+### FloorNavigator — Continuous Obstacle Avoidance
+- `drive_toward(direction, speed, timeout)` — drive forward avoiding obstacles in real-time
+- `drive_to_object(target_name)` — approach a YOLO target while avoiding floor obstacles
+- `drive_through_opening()` — center in doorway opening using Hough edge detection
+- `check_floor_clear(detections, w, h)` — quick clearance query for other modules
+- Divides floor zone into 16 columns, finds widest passable gap (>=25cm body width)
+- No occupancy grid — works in camera pixel space at ~10Hz
 
 ### PathPlanner — Autonomous Navigation
 - `WorldMap(rover, detector, tracker, pose)` — 2D occupancy grid in XY meters

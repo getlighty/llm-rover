@@ -25,18 +25,21 @@ class VisualServo:
     2. Wheel driving: forward speed + differential steering from gimbal pan offset
     """
 
-    def __init__(self, rover, detector, tracker, emergency_event=None):
+    def __init__(self, rover, detector, tracker, emergency_event=None,
+                 floor_nav=None):
         """
         Args:
             rover: RoverSerial instance (sends JSON commands to ESP32)
             detector: LocalDetector instance (runs YOLOv8)
             tracker: HumanTracker instance (owns camera, provides get_jpeg())
             emergency_event: Optional threading.Event — abort when set
+            floor_nav: Optional FloorNavigator — floor obstacle checking
         """
         self.rover = rover
         self.detector = detector
         self.tracker = tracker
         self._emergency_event = emergency_event
+        self._floor_nav = floor_nav
 
         # --- Gimbal P-control gains ---
         self.gimbal_gain_x = 40.0   # degrees per unit error (0..1 range)
@@ -168,6 +171,28 @@ class VisualServo:
                 R = self.drive_speed - steer
                 L = max(-0.3, min(0.5, L))
                 R = max(-0.3, min(0.5, R))
+
+                # Floor obstacle check: is the path ahead clear?
+                if self._floor_nav is not None:
+                    h_f, w_f = frame.shape[:2]
+                    # Map steering direction to a column
+                    center = self._floor_nav.NUM_COLUMNS / 2.0
+                    col_w = w_f / self._floor_nav.NUM_COLUMNS
+                    steer_col = int(center + (steer / self.max_steer)
+                                    * (center - 1)) if self.max_steer else int(center)
+                    steer_col = max(0, min(self._floor_nav.NUM_COLUMNS - 1,
+                                           steer_col))
+                    clear, alt_col = self._floor_nav.check_floor_clear(
+                        detections, w_f, h_f, steer_col)
+                    if not clear:
+                        if alt_col is not None:
+                            # Steer toward the clear gap instead
+                            L, R = self._floor_nav._col_to_steer(
+                                alt_col, self.drive_speed)
+                        else:
+                            # Completely blocked — stop
+                            L, R = 0, 0
+
                 self.rover.send({"T": 1, "L": round(L, 3), "R": round(R, 3)})
             else:
                 # Object too far off-center — stop wheels, let gimbal catch up

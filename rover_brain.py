@@ -78,7 +78,103 @@ TRACK_WIDTH_M = 0.20           # left-right distance between wheel contact patch
 # theoretical = (2 * speed / track_width) * (180/pi)
 # At 0.35 m/s: (0.7 / 0.20) * 57.3 = 200 deg/s theoretical, ~60% efficiency for skid-steer
 TURN_SPEED = 0.35              # m/s per wheel during rotation
-TURN_RATE_DPS = 120.0          # calibrated degrees per second at TURN_SPEED (tune this!)
+TURN_RATE_DPS = 200.0          # measured ~205°/s at TURN_SPEED via encoders
+
+# Encoder-guided spin parameters
+ENC_SPIN_TOLERANCE_DEG = 5.0   # stop wheels when within this many degrees of target
+ENC_SPIN_OVERSHOOT_DEG = 30.0  # bail if we overshoot target by this much
+ENC_SPIN_TIMEOUT_S = 4.0       # max time to wait for rotation to complete
+ENC_SPIN_POLL_HZ = 10          # encoder poll rate during spin
+ENC_SPIN_TRACK_WIDTH = 0.20    # effective track width for skid-steer (calibrate!)
+
+
+def _encoder_spin(rover, target_delta_deg, stop_event=None):
+    """Closed-loop rotation using wheel encoder speeds from T:1001.
+
+    Wheels must already be spinning when called.
+    Reads encoder-measured L/R speeds, integrates differential to track rotation.
+    Uses (v_R - v_L) / track_width convention: positive = CCW (left turn).
+    Comparison uses absolute values so target sign convention doesn't matter.
+
+    Returns (actual_delta_deg, timed_out) or None if no encoder data.
+    """
+    target_abs = abs(target_delta_deg)
+    accumulated_rad = 0.0
+    deadline = time.time() + ENC_SPIN_TIMEOUT_S
+    poll_interval = 1.0 / ENC_SPIN_POLL_HZ
+    timed_out = False
+    last_time = None
+
+    while time.time() < deadline:
+        if stop_event and stop_event.is_set():
+            break
+
+        data = rover.read_imu()  # reads next T:1001 line
+        if data is None:
+            time.sleep(poll_interval)
+            continue
+
+        now = time.time()
+        if last_time is None:
+            # First reading — record time, no dt yet
+            last_time = now
+            time.sleep(poll_interval)
+            continue
+
+        dt = now - last_time
+        last_time = now
+
+        v_l = float(data.get("L", 0))
+        v_r = float(data.get("R", 0))
+
+        # Differential drive: omega = (R - L) / track (positive = CCW/left)
+        omega_rad = (v_r - v_l) / ENC_SPIN_TRACK_WIDTH
+        accumulated_rad += omega_rad * dt
+
+        accumulated_abs = abs(math.degrees(accumulated_rad))
+
+        # Responsiveness check: after 0.5s, rotation should be measurable
+        elapsed = now - (deadline - ENC_SPIN_TIMEOUT_S)
+        if elapsed >= 0.5 and accumulated_abs < ENC_SPIN_TOLERANCE_DEG:
+            print(f"[encoder_spin] No rotation detected after 0.5s "
+                  f"(L={v_l:.3f}, R={v_r:.3f}), falling back to timed")
+            return None  # DON'T stop wheels — caller uses timed sleep
+
+        # Target reached
+        if accumulated_abs >= target_abs - ENC_SPIN_TOLERANCE_DEG:
+            break
+
+        # Overshoot protection
+        if accumulated_abs > target_abs + ENC_SPIN_OVERSHOOT_DEG:
+            print(f"[encoder_spin] Overshoot: {accumulated_abs:.1f}° vs target {target_abs:.1f}°")
+            break
+
+        time.sleep(poll_interval)
+    else:
+        timed_out = True
+
+    # Stop wheels
+    rover.send({"T": 1, "L": 0, "R": 0})
+
+    actual_deg = math.degrees(accumulated_rad)
+    label = "TIMEOUT" if timed_out else "OK"
+    print(f"[encoder_spin] target={target_delta_deg:+.0f}°, actual={actual_deg:+.1f}° {label}")
+
+    if last_time is None:
+        return None  # never got encoder data
+    return (actual_deg, timed_out)
+
+
+# --- Magnetometer-guided spin (DISABLED — needs firmware with working gyro/AHRS) ---
+# MAG_SPIN_TOLERANCE_DEG = 5.0
+# MAG_SPIN_OVERSHOOT_DEG = 30.0
+# MAG_SPIN_TIMEOUT_S = 4.0
+# MAG_SPIN_POLL_HZ = 10
+#
+# def _mag_spin(rover, imu_poller, target_delta_deg, stop_event=None):
+#     """Monitor magnetometer heading during spin. Needs working AHRS yaw."""
+#     pass  # Re-enable after flashing firmware with gyro + AHRS Euler angles
+
 
 SYSTEM_PROMPT = """\
 You are a rover robot with a speaker, camera, wheels, and a pan-tilt head. You are spartan and direct. You do what you're told and say only what's needed. No small talk, no unsolicited descriptions, no narrating what you see unless explicitly asked.
@@ -762,6 +858,24 @@ class RoverSerial:
         except Exception:
             pass
         return self._last_feedback
+
+    def read_imu(self):
+        """Read one T:1001 IMU line from the ESP32 stream. Returns dict or None."""
+        try:
+            with self._lock:
+                for _ in range(5):
+                    line = self._ser.readline().decode("utf-8", errors="ignore").strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        if data.get("T") == 1001:
+                            return data
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            pass
+        return None
 
     def close(self):
         self._running = False
@@ -2675,6 +2789,7 @@ def main():
         print(f"[detector] YOLO init failed: {_det_err}")
         local_detector = None
     visual_servo = None
+    floor_nav = None
     LABEL_OVERRIDES = {}
     world_map = None
     path_planner = None
@@ -2685,6 +2800,37 @@ def main():
     pose = PoseTracker()
     rover._on_command = pose.on_command
     print(f"[pose] Tracker active (wheelbase={PoseTracker.WHEELBASE}m)")
+
+    # --- IMU Poller (DISABLED — magnetometer/gyro unusable with current firmware) ---
+    # Re-enable after flashing firmware with working gyro + AHRS Euler angles.
+    imu_poller = None
+    # try:
+    #     from imu import IMUPoller
+    #     imu_poller = IMUPoller(rover, log_fn=lambda cat, msg: print(f"[{cat}] {msg}"))
+    #     imu_poller.start()
+    #     time.sleep(0.5)
+    #     if imu_poller.read_once():
+    #         imu_poller.set_heading_offset()
+    #         print(f"[imu] Poller started, boot heading offset set ({imu_poller.state.mag_heading_raw:.1f}° raw)")
+    #     else:
+    #         print("[imu] Poller started, but initial read failed (heading uncalibrated)")
+    # except Exception as e:
+    #     print(f"[imu] IMU poller unavailable: {e}")
+    #     imu_poller = None
+    #
+    # if imu_poller:
+    #     _orig_on_command = pose.on_command
+    #     def _pose_and_imu_on_command(cmd):
+    #         _orig_on_command(cmd)
+    #         if isinstance(cmd, dict) and cmd.get("T") == 1:
+    #             v_l = cmd.get("L", 0)
+    #             v_r = cmd.get("R", 0)
+    #             if v_l != 0 or v_r != 0:
+    #                 imu_poller.wheels_active.set()
+    #             else:
+    #                 imu_poller.wheels_active.clear()
+    #     rover._on_command = _pose_and_imu_on_command
+    print("[imu] IMU poller disabled (using encoder-guided turns instead)")
 
     # --- Path Planner (survey, vectorized paths, door navigation) ---
     try:
@@ -2967,13 +3113,42 @@ def main():
         last_tilt = getattr(execute_response, '_tilt', 0.0)
 
         def _run_commands(commands, last_pan, last_tilt):
+            pending_spin = None  # tracks active spin for mag-guided turns
+
             for cmd in commands:
                 # --- Explicit pause pseudo-command ---
                 if "_pause" in cmd:
                     secs = float(cmd["_pause"])
                     if secs > 0:
+                        # Encoder-guided spin: use wheel encoders instead of timer
+                        if pending_spin:
+                            expected_deg = pending_spin["omega_dps"] * secs
+                            yaw_before = pose.body_yaw
+                            spin_t0 = time.time()
+                            result = _encoder_spin(rover, expected_deg,
+                                                   stop_event=emergency_event)
+                            if result is not None:
+                                actual_deg, timed_out = result
+                                drift = abs(abs(actual_deg) - abs(expected_deg))
+                                if drift > 10:
+                                    print(f"  [encoder_spin] Drift: expected={expected_deg:+.0f}°, "
+                                          f"actual={actual_deg:+.1f}° (slip={drift:.0f}°)")
+                                # Override PoseTracker with encoder measurement
+                                pose.body_yaw = ((yaw_before + actual_deg + 180) % 360) - 180
+                                pending_spin = None
+                                print(f"  (_pause {secs:.2f}s → encoder_spin)")
+                                continue
+                            # _encoder_spin returned None — fall back to timed
+                            already = time.time() - spin_t0
+                            remaining = max(0, secs - already)
+                            print(f"  [encoder_spin] No data, falling back to timed ({remaining:.2f}s remaining)")
+                            time.sleep(remaining)
+                            print(f"  (_pause {secs:.2f}s, timed fallback)")
+                            pending_spin = None
+                            continue
                         time.sleep(secs)
                         print(f"  (_pause {secs:.2f}s)")
+                    pending_spin = None
                     continue
 
                 # Handle virtual commands
@@ -3002,8 +3177,25 @@ def main():
                 rover.send(cmd)
                 print(f"  -> {json.dumps(cmd)}")
 
-                # Auto-wait for gimbal moves (unless an explicit _pause follows)
+                # Detect spin commands for mag-guided turns
                 t = cmd.get("T")
+                if t == 1:
+                    v_l = cmd.get("L", 0)
+                    v_r = cmd.get("R", 0)
+                    # Spin = opposite wheel directions (one pos, one neg)
+                    if v_l != 0 and v_r != 0 and (v_l > 0) != (v_r > 0):
+                        # Estimate expected rotation: omega = (R - L) / wheelbase
+                        omega_rad = (v_r - v_l) / PoseTracker.WHEELBASE
+                        # Will be multiplied by pause duration later — store rate
+                        pending_spin = {"omega_dps": math.degrees(omega_rad),
+                                        "v_l": v_l, "v_r": v_r,
+                                        "expected_deg": 0}  # set when _pause arrives
+                    else:
+                        pending_spin = None
+                else:
+                    pending_spin = None
+
+                # Auto-wait for gimbal moves (unless an explicit _pause follows)
                 wait = 0
 
                 if t == 133:
@@ -3168,16 +3360,33 @@ def main():
                         angle = door.get("angle", 0)
                         dist = door.get("dist", 0)
                         print(f"[plan] Door already in map at angle={angle}° dist={dist:.1f}m")
-                        # Turn to face the door
+                        # Turn to face the door (encoder-guided)
                         if abs(angle) > 10:
-                            rotation_time = abs(angle) / TURN_RATE_DPS
                             sign = -1 if angle < 0 else 1
+                            yaw_before = pose.body_yaw
                             rover.send({"T": 1, "L": TURN_SPEED * sign, "R": -TURN_SPEED * sign})
-                            time.sleep(rotation_time)
-                            rover.send({"T": 1, "L": 0, "R": 0})
+                            spin_t0 = time.time()
+                            result = _encoder_spin(rover, float(angle),
+                                                   stop_event=emergency_event)
+                            if result is not None:
+                                actual_deg, _ = result
+                                pose.body_yaw = ((yaw_before + actual_deg + 180) % 360) - 180
+                            else:
+                                rotation_time = abs(angle) / TURN_RATE_DPS
+                                remaining = max(0, rotation_time - (time.time() - spin_t0))
+                                time.sleep(remaining)
+                                rover.send({"T": 1, "L": 0, "R": 0})
                             time.sleep(0.3)
                         # Center gimbal forward
                         rover.send({"T": 133, "X": 0, "Y": 0, "SPD": 200, "ACC": 10})
+                        # Drive through using floor nav if available
+                        if floor_nav and dist < 3.0:
+                            time.sleep(0.3)
+                            ok = floor_nav.drive_through_opening(
+                                timeout=max(5.0, dist / 0.12), speed=0.12)
+                            if ok:
+                                return True, f"Drove through door at {dist:.1f}m"
+                            return True, f"Found door at {dist:.1f}m, path blocked"
                         return True, f"Found door at {dist:.1f}m, facing it"
 
                 # 2. Check spatial map
@@ -3237,7 +3446,21 @@ def main():
                 secs = min(secs, 10.0)  # cap at 10s
                 speed = 0.15
                 if direction in ("backward", "back", "reverse"):
-                    speed = -speed
+                    # Reverse: no floor nav (camera faces forward)
+                    rover.send({"T": 1, "L": -speed, "R": -speed})
+                    time.sleep(secs)
+                    rover.send({"T": 1, "L": 0, "R": 0})
+                    return True, f"Drove {direction} for {secs:.1f}s"
+                # Forward: use floor nav for obstacle avoidance
+                if floor_nav:
+                    nav_dir = "left" if direction == "left" else (
+                        "right" if direction == "right" else "center")
+                    ok = floor_nav.drive_toward(nav_dir, speed=speed,
+                                                timeout=secs)
+                    if ok:
+                        return True, f"Drove {direction} for {secs:.1f}s (floor-nav)"
+                    return True, f"Drove {direction} — stopped for obstacle"
+                # Fallback: blind drive
                 rover.send({"T": 1, "L": speed, "R": speed})
                 time.sleep(secs)
                 rover.send({"T": 1, "L": 0, "R": 0})
@@ -3251,12 +3474,26 @@ def main():
                     degrees = float(parts[1]) if len(parts) > 1 else 90.0
                 except ValueError:
                     degrees = 90.0
-                rotation_time = degrees / TURN_RATE_DPS
                 sign = -1 if direction == "left" else 1  # left = L-, R+
+                target_delta = degrees * sign  # positive = right, negative = left
+                yaw_before = pose.body_yaw
                 rover.send({"T": 1, "L": TURN_SPEED * sign, "R": -TURN_SPEED * sign})
-                time.sleep(rotation_time)
-                rover.send({"T": 1, "L": 0, "R": 0})
-                return True, f"Turned {direction} ~{degrees:.0f} degrees"
+                spin_start = time.time()
+                result = _encoder_spin(rover, target_delta,
+                                       stop_event=emergency_event)
+                if result is not None:
+                    actual_deg, timed_out = result
+                    pose.body_yaw = ((yaw_before + actual_deg + 180) % 360) - 180
+                    label = f"{abs(actual_deg):.0f}" if not timed_out else f"~{abs(actual_deg):.0f}"
+                    return True, f"Turned {direction} {label}° (encoder-guided)"
+                else:
+                    # Fallback: timed rotation (subtract time already spent)
+                    rotation_time = degrees / TURN_RATE_DPS
+                    already = time.time() - spin_start
+                    remaining_time = max(0, rotation_time - already)
+                    time.sleep(remaining_time)
+                    rover.send({"T": 1, "L": 0, "R": 0})
+                    return True, f"Turned {direction} ~{degrees:.0f} degrees"
 
             elif action == "look":
                 # detail: "left" / "right" / "up" / "down" / "center"
@@ -3401,6 +3638,7 @@ def main():
         step_log = []
         consecutive_failures = 0
         total_steps = 0
+        stuck_headings = []  # compass headings at each failure (for untried-direction hints)
 
         print(f"[orchestrator] Starting — goal: \"{goal}\", {len(plan)} steps")
 
@@ -3466,11 +3704,18 @@ def main():
             step_log.append(f"{action}: {result['message'][:60]}")
             print(f"[orchestrator] Result: {'OK' if result['success'] else 'FAIL'} — {result['message'][:80]}")
 
-            # 5. Track consecutive failures
+            # 5. Track consecutive failures + heading history
             if result["success"]:
                 consecutive_failures = 0
+                stuck_headings.clear()
             else:
                 consecutive_failures += 1
+                # Record compass heading at failure for stuck-recovery hints
+                if imu_poller and imu_poller.state.fresh:
+                    hdg = round(imu_poller.heading_deg)
+                    stuck_headings.append(hdg)
+                    print(f"[orchestrator] Failure #{consecutive_failures} at heading {hdg}°, "
+                          f"tried: {stuck_headings}")
                 if consecutive_failures >= 3:
                     print("[orchestrator] 3 consecutive failures — aborting")
                     if voice:
@@ -3497,10 +3742,26 @@ def main():
             time.sleep(0.3)
             jpeg = tracker.get_jpeg()
             remaining_desc = json.dumps(plan) if plan else "[]"
+            # Build heading context for stuck recovery
+            heading_ctx = ""
+            if imu_poller and imu_poller.state.fresh:
+                hdg = round(imu_poller.heading_deg)
+                heading_ctx = f"Current heading: {hdg}°. "
+                if stuck_headings:
+                    # Suggest untried quadrant
+                    tried = set(h // 90 * 90 for h in stuck_headings)
+                    all_quadrants = {0, 90, 180, 270}
+                    untried = all_quadrants - tried
+                    hint = ""
+                    if untried:
+                        suggest = min(untried)
+                        hint = f" Try ~{suggest}° (untried)."
+                    heading_ctx += f"STUCK — tried headings: {stuck_headings}.{hint} "
             eval_prompt = (
                 f"Goal: \"{goal}\"\n"
                 f"Steps completed: {step_log}\n"
                 f"Last step result: {result['message']}\n"
+                f"{heading_ctx}"
                 f"Remaining plan: {remaining_desc}\n"
                 f"Is the goal achieved? If not, should the plan be revised?"
             )
@@ -3541,12 +3802,18 @@ def main():
             _all_prompts.update(_load_prompts(_ppath))
             print(f"[search] Loaded prompts from {_pf}")
 
-    # --- Visual Servo (YOLO 10Hz approach) ---
+    # --- Floor Navigator + Visual Servo (YOLO 10Hz approach) ---
     if local_detector:
+        from floor_nav import FloorNavigator
+        floor_nav = FloorNavigator(rover, local_detector, tracker,
+                                   emergency_event=emergency_event)
+        print("[floor_nav] FloorNavigator ready")
+
         from visual_servo import VisualServo
         visual_servo = VisualServo(rover, local_detector, tracker,
-                                   emergency_event=emergency_event)
-        print("[servo] VisualServo ready")
+                                   emergency_event=emergency_event,
+                                   floor_nav=floor_nav)
+        print("[servo] VisualServo ready (with floor nav)")
 
     search_engine = SearchEngine(
         rover=rover,
@@ -3756,6 +4023,24 @@ def main():
                 print(f"[speed] Set to {pct}% (level {level})")
                 return json.dumps({"status": "ok", "speed_percent": pct})
 
+            elif fn_name == "track_object":
+                return json.dumps({"error": "track_object not available in rover_brain.py mode"})
+
+            elif fn_name == "correct_label":
+                from local_detector import LABEL_OVERRIDES, _save_label_overrides
+                yolo_label = args.get("yolo_label", "").strip().lower()
+                correct_label = args.get("correct_label", "").strip().lower()
+                if not yolo_label or not correct_label:
+                    return json.dumps({"error": "Need yolo_label and correct_label"})
+                if yolo_label == correct_label:
+                    return json.dumps({"status": "no_change", "label": yolo_label})
+                LABEL_OVERRIDES[yolo_label] = correct_label
+                _save_label_overrides()
+                print(f"[detect] Label override: '{yolo_label}' -> '{correct_label}'")
+                return json.dumps({"status": "corrected",
+                                   "yolo_label": yolo_label,
+                                   "correct_label": correct_label})
+
             else:
                 return json.dumps({"error": f"Unknown function: {fn_name}"})
 
@@ -3766,6 +4051,8 @@ def main():
     gemini_live = None
     try:
         from gemini_live import GeminiLiveClient
+        from tools import to_gemini
+        from prompts import build_voice_system_prompt
         gemini_live = GeminiLiveClient(
             api_key=GEMINI_API_KEY,
             model=GEMINI_LIVE_MODEL,
@@ -3773,6 +4060,8 @@ def main():
             result_queue=llm_result_queue,
             playback_device=USB_PLAYBACK,
             voice=GEMINI_TTS_VOICE,
+            system_instruction=build_voice_system_prompt(),
+            tools=to_gemini(),
             mic_mute_fn=voice._mic_mute if voice else None,
             mic_unmute_fn=voice._mic_unmute if voice else None,
         )
@@ -3815,6 +4104,12 @@ def main():
                 if tracker.is_active:
                     seeing = "I CAN see a face right now" if tracker.status == "tracking" else "I CANNOT see anyone right now"
                     user_input += f" [Tracker: {seeing}]"
+
+                # Inject IMU context (heading, voltage, cardinal direction)
+                if imu_poller:
+                    imu_line = imu_poller.get_prompt_line()
+                    if imu_line:
+                        user_input += f" [{imu_line}]"
 
                 # Try Gemini Live WebSocket first
                 if gemini_live and gemini_live.is_connected:
