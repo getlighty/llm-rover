@@ -242,7 +242,11 @@ class Navigator:
             if assessment is None:
                 # LLM failed — drive forward conservatively
                 print(f"[nav] LLM unavailable, driving {DEFAULT_CLEAR_DIST}m")
-                self._execute_blind_drive(DEFAULT_CLEAR_DIST, stuck_count)
+                result, stuck_count = self._execute_blind_drive(
+                    DEFAULT_CLEAR_DIST, stuck_count)
+                if result == "stuck_abort":
+                    self._store_step_result(False, "stuck", wp + 1)
+                    return False
                 continue
 
             scene = assessment.get("scene", "?")
@@ -320,7 +324,7 @@ class Navigator:
                 drive_dist = max(drive_dist, 0.15)
                 drive_angle = assessment.get("drive_angle", 0) if assessment else 0
                 drive_angle = _clamp(drive_angle, -30, 30)
-                result = self._execute_blind_drive(
+                result, stuck_count = self._execute_blind_drive(
                     drive_dist, stuck_count, drive_angle)
                 if result == "stuck_abort":
                     self._store_step_result(False, "stuck", wp + 1)
@@ -328,14 +332,19 @@ class Navigator:
 
             else:
                 consecutive_turns = 0
-                self._execute_blind_drive(DEFAULT_CLEAR_DIST, stuck_count)
+                result, stuck_count = self._execute_blind_drive(
+                    DEFAULT_CLEAR_DIST, stuck_count)
+                if result == "stuck_abort":
+                    self._store_step_result(False, "stuck", wp + 1)
+                    return False
 
         self._say(f"Could not reach {target}")
         self._store_step_result(False, "budget", max_wp)
         return False
 
     def _execute_blind_drive(self, distance, stuck_count, drive_angle=0):
-        """Helper: blind drive + handle stuck.  Returns "ok" or "stuck_abort"."""
+        """Helper: blind drive + handle stuck.
+        Returns tuple: ("ok"|"stuck_abort", updated_stuck_count)."""
         self._last_drive_angle = drive_angle
         angle_str = f" at {drive_angle:+.0f}°" if abs(drive_angle) > 3 else ""
         print(f"[nav] Driving forward {distance:.1f}m{angle_str}")
@@ -355,12 +364,15 @@ class Navigator:
                 stuck_count += 1
                 if stuck_count >= MAX_STUCK_EVENTS:
                     self._say("I keep getting stuck")
-                    return "stuck_abort"
+                    return "stuck_abort", stuck_count
                 self._recover_stuck("")
             else:
                 print("[nav] LLM says path is clear — YOLO ghost, continuing")
                 result = "ok"
-        return "ok"
+        elif result == "ok":
+            # Successful movement reduces stale stuck pressure.
+            stuck_count = max(0, stuck_count - 1)
+        return "ok", stuck_count
 
     def search(self, target):
         """Search only (no drive).  Returns direction dict or None."""

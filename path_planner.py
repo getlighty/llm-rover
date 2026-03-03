@@ -502,13 +502,15 @@ class PathPlanner:
             print("[planner] No path found!")
             return []
 
-        # Convert grid cells to world coordinates
-        raw_path = [self.world._grid_to_world(cx, cy) for cx, cy in path_cells]
+        # Smooth path with obstacle-aware line-of-sight checks.
+        smooth_cells = self._smooth_path_cells(path_cells, inflated)
 
-        # Simplify path — remove collinear points, keep turns
-        waypoints = self._simplify_path(raw_path)
+        # Convert to world coordinates and merge very short segments.
+        raw_waypoints = [self.world._grid_to_world(cx, cy) for cx, cy in smooth_cells]
+        waypoints = self._merge_close_waypoints(raw_waypoints, min_spacing=0.20)
 
-        print(f"[planner] Path: {len(path_cells)} cells → {len(waypoints)} waypoints")
+        print(f"[planner] Path: {len(path_cells)} cells → {len(smooth_cells)} smooth cells "
+              f"→ {len(waypoints)} waypoints")
         return waypoints
 
     def _inflate_grid(self, radius):
@@ -529,38 +531,32 @@ class PathPlanner:
         """A* search on grid. Returns list of (gx, gy) cells or empty list."""
         import heapq
 
+        h, w = grid.shape[:2]
+        start = self._find_nearest_traversable(grid, start)
+        goal = self._find_nearest_traversable(grid, goal)
+        if start is None or goal is None:
+            return []
+
         sx, sy = start
         gx, gy = goal
 
-        # Check goal is reachable — search wider area if needed
-        if grid[gy, gx] == -1:
-            print("[planner] Goal is in obstacle, finding nearest free cell...")
-            best_dist = float('inf')
-            search_r = 30  # search up to 3m radius
-            for dx in range(-search_r, search_r + 1):
-                for dy in range(-search_r, search_r + 1):
-                    nx, ny = gx + dx, gy + dy
-                    if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE and grid[ny, nx] != -1:
-                        d = dx * dx + dy * dy
-                        if d < best_dist:
-                            best_dist = d
-                            gx, gy = nx, ny
-            if best_dist == float('inf'):
-                return []
-            print(f"[planner] Adjusted goal to nearest free cell ({best_dist ** 0.5 * CELL_SIZE:.2f}m away)")
-
         def heuristic(a, b):
-            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+            # Octile distance (admissible for 8-directional movement).
+            dx = abs(a[0] - b[0])
+            dy = abs(a[1] - b[1])
+            return (dx + dy) + (1.41421356237 - 2.0) * min(dx, dy)
 
-        open_set = [(0, sx, sy)]
+        traversal_cost = self._build_traversal_cost(grid)
+        open_set = [(heuristic((sx, sy), (gx, gy)), sx, sy)]
         came_from = {}
-        g_score = {(sx, sy): 0}
+        g_score = {(sx, sy): 0.0}
         visited = set()
 
         # 8-directional movement
         dirs = [(-1, 0), (1, 0), (0, -1), (0, 1),
                 (-1, -1), (-1, 1), (1, -1), (1, 1)]
         costs = [1.0, 1.0, 1.0, 1.0, 1.414, 1.414, 1.414, 1.414]
+        max_visits = int(h * w * 0.95)
 
         while open_set:
             _, cx, cy = heapq.heappop(open_set)
@@ -580,14 +576,20 @@ class PathPlanner:
 
             for (dx, dy), cost in zip(dirs, costs):
                 nx, ny = cx + dx, cy + dy
-                if not (0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE):
+                if not (0 <= nx < w and 0 <= ny < h):
                     continue
                 if grid[ny, nx] == -1:
                     continue
                 if (nx, ny) in visited:
                     continue
 
-                new_g = g_score[(cx, cy)] + cost
+                # Prevent corner-cutting through diagonally touching obstacles.
+                if dx != 0 and dy != 0:
+                    if grid[cy, nx] == -1 or grid[ny, cx] == -1:
+                        continue
+
+                move_cost = cost + float(traversal_cost[ny, nx])
+                new_g = g_score[(cx, cy)] + move_cost
                 if new_g < g_score.get((nx, ny), float('inf')):
                     g_score[(nx, ny)] = new_g
                     f = new_g + heuristic((nx, ny), (gx, gy))
@@ -595,50 +597,129 @@ class PathPlanner:
                     came_from[(nx, ny)] = (cx, cy)
 
             # Limit search to prevent long stalls
-            if len(visited) > 5000:
-                print("[planner] A* search exceeded 5000 nodes, giving up")
+            if len(visited) > max_visits:
+                print(f"[planner] A* search exceeded {max_visits} nodes, giving up")
                 return []
 
         return []
 
-    def _simplify_path(self, path, tolerance=0.15):
-        """Remove collinear/redundant waypoints. Keep turns and endpoints."""
-        if len(path) <= 2:
-            return path
+    def _find_nearest_traversable(self, grid, cell, search_r=30):
+        """Return nearest non-obstacle cell to the requested cell."""
+        h, w = grid.shape[:2]
+        x, y = cell
+        x = max(0, min(w - 1, x))
+        y = max(0, min(h - 1, y))
 
-        simplified = [path[0]]
-        for i in range(1, len(path) - 1):
-            prev = simplified[-1]
-            curr = path[i]
-            next_pt = path[i + 1]
+        if grid[y, x] != -1:
+            return x, y
 
-            # Check if curr is collinear with prev and next
-            dx1 = curr[0] - prev[0]
-            dy1 = curr[1] - prev[1]
-            dx2 = next_pt[0] - curr[0]
-            dy2 = next_pt[1] - curr[1]
+        print(f"[planner] Cell {cell} blocked, searching for nearest traversable...")
+        best = None
+        best_score = float("inf")
+        for dy in range(-search_r, search_r + 1):
+            ny = y + dy
+            if ny < 0 or ny >= h:
+                continue
+            for dx in range(-search_r, search_r + 1):
+                nx = x + dx
+                if nx < 0 or nx >= w:
+                    continue
+                if grid[ny, nx] == -1:
+                    continue
+                # Prefer nearby known-free/door cells over unknown.
+                dist2 = dx * dx + dy * dy
+                unknown_penalty = 4.0 if grid[ny, nx] == 0 else 0.0
+                score = dist2 + unknown_penalty
+                if score < best_score:
+                    best_score = score
+                    best = (nx, ny)
 
-            # Cross product for collinearity
-            cross = abs(dx1 * dy2 - dy1 * dx2)
-            if cross > tolerance:
-                simplified.append(curr)
+        if best is None:
+            return None
 
-        simplified.append(path[-1])
+        moved_m = math.sqrt((best[0] - x) ** 2 + (best[1] - y) ** 2) * CELL_SIZE
+        print(f"[planner] Adjusted blocked cell by {moved_m:.2f}m to {best}")
+        return best
 
-        # Further reduce: merge waypoints that are very close
-        merged = [simplified[0]]
-        for wp in simplified[1:]:
+    def _build_traversal_cost(self, grid):
+        """Extra traversal costs: prefer known free space and wider clearance."""
+        free_mask = (grid != -1).astype(np.uint8)
+        clearance = cv2.distanceTransform(free_mask, cv2.DIST_L2, 3)
+        clearance_r = max(1, int(OBSTACLE_CLEARANCE / CELL_SIZE))
+
+        proximity_penalty = np.clip((clearance_r - clearance) / clearance_r,
+                                    0.0, 1.0) * 0.8
+        unknown_penalty = (grid == 0).astype(np.float32) * 0.35
+        total = proximity_penalty + unknown_penalty
+        total[grid == -1] = 0.0
+        return total
+
+    def _smooth_path_cells(self, path_cells, grid):
+        """Line-of-sight smoothing that preserves obstacle-safe turns."""
+        if len(path_cells) <= 2:
+            return path_cells
+
+        smoothed = [path_cells[0]]
+        anchor_idx = 0
+        while anchor_idx < len(path_cells) - 1:
+            far_idx = anchor_idx + 1
+            while (far_idx + 1 < len(path_cells) and
+                   self._line_is_clear(grid, path_cells[anchor_idx],
+                                       path_cells[far_idx + 1])):
+                far_idx += 1
+            smoothed.append(path_cells[far_idx])
+            anchor_idx = far_idx
+        return smoothed
+
+    def _line_is_clear(self, grid, a, b):
+        """Check that a straight segment does not cross obstacles."""
+        h, w = grid.shape[:2]
+        x0, y0 = a
+        x1, y1 = b
+        dx = x1 - x0
+        dy = y1 - y0
+        steps = max(abs(dx), abs(dy))
+        if steps == 0:
+            return grid[y0, x0] != -1
+
+        cells = []
+        for i in range(steps + 1):
+            t = i / steps
+            x = int(round(x0 + dx * t))
+            y = int(round(y0 + dy * t))
+            if not (0 <= x < w and 0 <= y < h):
+                return False
+            if not cells or cells[-1] != (x, y):
+                cells.append((x, y))
+
+        for i, (x, y) in enumerate(cells):
+            if grid[y, x] == -1:
+                return False
+            if i == 0:
+                continue
+            px, py = cells[i - 1]
+            if abs(x - px) == 1 and abs(y - py) == 1:
+                # Also enforce no diagonal corner-cut in smoothed segments.
+                if grid[py, x] == -1 or grid[y, px] == -1:
+                    return False
+        return True
+
+    def _merge_close_waypoints(self, waypoints, min_spacing=0.20):
+        """Merge waypoints that are too close while preserving final goal."""
+        if len(waypoints) <= 2:
+            return waypoints
+
+        merged = [waypoints[0]]
+        for wp in waypoints[1:]:
             prev = merged[-1]
             dist = math.sqrt((wp[0] - prev[0]) ** 2 + (wp[1] - prev[1]) ** 2)
-            if dist > 0.20:  # minimum 20cm between waypoints
+            if dist > min_spacing:
                 merged.append(wp)
             else:
-                merged[-1] = wp  # replace with later waypoint
+                merged[-1] = wp
 
-        # Always include the goal
-        if merged[-1] != simplified[-1]:
-            merged.append(simplified[-1])
-
+        if merged[-1] != waypoints[-1]:
+            merged.append(waypoints[-1])
         return merged
 
 
