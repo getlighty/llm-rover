@@ -26,7 +26,7 @@ import audio
 import imu as imu_mod
 import orchestrator
 import prompts
-import reflection
+# import reflection  # removed — lessons learned via orchestrator.learn_from_feedback
 import web_ui
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -450,11 +450,13 @@ class Camera:
         self.detector = None
         self.depth_estimator = None  # set from main() if available
         self._det_results = []     # list of detection dicts
+        self._det_persistent = {}  # name → {det, ts} for additive scanning
         self._det_summary = ""     # one-line summary
         self._det_ts = 0.0         # timestamp of last detection
         self._det_jpeg = None      # JPEG with bounding box overlay
         self._det_frame_count = 0  # frame counter for running every 3rd
         self._depth_map = None     # latest depth map (float32 H x W)
+        self._DET_PERSIST_S = 0.8  # keep old detections for this long
 
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
@@ -492,6 +494,20 @@ class Camera:
                                     dets, depth_map)
                             except Exception:
                                 pass
+
+                        # Additive scanning: merge with persistent detections
+                        now = time.time()
+                        current_names = {d["name"] for d in dets}
+                        for d in dets:
+                            self._det_persistent[d["name"]] = {
+                                "det": d, "ts": now}
+                        # Add old detections not seen this frame (if fresh)
+                        for name, entry in list(self._det_persistent.items()):
+                            if (name not in current_names
+                                    and now - entry["ts"] < self._DET_PERSIST_S):
+                                dets.append(entry["det"])
+                            elif now - entry["ts"] >= self._DET_PERSIST_S * 2:
+                                del self._det_persistent[name]
 
                         summary = self.detector.summary(dets)
                         # Draw overlay on a copy
@@ -1420,6 +1436,30 @@ def voice_thread(mic_dev, mic_card):
 
         if plan_active.is_set():
             kind = classify_interrupt(text)
+
+            # Check if "override" is actually the same task (user repeating)
+            if kind == "override" and _last_task:
+                try:
+                    import requests as _req
+                    r = _req.post("http://localhost:11434/api/chat",
+                        json={"model": "qwen3.5:cloud",
+                              "messages": [
+                                  {"role": "system",
+                                   "content": "Reply ONLY yes or no."},
+                                  {"role": "user",
+                                   "content": f'Is "{text}" asking for the same '
+                                              f'thing as "{_last_task}"?'}],
+                              "stream": False, "think": False,
+                              "options": {"num_predict": 5}},
+                        timeout=3)
+                    answer = r.json()["message"]["content"].strip().lower()
+                    if answer.startswith("yes"):
+                        log_event("interrupt",
+                            f"same_task: '{text}' ≈ '{_last_task}'")
+                        continue
+                except Exception:
+                    pass  # LLM timeout/error → treat as normal override
+
             log_event("interrupt", f"{kind}: {text}")
 
             if kind == "stop":
@@ -2389,6 +2429,176 @@ def _set_killed(val):
         stt_enabled = True
         log_event("system", "Kill switch released — resuming")
 
+# ── Orchestrated Navigation ──────────────────────────────────────────
+
+def _orchestrated_navigate(nav_target, prior_history=None):
+    """Orchestrator-led navigation: plan route → step through with navigator.
+
+    Args:
+        nav_target: destination string
+        prior_history: list of step summaries from a failed prior attempt
+                       (fed into plan_route so the orchestrator avoids
+                       repeating the same approach)
+
+    Returns dict: {"reached": bool, "history": list[str]}
+    """
+    nav = _navigator
+    if not nav:
+        return {"reached": False, "history": []}
+
+    # 1. Gather context for route planning
+    jpeg = nav.tracker.get_jpeg()
+    explore_summary = ""
+    if nav.exploration:
+        body_yaw = (nav.pose.body_yaw
+                    if hasattr(nav.pose, 'body_yaw') else 0)
+        explore_summary = nav.exploration.summarize_for_llm(body_yaw) or ""
+
+    # 2. Plan route (1 LLM call → 2-5 spatial steps)
+    orchestrator.reset_call_counter()
+    prior_ctx = ""
+    if prior_history:
+        prior_ctx = ("PREVIOUS ATTEMPT FAILED: "
+                     + "; ".join(prior_history[-5:])
+                     + "\nPlan a DIFFERENT route.")
+    plan = orchestrator.plan_route(
+        nav_target, jpeg_bytes=jpeg,
+        exploration_summary=(explore_summary +
+                             ("\n" + prior_ctx if prior_ctx else "")),
+        log_fn=log_event)
+
+    log_event("plan",
+              f"[plan] {len(plan.steps)} steps for '{nav_target}'")
+
+    # 3. Execute each step
+    max_retries = 1
+    while plan.current_index < len(plan.steps):
+        if stop_event.is_set():
+            log_event("plan", "[plan] Aborted by stop event")
+            return {"reached": False, "history": plan.history}
+
+        step = plan.steps[plan.current_index]
+        step_num = plan.current_index + 1
+        total = len(plan.steps)
+        log_event("plan",
+                  f"[plan] Step {step_num}/{total}: '{step.target}'")
+
+        # Build context string for navigator
+        plan_context = plan.context_for_navigator()
+
+        # Run navigator for this step
+        reached = nav.navigate(
+            step.target,
+            plan_context=plan_context,
+            step_budget=step.waypoint_budget,
+        )
+
+        # Read step result
+        result = getattr(nav, '_last_result', None)
+        if result is None:
+            # Navigator didn't store a result (shouldn't happen)
+            from orchestrator import StepResult
+            result = StepResult(
+                success=reached, reason="arrived" if reached else "unknown",
+                waypoints_used=0, final_scene="", final_yolo="",
+                exploration_summary="",
+            )
+
+        log_event("plan",
+                  f"[plan] Step {step_num}/{total} "
+                  f"{'succeeded' if result.success else 'failed'}: "
+                  f"{result.reason} ({result.waypoints_used} wp)")
+
+        # Last step + success → done, skip evaluation
+        if result.success and plan.current_index == len(plan.steps) - 1:
+            plan.history.append(f"{step.target} (done)")
+            log_event("plan",
+                      f"[plan] Navigation complete: reached '{nav_target}'")
+            return {"reached": True, "history": plan.history}
+
+        # Evaluate step (1 LLM call)
+        eval_jpeg = nav.tracker.get_jpeg()
+        decision = orchestrator.evaluate_step(
+            plan, result, jpeg_bytes=eval_jpeg, log_fn=log_event)
+
+        action = decision.get("decision", "continue" if result.success else "abort")
+
+        # Record in history AFTER evaluation — skip/continue override failure
+        if action in ("continue", "skip"):
+            plan.history.append(f"{step.target} (done)")
+        else:
+            status = "done" if result.success else f"failed:{result.reason}"
+            plan.history.append(f"{step.target} ({status})")
+
+        if action == "continue":
+            plan.current_index += 1
+            # Last step accepted → success
+            if plan.current_index >= len(plan.steps):
+                log_event("plan",
+                          f"[plan] Navigation complete: '{nav_target}'")
+                return {"reached": True, "history": plan.history}
+
+        elif action == "skip":
+            log_event("plan",
+                      f"[plan] Skipping step: {decision.get('reason', '')}")
+            plan.current_index += 1
+            # Last step skipped → orchestrator says close enough
+            if plan.current_index >= len(plan.steps):
+                log_event("plan",
+                          f"[plan] Navigation complete (skipped last): "
+                          f"'{nav_target}'")
+                return {"reached": True, "history": plan.history}
+
+        elif action == "retry":
+            if max_retries > 0:
+                max_retries -= 1
+                hint = decision.get("retry_hint", "")
+                if hint:
+                    plan.history.append(f"retry hint: {hint}")
+                log_event("plan", f"[plan] Retrying step: {hint}")
+                # Loop will re-execute same step
+            else:
+                log_event("plan", "[plan] No retries left, advancing")
+                plan.current_index += 1
+
+        elif action == "replan":
+            new_steps_data = decision.get("new_steps", [])
+            if new_steps_data:
+                from orchestrator import Step
+                new_steps = []
+                for s in new_steps_data:
+                    if isinstance(s, dict) and "target" in s:
+                        new_steps.append(Step(
+                            target=s["target"],
+                            rationale=s.get("rationale", ""),
+                            waypoint_budget=max(8, int(
+                                s.get("waypoint_budget", 10))),
+                        ))
+                if new_steps:
+                    plan.steps = (plan.steps[:plan.current_index + 1]
+                                  + new_steps)
+                    plan.current_index += 1
+                    log_event("plan",
+                              f"[plan] Replanned: {len(new_steps)} new steps")
+                else:
+                    plan.current_index += 1
+            else:
+                plan.current_index += 1
+
+        elif action == "abort":
+            log_event("plan",
+                      f"[plan] Aborted: {decision.get('reason', '')}")
+            return {"reached": False, "history": plan.history}
+
+        else:
+            # Unknown decision — advance
+            plan.current_index += 1
+
+    # All steps exhausted without explicit success/abort
+    log_event("plan", f"[plan] All steps exhausted for '{nav_target}'")
+    return {"reached": False, "history": plan.history}
+
+
 # ── Main Loop ───────────────────────────────────────────────────────────
 
 def main():
@@ -2460,6 +2670,7 @@ def main():
     # Initialize Navigator (LLM-centric nav with YOLO fast fallback)
     global _navigator
     try:
+        import navigator
         from navigator import Navigator
         from rover_brain import PoseTracker
 
@@ -2467,6 +2678,9 @@ def main():
         # Hook pose tracker into serial commands
         _orig_send = ser.send
         def _nav_send_hook(cmd):
+            # Apply gimbal pan offset to all T:133 commands system-wide
+            if isinstance(cmd, dict) and cmd.get("T") == 133:
+                cmd = dict(cmd, X=cmd.get("X", 0) + navigator.GIMBAL_PAN_OFFSET)
             _orig_send(cmd)
             _nav_pose.on_command(cmd)
         ser.send = _nav_send_hook
@@ -2474,6 +2688,7 @@ def main():
         def _nav_vision_fn(prompt, jpeg_bytes):
             """Lightweight LLM vision call for Navigator — 15s timeout."""
             import base64 as _b64
+            import requests
             b64 = _b64.b64encode(jpeg_bytes).decode()
             r = requests.post(
                 "http://localhost:11434/api/chat",
@@ -2507,13 +2722,25 @@ def main():
                     pass
             return None
 
+        # Exploration grid — persists across navigate() calls, cleared on restart
+        _exploration_grid = None
+        try:
+            from exploration_grid import ExplorationGrid
+            _exploration_grid = ExplorationGrid()
+            navigator._exploration_grid = _exploration_grid  # expose for web_ui
+            print("[nav] Exploration grid active (80x80x2, 20cm cells)")
+        except Exception as _eg_err:
+            print(f"[nav] Exploration grid unavailable: {_eg_err}")
+
         _navigator = Navigator(
             rover=ser, detector=cam.detector, tracker=cam,
             llm_vision_fn=_nav_vision_fn, parse_fn=_nav_parse_fn,
             pose=_nav_pose, voice_fn=lambda msg: _speak(msg, spk, mic_card),
             emergency_event=stop_event,
+            exploration_grid=_exploration_grid,
         )
-        log_event("system", f"Navigator active (yolo={'ON' if cam.detector else 'OFF'})")
+        log_event("system", f"Navigator active (yolo={'ON' if cam.detector else 'OFF'}"
+                  f", exploration={'ON' if _exploration_grid else 'OFF'})")
     except Exception as e:
         log_event("system", f"Navigator not available: {e}")
         import traceback; traceback.print_exc()
@@ -2612,61 +2839,63 @@ def main():
             _last_task = text
             _last_task_target = _extract_target(text)
 
-        # ── Navigator shortcut for "go to X" / "find X" ──
+        # ── Navigator shortcut for movement commands ──
         nav_target = _extract_target(text)
-        if nav_target and _navigator:
+        if _navigator:
             text_lower_strip = text.strip().lower()
             is_nav = any(text_lower_strip.startswith(p) for p in (
-                "go to ", "navigate to ", "drive to ", "move to ",
-                "head toward", "get to "))
-            is_search = any(text_lower_strip.startswith(p) for p in (
+                "go to ", "go out", "go through",
+                "navigate to ", "drive to ", "move to ",
+                "head toward", "get to ", "get out",
+                "exit ", "leave "))
+            is_search = nav_target and any(text_lower_strip.startswith(p) for p in (
                 "find ", "look for ", "search for ", "where is "))
-            if is_nav:
-                log_event("plan", f"Navigator: navigate to '{nav_target}'")
+            # If no explicit target extracted, use the full command as the goal
+            if is_nav and not nav_target:
+                nav_target = text.strip()
+            if is_nav or is_search:
                 plan_active.set()
                 stop_event.clear()
-                reached = _navigator.navigate(nav_target)
-                plan_active.clear()
+
+                # For search: try scan first
+                if is_search:
+                    log_event("plan",
+                              f"Navigator: searching for '{nav_target}'")
+                    direction = _navigator.search(nav_target)
+                    if direction is not None:
+                        plan_active.clear()
+                        log_event("plan",
+                                  f"Navigator: found '{nav_target}'")
+                        continue
+                    log_event("plan",
+                              f"Navigator: '{nav_target}' not visible, "
+                              f"exploring")
+
+                # Orchestrated navigation with retry
                 log_event("plan",
-                    f"Navigator: {'reached' if reached else 'could not reach'} '{nav_target}'")
-                continue
-            elif is_search:
-                log_event("plan", f"Navigator: searching for '{nav_target}'")
-                plan_active.set()
+                          f"Navigator: orchestrated nav to '{nav_target}'")
+                result = _orchestrated_navigate(nav_target)
+                if not result["reached"] and not stop_event.is_set():
+                    log_event("plan",
+                              f"Navigator: first attempt failed, "
+                              f"retrying with new plan")
+                    result = _orchestrated_navigate(
+                        nav_target,
+                        prior_history=result["history"])
+
+                plan_active.clear()
                 stop_event.clear()
-                direction = _navigator.search(nav_target)
-                plan_active.clear()
-                found = direction is not None
                 log_event("plan",
-                    f"Navigator: {'found' if found else 'could not find'} '{nav_target}'")
+                    f"Navigator: "
+                    f"{'reached' if result['reached'] else 'could not reach'}"
+                    f" '{nav_target}'")
                 continue
 
         log_event("plan", f"Starting: {text}")
         result = run_plan(text, ser, cam, spk, mic_card)
 
-        # ── Post-plan reflection ──
         if result is None:
             continue
-
-        trigger = None
-        if result["feedback"]:
-            trigger = "feedback_negative"
-        elif result["stuck_count"] >= 3:
-            trigger = "stuck_repeated"
-        elif result["interrupted"] and result["rounds"] > 0:
-            trigger = "cancelled"
-
-        if trigger:
-            log_event("system", f"Reflecting on plan (trigger={trigger})")
-            def _do_reflect(req=result["original_text"], trig=trigger,
-                            fb=list(result["feedback"]),
-                            sc=result["stuck_count"],
-                            hist=list(result.get("history", []))):
-                reflection.reflect(
-                    req, trig, feedback=fb, stuck_count=sc,
-                    history=hist, log_fn=log_event)
-            t = threading.Thread(target=_do_reflect, daemon=True)
-            t.start()
 
 if __name__ == "__main__":
     main()
