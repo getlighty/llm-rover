@@ -2788,12 +2788,7 @@ def main():
     except Exception as _det_err:
         print(f"[detector] YOLO init failed: {_det_err}")
         local_detector = None
-    visual_servo = None
-    floor_nav = None
     LABEL_OVERRIDES = {}
-    world_map = None
-    path_planner = None
-    path_follower = None
     spatial_map = SpatialMap()
 
     # --- Pose Tracker ---
@@ -2831,14 +2826,6 @@ def main():
     #                 imu_poller.wheels_active.clear()
     #     rover._on_command = _pose_and_imu_on_command
     print("[imu] IMU poller disabled (using encoder-guided turns instead)")
-
-    # --- Path Planner (survey, vectorized paths, door navigation) ---
-    try:
-        from path_planner import WorldMap, PathPlanner, PathFollower
-        # WorldMap, PathPlanner, PathFollower will be initialized on demand (need survey first)
-        print(f"[nav] Path planner available")
-    except Exception as e:
-        print(f"[nav] Path planner unavailable: {e}")
 
     # --- Adaptive light management ---
     def _check_ambient_light():
@@ -3351,45 +3338,8 @@ def main():
                 return False, "Survey requires local detector (currently disabled)"
 
             elif action == "find":
+                # Check spatial map first (instant, no LLM)
                 target_lower = target.lower().strip()
-
-                # 1. Check if survey already found this (doors, landmarks)
-                if target_lower in ("door", "exit", "doorway") and world_map:
-                    door = world_map.find_door()
-                    if door:
-                        angle = door.get("angle", 0)
-                        dist = door.get("dist", 0)
-                        print(f"[plan] Door already in map at angle={angle}° dist={dist:.1f}m")
-                        # Turn to face the door (encoder-guided)
-                        if abs(angle) > 10:
-                            sign = -1 if angle < 0 else 1
-                            yaw_before = pose.body_yaw
-                            rover.send({"T": 1, "L": TURN_SPEED * sign, "R": -TURN_SPEED * sign})
-                            spin_t0 = time.time()
-                            result = _encoder_spin(rover, float(angle),
-                                                   stop_event=emergency_event)
-                            if result is not None:
-                                actual_deg, _ = result
-                                pose.body_yaw = ((yaw_before + actual_deg + 180) % 360) - 180
-                            else:
-                                rotation_time = abs(angle) / TURN_RATE_DPS
-                                remaining = max(0, rotation_time - (time.time() - spin_t0))
-                                time.sleep(remaining)
-                                rover.send({"T": 1, "L": 0, "R": 0})
-                            time.sleep(0.3)
-                        # Center gimbal forward
-                        rover.send({"T": 133, "X": 0, "Y": 0, "SPD": 200, "ACC": 10})
-                        # Drive through using floor nav if available
-                        if floor_nav and dist < 3.0:
-                            time.sleep(0.3)
-                            ok = floor_nav.drive_through_opening(
-                                timeout=max(5.0, dist / 0.12), speed=0.12)
-                            if ok:
-                                return True, f"Drove through door at {dist:.1f}m"
-                            return True, f"Found door at {dist:.1f}m, path blocked"
-                        return True, f"Found door at {dist:.1f}m, facing it"
-
-                # 2. Check spatial map
                 obj_name, entry = spatial_map.find(target_lower)
                 if obj_name and not spatial_map.is_stale(entry):
                     pan = spatial_map.gimbal_pan_for(entry, pose.body_yaw)
@@ -3398,42 +3348,15 @@ def main():
                     time.sleep(0.8)
                     return True, f"Found {obj_name} in spatial map"
 
-                # 3. LLM vision systematic search
+                # Navigator gimbal scan (YOLO + LLM)
                 tracker.pause(300)
                 found = systematic_search(target, target)
                 return found, f"{'Found' if found else 'Could not find'} {target}"
 
-            elif action == "navigate":
-                # Try path planner first if we have a map
-                if world_map and path_planner:
-                    loc = world_map.find_landmark(target)
-                    if loc:
-                        waypoints = path_planner.plan(loc)
-                        if waypoints and path_follower:
-                            success = path_follower.follow(waypoints, voice=voice)
-                            return success, f"{'Reached' if success else 'Could not reach'} {target}"
-                        print(f"[plan] A* failed for {target}, falling back to visual approach")
-                # Fallback: visual servo or LLM-based navigation
-                if visual_servo:
-                    tracker.pause(300)
-                    visual_servo._running = True
-                    success = visual_servo.scan_and_find(target, voice=voice)
-                    if success:
-                        return True, f"Reached {target}"
-                # Final fallback: LLM step-by-step navigation
+            elif action in ("navigate", "approach"):
+                tracker.pause(300)
                 success = navigate_to_object(target, target)
                 return success, f"{'Reached' if success else 'Could not reach'} {target}"
-
-            elif action == "approach":
-                if visual_servo:
-                    tracker.pause(300)
-                    visual_servo._running = True
-                    success = visual_servo.approach(target, voice=voice)
-                    if success:
-                        return True, f"Approached {target}"
-                # Fallback: LLM-based navigation
-                success = navigate_to_object(target, target)
-                return success, f"{'Approached' if success else 'Could not approach'} {target}"
 
             elif action == "drive":
                 # detail: "forward 2s" or "backward 3s"
@@ -3446,21 +3369,11 @@ def main():
                 secs = min(secs, 10.0)  # cap at 10s
                 speed = 0.15
                 if direction in ("backward", "back", "reverse"):
-                    # Reverse: no floor nav (camera faces forward)
                     rover.send({"T": 1, "L": -speed, "R": -speed})
                     time.sleep(secs)
                     rover.send({"T": 1, "L": 0, "R": 0})
                     return True, f"Drove {direction} for {secs:.1f}s"
-                # Forward: use floor nav for obstacle avoidance
-                if floor_nav:
-                    nav_dir = "left" if direction == "left" else (
-                        "right" if direction == "right" else "center")
-                    ok = floor_nav.drive_toward(nav_dir, speed=speed,
-                                                timeout=secs)
-                    if ok:
-                        return True, f"Drove {direction} for {secs:.1f}s (floor-nav)"
-                    return True, f"Drove {direction} — stopped for obstacle"
-                # Fallback: blind drive
+                # Forward drive
                 rover.send({"T": 1, "L": speed, "R": speed})
                 time.sleep(secs)
                 rover.send({"T": 1, "L": 0, "R": 0})
@@ -3790,54 +3703,23 @@ def main():
         final = _speak_summary(goal, step_log, jpeg)
         return final or initial_parsed
 
-    # --- Search engine: unified priority-scan + LLM-guided navigation ---
-    from search_engine import SearchEngine, load_prompts as _load_prompts
-
-    # Load prompt templates
-    _prompts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
-    _all_prompts = {}
-    for _pf in ("search.md", "nav.md"):
-        _ppath = os.path.join(_prompts_dir, _pf)
-        if os.path.exists(_ppath):
-            _all_prompts.update(_load_prompts(_ppath))
-            print(f"[search] Loaded prompts from {_pf}")
-
-    # --- Floor Navigator + Visual Servo (YOLO 10Hz approach) ---
-    if local_detector:
-        from floor_nav import FloorNavigator
-        floor_nav = FloorNavigator(rover, local_detector, tracker,
-                                   emergency_event=emergency_event)
-        print("[floor_nav] FloorNavigator ready")
-
-        from visual_servo import VisualServo
-        visual_servo = VisualServo(rover, local_detector, tracker,
-                                   emergency_event=emergency_event,
-                                   floor_nav=floor_nav)
-        print("[servo] VisualServo ready (with floor nav)")
-
-    search_engine = SearchEngine(
-        rover=rover,
-        tracker=tracker,
-        pose=pose,
-        spatial_map=spatial_map,
-        llm_vision_fn=_tracker_vision,
-        parse_fn=parse_llm_response,
-        voice_fn=voice.speak if voice else None,
-        prompts=_all_prompts,
-        detector=local_detector,
+    # --- Navigator (single module replacing visual_servo, search_engine, floor_nav, path_planner) ---
+    from navigator import Navigator
+    navigator = Navigator(
+        rover=rover, detector=local_detector, tracker=tracker,
+        llm_vision_fn=_tracker_vision, parse_fn=parse_llm_response,
+        pose=pose, voice_fn=voice.speak if voice else None,
         emergency_event=emergency_event,
     )
-    print(f"[search] SearchEngine ready (prompts: {list(_all_prompts.keys())}, "
-          f"yolo={'ON' if local_detector else 'OFF'})")
+    print(f"[nav] Navigator ready (yolo={'ON' if local_detector else 'OFF'})")
 
     def systematic_search(target_name, original_input):
-        """Thin wrapper — delegates to SearchEngine."""
-        return search_engine.search(target_name)
+        """Thin wrapper — delegates to Navigator."""
+        return navigator.search(target_name) is not None
 
     def navigate_to_object(target_name, original_input):
-        """Thin wrapper — delegates to SearchEngine.search_and_approach."""
-        result = search_engine.search_and_approach(target_name, visual_servo=visual_servo)
-        return result.get("reached", False)
+        """Thin wrapper — delegates to Navigator."""
+        return navigator.navigate(target_name)
 
 
     # --- Calibration mode: slow movements, no speech, voice-controlled ---
@@ -3983,15 +3865,15 @@ def main():
                 target = args.get("target", "")
                 if not target:
                     return json.dumps({"error": "No target specified"})
-                result = search_engine.search_and_approach(target, visual_servo=visual_servo)
-                return json.dumps(result)
+                reached = navigator.navigate(target)
+                return json.dumps({"found": reached, "reached": reached, "target": target})
 
             elif fn_name == "search_for":
                 target = args.get("target", "")
                 if not target:
                     return json.dumps({"error": "No target specified"})
-                found = search_engine.search(target)
-                return json.dumps({"found": bool(found), "target": target})
+                direction = navigator.search(target)
+                return json.dumps({"found": direction is not None, "target": target})
 
             elif fn_name == "remember":
                 note = args.get("note", "")
@@ -4345,25 +4227,9 @@ def main():
                 lower)
             if nav_match:
                 nav_target = nav_match.group(1).strip().rstrip("?.!")
-                if visual_servo:
-                    # Use fast local detection + visual servo (no LLM needed)
-                    tracker.pause(300)
-                    visual_servo._running = True
-                    success = visual_servo.scan_and_find(nav_target, voice=voice)
-                    log_exchange(user_input, {"speak": f"{'Found' if success else 'Could not find'} {nav_target}"}, source="llm")
-                elif world_map and path_planner:
-                    # Use path planner if available
-                    loc = world_map.find_landmark(nav_target)
-                    if loc:
-                        waypoints = path_planner.plan(loc)
-                        if waypoints and path_follower:
-                            path_follower.follow(waypoints, voice=voice)
-                    else:
-                        navigate_to_object(nav_target, user_input)
-                else:
-                    # Fallback: LLM-based navigation
-                    navigate_to_object(nav_target, user_input)
-                    log_exchange(user_input, {"speak": f"Navigated to {nav_target}"}, source="llm")
+                tracker.pause(300)
+                success = navigate_to_object(nav_target, user_input)
+                log_exchange(user_input, {"speak": f"{'Reached' if success else 'Could not reach'} {nav_target}"}, source="llm")
                 continue
 
             # --- Try fast command cache first (instant, no LLM) ---
