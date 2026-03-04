@@ -1846,6 +1846,8 @@ def run_plan(text, ser, cam, spk, mic_card):
     wheels_were_active = False  # did last command set include wheel motion?
     scan_only_rounds = 0        # consecutive rounds with gimbal-only (no wheels)
     was_interrupted = False
+    repeated_speak = 0          # consecutive rounds with same speak text
+    last_speak = ""             # previous round's speak text
     round_memory = []           # compact per-round summaries for LLM spatial memory
 
     # Capture round 0 (first LLM response, before loop)
@@ -2281,6 +2283,23 @@ def run_plan(text, ser, cam, spk, mic_card):
         say = resp.get("speak", "")
         observe = resp.get("observe", False)
         remember = resp.get("remember")
+
+        # ── Repeated action loop detection ──
+        if say and say == last_speak:
+            repeated_speak += 1
+        else:
+            repeated_speak = 0
+        last_speak = say
+        if repeated_speak >= 3:
+            log_event("stuck",
+                      f"LLM stuck in loop: repeated '{say}' "
+                      f"{repeated_speak + 1} times — aborting plan")
+            _speak("I'm repeating myself. Stopping.", spk, mic_card)
+            ser.stop()
+            plan_active.clear()
+            return {"original_text": text, "feedback": plan_feedback,
+                    "stuck_count": total_stuck_events, "rounds": round_num,
+                    "interrupted": False, "history": plan_history}
 
         # ── Log LLM decision summary ──
         cmd_types = []

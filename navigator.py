@@ -166,6 +166,8 @@ class Navigator:
         total_rotation = 0     # cumulative degrees turned (detect circling)
         subtask_wp_count = 0  # waypoints since last subtask change
         max_wp = step_budget if step_budget else MAX_WAYPOINTS
+        prev_drive_jpeg = None  # frame before last drive (for stuck detection)
+        no_progress_drives = 0  # consecutive drives with unchanged image
 
         # Panoramic scan — skip when orchestrator provides plan context
         if not plan_context:
@@ -233,6 +235,28 @@ class Navigator:
             # 4. Estimate clear distance
             clear_dist = self._estimate_clear_distance(depth_map, dets)
             dist_str = f"{clear_dist:.1f}m" if clear_dist else "unknown"
+
+            # 4b. Wall proximity check — back away and turn 90°
+            wall_detected = (
+                (depth_map is not None and self._depth_wall_check(depth_map))
+                or self._image_wall_check(jpeg))
+            if wall_detected:
+                # Turn opposite to the direction we were moving
+                # If we were driving left (negative angle), turn right (+90)
+                last_angle = getattr(self, '_last_drive_angle', 0)
+                turn_deg = -90 if last_angle > 0 else 90
+                print(f"[nav] Wall detected — backing up + turning "
+                      f"{turn_deg:+d}° (was driving {last_angle:+.0f}°)")
+                # Back up to create space
+                self.rover.send({"T": 1, "L": -0.10, "R": -0.10})
+                time.sleep(1.5)
+                self._stop_wheels()
+                time.sleep(0.3)
+                # Turn 90° via gimbal (body follows at next waypoint)
+                new_pan = _clamp(self.pose.cam_pan + turn_deg, -180, 180)
+                self._move_gimbal(new_pan, 0)
+                consecutive_turns = 0
+                continue
 
             # 5. LLM assessment
             assessment = self._llm_assess_waypoint(
@@ -324,11 +348,28 @@ class Navigator:
                 drive_dist = max(drive_dist, 0.15)
                 drive_angle = assessment.get("drive_angle", 0) if assessment else 0
                 drive_angle = _clamp(drive_angle, -30, 30)
+                # Grab frame before driving for stuck detection
+                pre_drive_jpeg = self.tracker.get_jpeg()
                 result, stuck_count = self._execute_blind_drive(
                     drive_dist, stuck_count, drive_angle)
                 if result == "stuck_abort":
                     self._store_step_result(False, "stuck", wp + 1)
                     return False
+                # Image-based stuck: did the scene change after driving?
+                post_drive_jpeg = self.tracker.get_jpeg()
+                if (pre_drive_jpeg and post_drive_jpeg
+                        and not _frame_changed(pre_drive_jpeg,
+                                               post_drive_jpeg, 0.12)):
+                    no_progress_drives += 1
+                    print(f"[nav] No visual progress after drive "
+                          f"({no_progress_drives} consecutive)")
+                    if no_progress_drives >= 2:
+                        print("[nav] Stuck: 2 drives with no image change"
+                              " — backing up and scanning")
+                        no_progress_drives = 0
+                        self._recover_stuck(target)
+                else:
+                    no_progress_drives = 0
 
             else:
                 consecutive_turns = 0
@@ -427,7 +468,12 @@ class Navigator:
         d_max = float(depth_map.max())
 
         if d_max - d_min < 0.01:
-            return 1.0  # uniform depth = likely open space
+            # Uniform depth = wall filling frame, NOT open space.
+            # High uniform value = close wall; low = far (maybe open).
+            mid = (d_min + d_max) / 2.0
+            if mid > 0.5:  # Depth Anything: high = close
+                return 0.15  # wall right in front
+            return 1.0  # uniform low depth = possibly open space
 
         # Invert: high depth = close = small distance
         relative_far = 1.0 - (near - d_min) / (d_max - d_min + 1e-6)
@@ -448,7 +494,11 @@ class Navigator:
         d_min = float(depth_map.min())
         d_max = float(depth_map.max())
         if d_max - d_min < 0.01:
-            return None  # uniform = no obstacles
+            # Uniform depth — if high value = wall filling frame
+            mid = (d_min + d_max) / 2.0
+            if mid > 0.5:
+                return "wall (uniform close depth)"
+            return None  # uniform low = no obstacles
 
         # Depth Anything: higher = closer. 99th percentile = nearest object.
         near_val = float(np.percentile(corridor, 99))
@@ -459,6 +509,61 @@ class Navigator:
             return f"depth {relative_closeness:.0%} of range"
 
         return None
+
+    def _depth_wall_check(self, depth_map):
+        """Check if a wall/surface fills most of the frame (rover pressed
+        against it). Depth Anything: higher = closer.
+        Returns True if wall detected, False otherwise."""
+        h, w = depth_map.shape[:2]
+        # Wide corridor: center 80% horizontal, middle 60% vertical
+        x0, x1 = int(w * 0.10), int(w * 0.90)
+        y0, y1 = int(h * 0.20), int(h * 0.80)
+        region = depth_map[y0:y1, x0:x1]
+        if region.size == 0:
+            return False
+
+        d_min = float(depth_map.min())
+        d_max = float(depth_map.max())
+
+        # Uniform depth = featureless surface (wall, ceiling, floor very close)
+        if d_max - d_min < 0.02:
+            print(f"[nav] Wall detected: uniform depth "
+                  f"(range={d_max - d_min:.4f})")
+            return True
+
+        # What fraction of the region is in the top 15% of depth (= very close)?
+        close_threshold = d_min + (d_max - d_min) * 0.85
+        close_fraction = float(np.mean(region > close_threshold))
+
+        if close_fraction > 0.60:
+            print(f"[nav] Wall detected: {close_fraction:.0%} of frame "
+                  f"is very close (depth threshold {close_threshold:.2f})")
+            return True
+        return False
+
+    def _image_wall_check(self, jpeg):
+        """Check if the raw camera image is a featureless surface (wall).
+        Uses color uniformity — a wall has low brightness variance and
+        one dominant color, a real scene has varied brightness.
+        Returns True if wall/surface detected."""
+        try:
+            img = cv2.imdecode(np.frombuffer(jpeg, np.uint8),
+                               cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                return False
+            small = cv2.resize(img, (80, 60))
+            # Color uniformity: real scenes have std > 45, walls < 35
+            std = float(small.std())
+            # Dominant color: bin into 16 levels, check max bin fraction
+            hist = cv2.calcHist([small], [0], None, [16], [0, 256])
+            dominant = float(hist.max() / hist.sum())
+            if std < 35 and dominant > 0.30:
+                print(f"[nav] Wall detected (image): "
+                      f"std={std:.0f}, dominant_bin={dominant:.0%}")
+                return True
+            return False
+        except Exception:
+            return False
 
     def _depth_steer_direction(self, depth_map):
         """Determine which side has more open space from depth map.
@@ -516,7 +621,20 @@ class Navigator:
                 depth_map = (self.tracker.get_depth_map()
                              if hasattr(self.tracker, 'get_depth_map')
                              else None)
+                # Wall check: featureless surface filling the frame
+                cur_jpeg = self.tracker.get_jpeg()
+                if cur_jpeg and self._image_wall_check(cur_jpeg):
+                    self._stop_wheels()
+                    self._last_drive_avoidances = avoidance_count
+                    print("[nav] Blind drive: wall ahead (image), stopping")
+                    return "obstacle"
+
                 if depth_map is not None:
+                    if self._depth_wall_check(depth_map):
+                        self._stop_wheels()
+                        self._last_drive_avoidances = avoidance_count
+                        print("[nav] Blind drive: wall ahead (depth), stopping")
+                        return "obstacle"
                     obstacle = self._depth_obstacle_check(depth_map)
                     if obstacle:
                         obstacle_detected = True
@@ -993,9 +1111,11 @@ class Navigator:
         Returns True if obstacle confirmed, False if path looks clear."""
         result = self._llm_call(
             "I stopped because my sensors detected an obstacle ahead. "
-            "Look at this image: is there ACTUALLY a physical object "
-            "blocking my path on the floor within 0.5m? "
-            "Ignore walls/objects that are far away or to the side.\n"
+            "Look at this image: is there ANYTHING blocking my forward path "
+            "within 0.5m? This includes walls, furniture, doors, bags, "
+            "large surfaces, or any solid object. "
+            "A wall or surface filling most of the frame = YES, obstacle. "
+            "Ignore objects that are far away or clearly to the side.\n"
             "Reply ONLY JSON: "
             '{"obstacle": true/false, "what": "brief description"}')
         if result is None:
