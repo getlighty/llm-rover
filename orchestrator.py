@@ -18,7 +18,12 @@ from typing import List, Optional
 
 import requests
 
+import os
+
 import lessons
+import room_context
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 
 # ── Navigation plan dataclasses ──────────────────────────────────────
@@ -46,6 +51,34 @@ class NavigationPlan:
     steps: List[Step]
     current_index: int = 0
     history: List[str] = field(default_factory=list)  # completed step summaries
+    journey: List[dict] = field(default_factory=list)  # per-plan observation log
+
+    def log_observation(self, scene, yolo="", room="", heading=0):
+        """Record what the rover saw at a point during this plan."""
+        entry = {"t": time.strftime("%H:%M:%S"), "scene": scene[:200]}
+        if yolo:
+            entry["yolo"] = yolo[:100]
+        if room:
+            entry["room"] = room
+        if heading:
+            entry["heading"] = round(heading)
+        self.journey.append(entry)
+        # Keep last 15 observations to avoid prompt bloat
+        if len(self.journey) > 15:
+            self.journey = self.journey[-15:]
+
+    def journey_summary(self):
+        """Compact summary of what the rover has seen during this plan."""
+        if not self.journey:
+            return ""
+        lines = ["JOURNEY LOG (what I saw during this plan):"]
+        for obs in self.journey:
+            parts = [obs["t"]]
+            if obs.get("room"):
+                parts.append(f"[{obs['room']}]")
+            parts.append(obs["scene"])
+            lines.append("  " + " ".join(parts))
+        return "\n".join(lines)
 
     def context_for_navigator(self) -> str:
         """Concise string for navigator's per-waypoint LLM prompt."""
@@ -62,13 +95,21 @@ class NavigationPlan:
             parts.append(f"NEXT: {self.steps[self.current_index+1].target}")
         if self.history:
             parts.append(f"DONE: {'; '.join(self.history[-3:])}")
+        # Include recent journey observations (last 5 for navigator)
+        recent = self.journey[-5:] if self.journey else []
+        if recent:
+            journal = []
+            for obs in recent:
+                r = f"[{obs.get('room', '?')}]" if obs.get("room") else ""
+                journal.append(f"  {obs['t']} {r} {obs['scene']}")
+            parts.append("RECENT OBSERVATIONS:\n" + "\n".join(journal))
         return "\n".join(parts)
 
 # ── Ollama config ─────────────────────────────────────────────────────
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen3.5:cloud"        # vision-capable (scene description)
-OLLAMA_TEXT_MODEL = "qwen3.5:cloud"   # reasoning/guidance
+OLLAMA_MODEL = "qwen3.5:9b"        # vision-capable (scene description)
+OLLAMA_TEXT_MODEL = "qwen3.5:9b"   # reasoning/guidance
 
 # ── Constants ─────────────────────────────────────────────────────────
 
@@ -141,13 +182,55 @@ def classify_task(text):
 
 # ── Ollama API ────────────────────────────────────────────────────────
 
+def _call_anthropic(system_prompt, user_text, jpeg_bytes=None, log_fn=None,
+                    model=None):
+    """Make an Anthropic API call, optionally with an image."""
+    model = model or OLLAMA_TEXT_MODEL  # will be e.g. "claude-sonnet-4-6-..."
+    user_content = []
+    if jpeg_bytes:
+        b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+        user_content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg",
+                        "data": b64},
+        })
+    user_content.append({"type": "text", "text": user_text})
+
+    try:
+        r = requests.post("https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_content}],
+                "temperature": 0.3,
+                "max_tokens": 1500,
+            },
+            timeout=60)
+        r.raise_for_status()
+        return r.json()["content"][0]["text"].strip()
+    except Exception as e:
+        if log_fn:
+            log_fn("error", f"Anthropic orchestrator call failed: {e}")
+        return None
+
+
 def _call_ollama(system_prompt, user_text, jpeg_bytes=None, log_fn=None,
                  model=None):
-    """Make an Ollama API call, optionally with an image."""
+    """Make an LLM call. Routes to Anthropic for claude-* models."""
     count = _increment_calls()
     model = model or (OLLAMA_MODEL if jpeg_bytes else OLLAMA_TEXT_MODEL)
     if log_fn:
         log_fn("orchestrator", f"LLM call #{count} ({model})")
+
+    # Route claude models to Anthropic API
+    if model.startswith("claude-"):
+        return _call_anthropic(system_prompt, user_text, jpeg_bytes,
+                               log_fn, model)
 
     user_msg = {"role": "user", "content": user_text}
     if jpeg_bytes:
@@ -224,7 +307,9 @@ def describe_scene(jpeg_bytes, context="", log_fn=None):
 
 # ── Route planning ───────────────────────────────────────────────────
 
-PLAN_ROUTE_SYSTEM = """You are the route planner for Jasper, a 26cm-wide 6-wheel indoor rover.
+PLAN_ROUTE_TEMPLATE = """You are the route planner for Jasper, a 6-wheel indoor rover.
+Physical: 28cm long × 26cm wide × 32cm tall, 3kg, ground clearance 22mm.
+Camera on pan-tilt gimbal at ~30cm height. Max speed 0.2 m/s. Can spin in place or reverse if spinning is not possible.
 Break the navigation task into 2-5 spatial milestones the rover can see and drive to sequentially.
 
 Each step must be a CONCRETE SPATIAL TARGET the rover can recognize visually:
@@ -236,11 +321,13 @@ Rules:
 - First step should be something currently visible or very nearby
 - Last step should be the final destination or as close as possible
 - 2-5 steps total (fewer if the target is nearby/simple)
-- Each step gets a waypoint_budget (5-15) — more for tricky navigation
+- Each step gets a waypoint_budget (default 10, range 5-30) — more for long distances or tricky navigation (e.g. navigating through a room = 15-20, traversing a hallway = 10-15, exiting a cluttered room = 20-30)
+
+{home_layout}
 
 Respond with ONLY valid JSON:
-{"steps": [{"target": "...", "rationale": "...", "waypoint_budget": 10}, ...],
- "route_reasoning": "1-2 sentence route description"}"""
+{{"steps": [{{"target": "...", "rationale": "...", "waypoint_budget": 10}}, ...],
+ "route_reasoning": "1-2 sentence route description"}}"""
 
 
 def plan_route(task, jpeg_bytes=None, exploration_summary="", log_fn=None):
@@ -261,7 +348,10 @@ def plan_route(task, jpeg_bytes=None, exploration_summary="", log_fn=None):
     if lessons_block:
         user_text += lessons_block
 
-    raw = _call_ollama(PLAN_ROUTE_SYSTEM, user_text, jpeg_bytes,
+    home_layout = room_context.format_home_layout()
+    system = PLAN_ROUTE_TEMPLATE.format(home_layout=home_layout)
+
+    raw = _call_ollama(system, user_text, jpeg_bytes,
                        log_fn=log_fn, model=OLLAMA_MODEL)
     data = _parse_json(raw)
 
@@ -301,7 +391,12 @@ def plan_route(task, jpeg_bytes=None, exploration_summary="", log_fn=None):
 EVALUATE_STEP_SYSTEM = """You are evaluating navigation progress for Jasper, a 6-wheel indoor rover.
 A step in the navigation plan just completed. Decide what to do next.
 
+YOU are the authority on whether the MISSION is complete — the executor only reports what it sees.
+Always check: does the scene description and context confirm the MISSION goal is actually achieved?
+The executor may claim "arrived" prematurely — verify against the mission goal, not just the step target.
+
 Decisions:
+- "done": The MISSION GOAL is achieved — the rover has reached its final destination. Use this even mid-plan if the goal is clearly met.
 - "continue": Step succeeded, move to the next step in the plan
 - "skip": Step didn't fully succeed but we're close enough, move on
 - "retry": Step failed but is worth retrying (provide a hint for the retry)
@@ -309,13 +404,15 @@ Decisions:
 - "abort": Navigation is impossible (blocked, unsafe, or target doesn't exist)
 
 Respond with ONLY valid JSON:
-{"decision": "continue|skip|retry|replan|abort",
+{"decision": "done|continue|skip|retry|replan|abort",
  "reason": "brief explanation",
  "new_steps": [{"target": "...", "rationale": "...", "waypoint_budget": 10}],
  "retry_hint": "hint for the navigator on retry"}
 
 Only include "new_steps" if decision is "replan".
-Only include "retry_hint" if decision is "retry"."""
+Only include "retry_hint" if decision is "retry".
+
+If a step failed due to budget exhaustion ("budget" in reason), prefer "replan" with higher waypoint_budget values (up to 30) rather than "abort". The rover may just need more waypoints to navigate around obstacles. You can also simplify the remaining steps or pick a more direct route."""
 
 
 def evaluate_step(plan, result, jpeg_bytes=None, log_fn=None):
@@ -335,14 +432,17 @@ def evaluate_step(plan, result, jpeg_bytes=None, log_fn=None):
             if plan.current_index < len(plan.steps) else None)
     step_desc = step.target if step else "unknown"
 
+    journey = plan.journey_summary()
     user_text = (
         f"MISSION: {plan.task}\n"
         f"STEP {plan.current_index+1}/{len(plan.steps)}: '{step_desc}'\n"
         f"RESULT: {'SUCCESS' if result.success else 'FAILED'} — {result.reason}\n"
-        f"Waypoints used: {result.waypoints_used}\n"
+        f"Waypoints used: {result.waypoints_used}/{step.waypoint_budget if step else '?'}\n"
         f"Scene: {result.final_scene}\n"
         f"YOLO: {result.final_yolo}\n"
     )
+    if journey:
+        user_text += f"\n{journey}\n"
     if result.exploration_summary:
         user_text += f"Exploration: {result.exploration_summary}\n"
     if plan.history:
@@ -357,7 +457,7 @@ def evaluate_step(plan, result, jpeg_bytes=None, log_fn=None):
 
     if data and "decision" in data:
         decision = data["decision"]
-        if decision not in ("continue", "skip", "retry", "replan", "abort"):
+        if decision not in ("done", "continue", "skip", "retry", "replan", "abort"):
             decision = "continue" if result.success else "abort"
             data["decision"] = decision
         if log_fn:
@@ -385,11 +485,12 @@ You receive:
 - Context from the executor (what happened, why it needs help)
 
 ## Rover capabilities
-- 6 wheels, differential drive, max 0.2 m/s (slow mover)
-- Pan-tilt camera gimbal (the "head") — can look around independently of body
-- 26cm wide, 35cm long — can't fit through gaps < 30cm
-- Camera is USB 640x480 wide-angle (~65 deg FOV)
-- Indoor environment (home/workshop)
+- 6-wheel differential drive, 28cm long × 26cm wide × 32cm tall, ~3kg
+- Ground clearance only 22mm — cannot climb thresholds, cables, or uneven surfaces
+- Pan-tilt camera gimbal at ~30cm height — can look around independently of body
+- Camera is USB 640x480 wide-angle (~65° FOV)
+- Max speed 0.2 m/s, can spin in place (zero turning radius)
+- Indoor environment (home/workshop), can't fit through gaps < 30cm
 
 ## Your job
 Analyze the situation and give concrete, actionable guidance. Think about:

@@ -59,13 +59,18 @@ KNOWN_WIDTHS = {
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 COCO_MODEL = os.path.join(MODEL_DIR, "yolov8n.onnx")
 
+# YOLO11n TensorRT engine (COCO 80 classes, FP16 — fastest on Jetson)
+YOLO11N_TRT = os.path.join(MODEL_DIR, "yolo11n.engine")
+
 # YOLO-World workshop model (42 indoor/workshop classes, open-vocabulary baked in)
 WORLD_MODEL_PT = os.path.join(MODEL_DIR, "yolov8s-world-workshop.pt")
 WORLD_MODEL_ONNX = os.path.join(MODEL_DIR, "yolov8s-world-workshop.onnx")
 WORLD_MODEL_TRT = os.path.join(MODEL_DIR, "yolov8s-world-workshop.engine")
 
-# Default: prefer TRT engine > PT (PyTorch GPU) > ONNX World > ONNX COCO
+# Default: prefer YOLO11n TRT > World TRT > PT > ONNX World > ONNX COCO
 def _pick_default_model():
+    if os.path.exists(YOLO11N_TRT):
+        return YOLO11N_TRT
     if os.path.exists(WORLD_MODEL_TRT):
         return WORLD_MODEL_TRT
     if os.path.exists(WORLD_MODEL_PT):
@@ -137,6 +142,9 @@ class LocalDetector:
         if "world" in basename or "workshop" in basename:
             self.class_names = WORLD_NAMES
             self._model_label = "YOLO-World"
+        elif "yolo11" in basename:
+            self.class_names = COCO_NAMES
+            self._model_label = "YOLO11n"
         else:
             self.class_names = COCO_NAMES
             self._model_label = "YOLOv8n"
@@ -149,7 +157,11 @@ class LocalDetector:
         if model_path.endswith(".pt"):
             self._init_pytorch(model_path)
         elif model_path.endswith(".engine"):
-            self._init_tensorrt(model_path)
+            # Try Ultralytics first (handles its own engine wrapper format)
+            try:
+                self._init_pytorch(model_path)
+            except Exception:
+                self._init_tensorrt(model_path)
         else:
             self._init_opencv_dnn(model_path)
 
@@ -157,19 +169,23 @@ class LocalDetector:
               f"{len(self.class_names)} classes, conf={conf})")
 
     def _init_pytorch(self, model_path):
-        """Load model via Ultralytics for PyTorch GPU inference."""
+        """Load model via Ultralytics for PyTorch/TRT GPU inference."""
         try:
             import torch
             from ultralytics import YOLO
-            self._ultralytics_model = YOLO(model_path)
+            is_engine = model_path.endswith(".engine")
+            self._ultralytics_model = YOLO(model_path, task="detect")
             # Read class names from model (handles custom-trained models)
             if hasattr(self._ultralytics_model, "names") and self._ultralytics_model.names:
                 self.class_names = list(self._ultralytics_model.names.values())
                 if len(self.class_names) == 1:
                     self._model_label = f"YOLOv8-{self.class_names[0]}"
-                else:
+                elif not is_engine:
                     self._model_label = f"YOLOv8-custom({len(self.class_names)}cls)"
-            if torch.cuda.is_available():
+            if is_engine:
+                # Engine files are already on GPU — don't call .to()
+                self.backend = "TensorRT FP16"
+            elif torch.cuda.is_available():
                 self._ultralytics_model.to("cuda")
                 self.backend = "PyTorch GPU"
             else:
@@ -177,7 +193,7 @@ class LocalDetector:
             # Warmup
             dummy = np.zeros((self.input_size, self.input_size, 3), dtype=np.uint8)
             self._ultralytics_model.predict(dummy, verbose=False, conf=self.conf,
-                                            half=True)
+                                            half=True, device=0 if is_engine else None)
         except Exception as e:
             print(f"[detector] PyTorch init failed ({e}), falling back to ONNX")
             onnx_path = model_path.replace(".pt", ".onnx")
@@ -269,10 +285,13 @@ class LocalDetector:
     def _detect_ultralytics(self, frame, h, w):
         """Run detection via Ultralytics YOLO predict API."""
         t0 = time.time()
-        results = self._ultralytics_model.predict(
-            frame, verbose=False, conf=self.conf, iou=self.nms_thresh,
+        predict_kwargs = dict(
+            verbose=False, conf=self.conf, iou=self.nms_thresh,
             half=True, imgsz=self.input_size,
         )
+        if self.backend == "TensorRT FP16":
+            predict_kwargs["device"] = 0
+        results = self._ultralytics_model.predict(frame, **predict_kwargs)
         self.last_inference_ms = (time.time() - t0) * 1000
 
         detections = []
@@ -530,3 +549,154 @@ class LocalDetector:
             s += ")"
             parts.append(s)
         return " ".join(parts)
+
+
+# ── Depth Estimation (Depth Anything V1 Small, TensorRT) ────────────
+
+DEPTH_ENGINE_PATH = os.path.join(MODEL_DIR, "depth_anything_vits14_308.trt")
+DEPTH_INPUT_SIZE = 308
+
+# ImageNet normalization (applied in BGR order to match model training)
+_DEPTH_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_DEPTH_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+class DepthEstimator:
+    """Monocular depth estimation using Depth Anything V1 Small + TensorRT.
+
+    Produces a relative float32 depth map (higher = farther).
+    CUDA resources are lazily initialized on first estimate() call so that
+    the pycuda context is created on the correct thread.
+
+    Usage:
+        depth = DepthEstimator()             # lightweight — just reads engine bytes
+        depth_map = depth.estimate(bgr_frame) # float32 (H, W) at frame resolution
+        depth.enrich_detections(dets, depth_map)  # adds/updates dist_m on each det
+    """
+
+    def __init__(self, engine_path=None, input_size=DEPTH_INPUT_SIZE,
+                 depth_scale=1.0):
+        if engine_path is None:
+            engine_path = DEPTH_ENGINE_PATH
+        if not os.path.exists(engine_path):
+            raise FileNotFoundError(f"Depth engine not found: {engine_path}")
+
+        self.input_size = input_size
+        self.depth_scale = depth_scale
+        self._lock = threading.Lock()
+        self.last_depth_map = None
+        self.last_inference_ms = 0
+        self.backend = "TensorRT FP16"
+
+        # Read engine bytes now (main thread, no CUDA needed)
+        with open(engine_path, 'rb') as f:
+            self._engine_bytes = f.read()
+
+        # CUDA resources — initialized lazily on first estimate() call
+        self._ready = False
+        self._cuda_ctx = None
+
+        print(f"[depth] Depth Anything V1s engine loaded "
+              f"({len(self._engine_bytes) / 1024 / 1024:.0f} MB, "
+              f"{input_size}x{input_size}, scale={depth_scale})")
+
+    def _lazy_init(self):
+        """Initialize pycuda + TRT resources on the calling thread.
+
+        Uses the CUDA primary context (shared with PyTorch/Ultralytics)
+        rather than creating a new context, to avoid conflicts.
+        """
+        import pycuda.driver as cuda
+        cuda.init()
+        dev = cuda.Device(0)
+        self._cuda_ctx = dev.retain_primary_ctx()
+        self._cuda_ctx.push()
+        self._cuda = cuda
+
+        import tensorrt as trt
+        runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+        self.engine = runtime.deserialize_cuda_engine(self._engine_bytes)
+        del self._engine_bytes  # free the raw bytes
+        self.context = self.engine.create_execution_context()
+
+        input_vol = 1 * 3 * self.input_size * self.input_size
+        output_vol = 1 * 1 * self.input_size * self.input_size
+        self.h_input = cuda.pagelocked_empty(input_vol, dtype=np.float32)
+        self.h_output = cuda.pagelocked_empty(output_vol, dtype=np.float32)
+        self.d_input = cuda.mem_alloc(self.h_input.nbytes)
+        self.d_output = cuda.mem_alloc(self.h_output.nbytes)
+        self.stream = cuda.Stream()
+
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                self.context.set_tensor_address(name, int(self.d_input))
+            else:
+                self.context.set_tensor_address(name, int(self.d_output))
+
+        self._ready = True
+        print(f"[depth] CUDA context initialized on thread "
+              f"{threading.current_thread().name}")
+
+    def _preprocess(self, bgr_frame):
+        """Resize, normalize, transpose to CHW float32."""
+        img = cv2.resize(bgr_frame, (self.input_size, self.input_size),
+                         interpolation=cv2.INTER_CUBIC)
+        img = img.astype(np.float32) / 255.0
+        img = (img - _DEPTH_MEAN) / _DEPTH_STD
+        img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
+        return np.ascontiguousarray(img[None], dtype=np.float32)
+
+    def estimate(self, bgr_frame):
+        """Run depth inference. Returns float32 depth map at frame resolution."""
+        if not self._ready:
+            self._lazy_init()
+
+        h, w = bgr_frame.shape[:2]
+        preprocessed = self._preprocess(bgr_frame)
+
+        cuda = self._cuda
+        t0 = time.time()
+        np.copyto(self.h_input, preprocessed.ravel())
+        cuda.memcpy_htod_async(self.d_input, self.h_input, self.stream)
+        self.context.execute_async_v3(stream_handle=self.stream.handle)
+        cuda.memcpy_dtoh_async(self.h_output, self.d_output, self.stream)
+        self.stream.synchronize()
+        self.last_inference_ms = (time.time() - t0) * 1000
+
+        depth = self.h_output.reshape(self.input_size, self.input_size)
+        depth = cv2.resize(depth, (w, h))
+
+        with self._lock:
+            self.last_depth_map = depth
+        return depth
+
+    def enrich_detections(self, detections, depth_map):
+        """Add/update dist_m on each detection using the depth map.
+
+        Samples a small patch around each bbox center for robustness.
+        """
+        if depth_map is None or len(detections) == 0:
+            return
+        h, w = depth_map.shape[:2]
+        for d in detections:
+            x1, y1, x2, y2 = d["bbox"]
+            # Sample 5x5 patch around bbox center
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            r = 5
+            patch = depth_map[max(0, cy-r):min(h, cy+r+1),
+                              max(0, cx-r):min(w, cx+r+1)]
+            if patch.size > 0:
+                raw_depth = float(np.median(patch))
+                d["dist_m"] = round(raw_depth * self.depth_scale, 2)
+
+    def colorize(self, depth_map):
+        """Convert depth map to BGR colorized image for visualization."""
+        d = depth_map.copy()
+        dmin, dmax = d.min(), d.max()
+        if dmax - dmin > 1e-6:
+            d = (d - dmin) / (dmax - dmin) * 255.0
+        else:
+            d = np.zeros_like(d)
+        return cv2.applyColorMap(d.astype(np.uint8), cv2.COLORMAP_INFERNO)

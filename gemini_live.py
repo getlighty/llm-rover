@@ -40,180 +40,6 @@ RECONNECT_MAX = 120     # max retry delay (seconds)
 PLAYBACK_COOLDOWN = 0.3  # seconds after aplay finishes before unmuting mic
 
 ROVER_DIR = os.path.dirname(os.path.abspath(__file__))
-MEMORY_FILE = os.path.join(ROVER_DIR, "memory.md")
-
-
-def _load_memory_tail(n=20):
-    try:
-        with open(MEMORY_FILE) as f:
-            lines = f.readlines()
-        return "".join(lines[-n:]).strip()
-    except Exception:
-        return ""
-
-
-# ---------------------------------------------------------------------------
-# System instructions for Gemini Live session
-# ---------------------------------------------------------------------------
-GEMINI_LIVE_SYSTEM = """\
-You are Jasper, a 6-wheel rover robot built on the Waveshare UGV Rover PT platform. Your owner is Ovi.
-
-## Personality
-- Terse. 5-10 words max per response. You're a robot, not a chatbot.
-- Express yourself physically using send_rover_commands: nod (tilt up then down), shake head (pan left-right), tilt head when curious.
-- Every response should include physical expression via send_rover_commands.
-- Warm but minimal. Don't narrate surroundings unless asked.
-- Don't say Ovi's name every time.
-
-## Hardware
-- 6 wheels, skid-steer. Max speed 1.0 m/s but DEFAULT to 0.20 m/s (Ovi's preference — move slowly).
-- Pan-tilt gimbal (your head): pan -180..+180, tilt -30..+90. SPD 200-400 normal, 500+ quick gestures. X=0,Y=0 is center.
-- Lights: base (IO4) + head (IO5), 0-255 PWM. Dim when room is bright.
-- OLED: 4 lines, ~16 chars each.
-- Battery: ~10.5V (12V boost damaged, reduced power).
-
-## ESP32 Commands (for send_rover_commands)
-- Wheels: {"T":1, "L":<left_speed>, "R":<right_speed>} — positive=forward, negative=backward
-- Gimbal absolute: {"T":133, "X":<pan>, "Y":<tilt>, "SPD":<speed>, "ACC":<accel>}
-- Lights: {"T":132, "IO4":<base 0-255>, "IO5":<head 0-255>}
-- OLED: {"T":3, "lineNum":<0-3>, "Text":"<msg>"}
-- Emergency stop: {"T":0}
-- Feedback: {"T":130}
-
-## Physical expressions (use these!)
-- Yes/agree: Nod — {"T":133,"X":0,"Y":20,"SPD":400,"ACC":20} then {"T":133,"X":0,"Y":-5,"SPD":400,"ACC":20} then {"T":133,"X":0,"Y":0,"SPD":200,"ACC":10}
-- No/disagree: Shake — {"T":133,"X":-40,"Y":0,"SPD":500,"ACC":20} then {"T":133,"X":40,"Y":0,"SPD":500,"ACC":20} then {"T":133,"X":0,"Y":0,"SPD":200,"ACC":10}
-- Thinking: Tilt — {"T":133,"X":20,"Y":10,"SPD":200,"ACC":10}
-- Greeting: Look up slightly, small nod
-
-## Vision
-You CANNOT see directly. Use look_at_camera to see via the camera. Always use it when you need visual info about your surroundings.
-
-## Safety
-- When user says stop/halt/freeze, IMMEDIATELY call send_rover_commands with {"T":1,"L":0,"R":0}.
-- Max wheel speed 0.20 m/s unless user explicitly says faster.
-- Look around before backing up.
-
-## Ovi's preferences
-- Move slowly (0.15-0.20 m/s max)
-- Dim lights when ambient light is sufficient
-- Don't say his name constantly
-- Upgrades need clear purpose
-"""
-
-# ---------------------------------------------------------------------------
-# Tool definitions in Gemini function calling format
-# ---------------------------------------------------------------------------
-GEMINI_TOOLS = [
-    {
-        "function_declarations": [
-            {
-                "name": "send_rover_commands",
-                "description": "Send raw ESP32 JSON commands to control wheels, gimbal, lights, and OLED. Use this for ALL physical actions: moving, turning, nodding, shaking head, blinking lights. Commands are sent sequentially. Include a duration (seconds) to auto-stop wheels after that time.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "commands": {
-                            "type": "array",
-                            "description": "List of ESP32 JSON command objects to send sequentially.",
-                            "items": {"type": "object"},
-                        },
-                        "duration": {
-                            "type": "number",
-                            "description": "Optional: seconds to wait before sending wheel-stop command. Use for timed movements.",
-                        },
-                    },
-                    "required": ["commands"],
-                },
-            },
-            {
-                "name": "look_at_camera",
-                "description": "Move the gimbal to a position and describe what the camera sees. Use this whenever you need to see something. You CANNOT see without calling this. Returns a text description of the scene.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pan": {
-                            "type": "number",
-                            "description": "Gimbal pan angle (-180 to 180). 0=forward. Default 0.",
-                        },
-                        "tilt": {
-                            "type": "number",
-                            "description": "Gimbal tilt angle (-30 to 90). 0=level. Default 0.",
-                        },
-                        "question": {
-                            "type": "string",
-                            "description": "What to look for or describe.",
-                        },
-                    },
-                },
-            },
-            {
-                "name": "navigate_to",
-                "description": "Autonomously navigate toward a named object or location. The rover will search, find, and drive to the target using camera vision. Takes 10-60 seconds. Returns success/failure.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target": {
-                            "type": "string",
-                            "description": "Object or location to navigate to.",
-                        },
-                    },
-                    "required": ["target"],
-                },
-            },
-            {
-                "name": "search_for",
-                "description": "Search for an object by sweeping the camera. Finds and aligns toward it but does NOT drive to it. Use navigate_to to drive there.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target": {
-                            "type": "string",
-                            "description": "Object to search for.",
-                        },
-                    },
-                    "required": ["target"],
-                },
-            },
-            {
-                "name": "remember",
-                "description": "Save a note to persistent memory. Use when the user asks you to remember something.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "note": {
-                            "type": "string",
-                            "description": "The note to remember.",
-                        },
-                    },
-                    "required": ["note"],
-                },
-            },
-            {
-                "name": "get_status",
-                "description": "Get rover status: battery voltage, current pose, tracker state, spatial map summary.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            {
-                "name": "set_speed",
-                "description": "Set the rover's speed scale. Level 1 = 10% (very slow), level 5 = 50%, level 10 = 100% (max). Default is level 2 (20%).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "level": {
-                            "type": "integer",
-                            "description": "Speed level 1-10.",
-                        },
-                    },
-                    "required": ["level"],
-                },
-            },
-        ]
-    }
-]
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +50,7 @@ class GeminiLiveClient:
 
     def __init__(self, api_key, model, tool_dispatch_fn, result_queue,
                  playback_device=None, voice="Puck", system_instruction=None,
-                 mic_mute_fn=None, mic_unmute_fn=None):
+                 tools=None, mic_mute_fn=None, mic_unmute_fn=None):
         """
         Args:
             api_key: Gemini API key
@@ -234,6 +60,7 @@ class GeminiLiveClient:
             playback_device: ALSA device for audio output (e.g. "plughw:1,0")
             voice: Gemini voice name (Puck, Kore, Enceladus, etc.)
             system_instruction: override system prompt
+            tools: Gemini function_declarations format (from tools.to_gemini())
             mic_mute_fn: callable() to mute mic during playback
             mic_unmute_fn: callable() to unmute mic after playback
         """
@@ -244,6 +71,7 @@ class GeminiLiveClient:
         self._playback_device = playback_device or "plughw:1,0"
         self._voice = voice
         self._system_instruction = system_instruction
+        self._tools = tools
         self._mic_mute_fn = mic_mute_fn
         self._mic_unmute_fn = mic_unmute_fn
 
@@ -348,12 +176,9 @@ class GeminiLiveClient:
 
     def _build_setup(self):
         """Build the BidiGenerateContent setup message."""
-        memory = _load_memory_tail(20)
-        system_text = self._system_instruction or GEMINI_LIVE_SYSTEM
-        if memory:
-            system_text += f"\n\n## Recent memory\n{memory}"
+        system_text = self._system_instruction or ""
 
-        return {
+        setup = {
             "setup": {
                 "model": f"models/{self._model}",
                 "generation_config": {
@@ -369,10 +194,12 @@ class GeminiLiveClient:
                 "system_instruction": {
                     "parts": [{"text": system_text}]
                 },
-                "tools": GEMINI_TOOLS,
                 "output_audio_transcription": {},
             }
         }
+        if self._tools:
+            setup["setup"]["tools"] = self._tools
+        return setup
 
     # ---- WebSocket session ----
 

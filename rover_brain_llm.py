@@ -44,6 +44,9 @@ if os.path.exists(_env_file):
                 _k, _v = _line.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
 
+# Re-set API keys on modules imported before .env was loaded
+orchestrator.ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
 # ── Log Event Bus ──────────────────────────────────────────────────────
 
 _log_events = collections.deque(maxlen=500)
@@ -83,6 +86,7 @@ _tts_name = "groq"
 AVAILABLE_PROVIDERS = {
     "stt": ["groq", "xai-realtime"],
     "llm": [
+        "ollama/qwen3.5:9b",
         "ollama/qwen3.5:cloud",
         "ollama/qwen3-vl:2b",
         "ollama/ministral-3:14b-cloud",
@@ -91,19 +95,59 @@ AVAILABLE_PROVIDERS = {
         "groq/meta-llama/llama-4-maverick-17b-128e-instruct",
         "xai/grok-4-1-fast-reasoning",
         "xai/grok-4-1-fast-non-reasoning",
+        "anthropic/claude-sonnet-4-6",
+        "anthropic/claude-sonnet-4-20250514",
+        "anthropic/claude-haiku-4-5-20251001",
     ],
     "tts": ["groq", "elevenlabs"],
     "orch": [
+        "qwen3.5:9b",
+        "claude-sonnet-4-6",
         "glm-5:cloud",
         "minimax-m2.5:cloud",
         "kimi-k2.5:cloud",
         "qwen3.5:cloud",
+        "claude-sonnet-4-20250514",
+        "claude-haiku-4-5-20251001",
     ],
 }
 
 # ── xAI Realtime voice state (module-level for hot-swap) ──
 _xai_voice = None       # XAIRealtimeVoice instance (or None)
 _xai_refs = {}          # filled by main(): ser, cam, spk, mic_dev, etc.
+
+
+def _follow_recovery(cam, ser, log_fn):
+    """LLM-guided obstacle recovery during follow mode."""
+    jpeg = snap_with_flash(cam, ser)
+    if not jpeg:
+        return False
+    resp = call_llm("Obstacle blocking path while following target. "
+                     "Navigate around with short maneuvers.", jpeg)
+    if resp and resp.get("commands"):
+        execute(ser, resp["commands"], stop_event, cam)
+        return True
+    return False
+
+
+def _follow_llm_fn(prompt, jpeg=None):
+    """Flexible LLM call for follow mode — callout, verification, etc."""
+    try:
+        resp = call_llm(prompt, jpeg)
+        text = resp.get("speak", "") if resp else ""
+        if text and "unavailable" in text.lower():
+            return ""
+        return text
+    except Exception:
+        return ""
+
+
+def _follow_label_override(yolo_label, correct_label):
+    """Persist a YOLO label correction from follow mode."""
+    from local_detector import LABEL_OVERRIDES, _save_label_overrides
+    LABEL_OVERRIDES[yolo_label] = correct_label
+    _save_label_overrides()
+    log_event("detect", f"Follow auto-label: '{yolo_label}' -> '{correct_label}'")
 
 
 def _xai_tool_dispatch(fn_name, args):
@@ -202,6 +246,22 @@ def _xai_tool_dispatch(fn_name, args):
                            log_fn=lambda msg: log_event("track", msg))
             return json.dumps(result)
 
+        elif fn_name == "follow_person":
+            from follow_target import follow
+            target = args.get("target", "person")
+            duration = float(args.get("duration", 60))
+            result = follow(target, ser, cam, _xai_refs.get("imu"),
+                            duration=duration,
+                            stop_event=stop_event,
+                            log_fn=lambda msg: log_event("follow", msg),
+                            voice=_xai_voice, floor_nav=_floor_nav,
+                            recovery_fn=_follow_recovery,
+                            speak_fn=lambda t: _speak_async(t,
+                                _xai_refs.get("spk"), _xai_refs.get("mic_card")),
+                            llm_fn=_follow_llm_fn,
+                            label_override_fn=_follow_label_override)
+            return json.dumps(result)
+
         elif fn_name == "correct_label":
             from local_detector import LABEL_OVERRIDES, _save_label_overrides
             yolo_label = args.get("yolo_label", "").strip().lower()
@@ -253,6 +313,36 @@ def _start_xai_realtime():
         return None
 
 
+_PROVIDER_PREFS_FILE = os.path.join(ROVER_DIR, ".provider_prefs.json")
+
+
+def _save_provider_prefs():
+    """Persist LLM and orchestrator choices to disk."""
+    try:
+        prefs = {"llm": _llm_name, "orch": orchestrator.OLLAMA_TEXT_MODEL}
+        with open(_PROVIDER_PREFS_FILE, "w") as f:
+            json.dump(prefs, f)
+    except Exception:
+        pass
+
+
+def _restore_provider_prefs():
+    """Restore LLM and orchestrator from saved prefs. Call after main init."""
+    try:
+        with open(_PROVIDER_PREFS_FILE) as f:
+            prefs = json.load(f)
+        llm = prefs.get("llm")
+        orch = prefs.get("orch")
+        if llm and llm != _llm_name:
+            set_provider("llm", llm)
+        if orch and orch != orchestrator.OLLAMA_TEXT_MODEL:
+            set_provider("orch", orch)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    except Exception as e:
+        log_event("error", f"Provider prefs restore failed: {e}")
+
+
 def set_provider(kind, name):
     """Hot-swap a provider at runtime. kind = 'stt'|'llm'|'tts'.
 
@@ -298,14 +388,17 @@ def set_provider(kind, name):
         llm_mod = mod
         _llm_name = name
         log_event("system", f"LLM model: {mod.LLM_MODEL}")
+        _save_provider_prefs()
     elif kind == "tts":
         mod = importlib.import_module(f"tts_{name}")
         importlib.reload(mod)
         tts_mod = mod
         _tts_name = name
     elif kind == "orch":
+        orchestrator.OLLAMA_MODEL = name
         orchestrator.OLLAMA_TEXT_MODEL = name
         log_event("system", f"Orchestrator model: {name}")
+        _save_provider_prefs()
     else:
         raise ValueError(f"Unknown provider kind: {kind}")
     log_event("system", f"Switched {kind} to {name}")
@@ -387,6 +480,11 @@ class Serial:
             if desk_mode and (cmd.get("L", 0) != 0 or cmd.get("R", 0) != 0):
                 log_event("system", "Desk mode: wheel command blocked")
                 return
+            # Voltage throttle: scale wheel speeds when battery is low
+            if _voltage_throttle < 1.0:
+                l = cmd.get("L", 0) * _voltage_throttle
+                r = cmd.get("R", 0) * _voltage_throttle
+                cmd = dict(cmd, L=round(l, 4), R=round(r, 4))
             cmd = dict(cmd, L=-cmd.get("R", 0), R=-cmd.get("L", 0))
         raw = json.dumps(cmd) + "\n"
         self.ser.write(raw.encode("utf-8"))
@@ -542,15 +640,20 @@ class Camera:
             time.sleep(0.03)  # ~30 fps
 
     def get_detections(self):
-        """Return (det_list, summary_str, age_secs)."""
+        """Return (det_list, summary_str, age_secs).
+        Suppresses all detections when gimbal is tilted down (seeing own body)."""
+        if _gimbal_tilt < _TILT_YOLO_SUPPRESS:
+            return ([], "", 999.0)
         with self._lock:
             return (list(self._det_results), self._det_summary,
                     time.time() - self._det_ts if self._det_ts else 999.0)
 
     def get_overlay_jpeg(self):
-        """Return JPEG with bounding boxes, or fall back to raw."""
+        """Return JPEG with bounding boxes, or raw if YOLO is off."""
         with self._lock:
-            return self._det_jpeg if self._det_jpeg is not None else self._jpeg
+            if yolo_enabled and self._det_jpeg is not None:
+                return self._det_jpeg
+            return self._jpeg
 
     def snap(self, max_dim=512, quality=60):
         with self._lock:
@@ -938,9 +1041,9 @@ def _floor_nav_sleep(ser, secs, stop_ev, cam):
 
 
 def execute(ser, commands, stop_ev=None, cam=None):
-    global _gimbal_pan
+    global _gimbal_pan, _gimbal_tilt
     last_pan = _gimbal_pan  # start from actual current gimbal position
-    last_tilt = 0.0
+    last_tilt = _gimbal_tilt
     pending_spin = None     # (L, R) of a spin command awaiting its _pause
     skip_next_pause = False  # set after car-backup to skip the associated _pause
     driving_forward = False  # True when wheels are driving forward (not spin)
@@ -957,12 +1060,27 @@ def execute(ser, commands, stop_ev=None, cam=None):
             secs = float(cmd["_pause"])
             if secs > 0:
                 log_event("serial", f"_pause {secs:.2f}s")
-                if False:  # Floor nav disabled for LLM navigation — too aggressive in clutter
-                    # Floor-nav-aware sleep: checks obstacles every 100ms
-                    remaining = _floor_nav_sleep(ser, secs, stop_ev, cam)
-                    if remaining > 0:
+                if driving_forward and cam is not None:
+                    # Check for obstacles every 200ms while driving forward
+                    _drove = 0.0
+                    _hit = False
+                    while _drove < secs:
+                        if stop_ev and stop_ev.is_set():
+                            ser.stop()
+                            return
+                        time.sleep(0.2)
+                        _drove += 0.2
+                        # YOLO obstacle check
+                        _blocking, _bdesc = _check_path_obstacle(cam)
+                        if _blocking:
+                            ser.send({"T": 1, "L": 0, "R": 0})
+                            log_event("system",
+                                f"Obstacle during drive: {_bdesc} — stopped"
+                                f" ({secs - _drove:.1f}s remaining)")
+                            _hit = True
+                            break
+                    if _hit:
                         driving_forward = False
-                        # Skip remaining commands — floor blocked
                         pending_spin = None
                         continue
                 else:
@@ -1065,6 +1183,7 @@ def execute(ser, commands, stop_ev=None, cam=None):
                 return
             last_pan, last_tilt = new_pan, new_tilt
             _gimbal_pan = last_pan  # sync to global for radar
+            _gimbal_tilt = last_tilt
         elif t == 1:
             # Non-spin wheel command clears pending_spin
             l, r = cmd.get("L", 0), cmd.get("R", 0)
@@ -1161,6 +1280,177 @@ def _run_bash(cmd):
         return False, msg
 
 
+# ── File Tools (LLM self-access) ─────────────────────────────────────
+
+_FILE_ROOT = ROVER_DIR  # /home/jasper/rover-control/
+_FILE_ALLOWED_EXTENSIONS = {
+    ".py", ".md", ".txt", ".json", ".yaml", ".yml", ".cfg", ".ini",
+    ".env", ".sh", ".log", ".csv", ".toml",
+}
+
+def _resolve_file_path(path):
+    """Resolve and validate a file path. Returns (abs_path, error_msg)."""
+    if not path:
+        return None, "Empty path"
+    # Allow relative paths (relative to ROVER_DIR)
+    if not os.path.isabs(path):
+        path = os.path.join(_FILE_ROOT, path)
+    path = os.path.realpath(path)
+    # Must be under /home/jasper/
+    if not path.startswith("/home/jasper/"):
+        return None, f"Access denied: {path} (must be under /home/jasper/)"
+    return path, None
+
+
+def _file_read(path, offset=None, limit=None):
+    """Read a file and return its contents. Supports offset/limit in lines."""
+    global _bash_output
+    abs_path, err = _resolve_file_path(path)
+    if err:
+        _bash_output = err
+        log_event("file", f"read DENIED: {err}")
+        return
+    if not os.path.isfile(abs_path):
+        _bash_output = f"File not found: {path}"
+        log_event("file", f"read 404: {path}")
+        return
+    try:
+        with open(abs_path, "r", errors="replace") as f:
+            lines = f.readlines()
+        total = len(lines)
+        start = max(0, (offset or 1) - 1)
+        end = start + (limit or 200)
+        selected = lines[start:end]
+        numbered = "".join(
+            f"{start + i + 1:4d}  {line}" for i, line in enumerate(selected))
+        if len(numbered) > 8000:
+            numbered = numbered[:8000] + "\n... (truncated)"
+        header = f"── {os.path.relpath(abs_path, '/home/jasper')} ({total} lines) ──\n"
+        _bash_output = header + numbered
+        log_event("file", f"read: {path} ({total} lines, showing {start+1}-{min(end, total)})")
+    except Exception as e:
+        _bash_output = f"Error reading {path}: {e}"
+        log_event("file", f"read error: {e}")
+
+
+def _file_write(path, content, append=False):
+    """Write content to a file. Can create new files or overwrite/append."""
+    global _bash_output
+    abs_path, err = _resolve_file_path(path)
+    if err:
+        _bash_output = err
+        log_event("file", f"write DENIED: {err}")
+        return
+    # Block writing to critical system files
+    basename = os.path.basename(abs_path)
+    if basename in (".bashrc", ".profile", ".bash_logout"):
+        _bash_output = f"Write denied: {basename} is a protected file"
+        log_event("file", f"write DENIED: {basename}")
+        return
+    ext = os.path.splitext(abs_path)[1].lower()
+    if ext and ext not in _FILE_ALLOWED_EXTENSIONS:
+        _bash_output = f"Write denied: extension '{ext}' not allowed"
+        log_event("file", f"write DENIED: ext {ext}")
+        return
+    try:
+        mode = "a" if append else "w"
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, mode) as f:
+            f.write(content)
+        _bash_output = f"Written {len(content)} chars to {path}" + (" (appended)" if append else "")
+        log_event("file", f"write: {path} ({len(content)} chars, {'append' if append else 'overwrite'})")
+    except Exception as e:
+        _bash_output = f"Error writing {path}: {e}"
+        log_event("file", f"write error: {e}")
+
+
+def _file_list(path=None, pattern=None):
+    """List files in a directory, optionally filtered by glob pattern."""
+    global _bash_output
+    dir_path = path or _FILE_ROOT
+    abs_path, err = _resolve_file_path(dir_path)
+    if err:
+        _bash_output = err
+        log_event("file", f"list DENIED: {err}")
+        return
+    if not os.path.isdir(abs_path):
+        _bash_output = f"Not a directory: {dir_path}"
+        log_event("file", f"list 404: {dir_path}")
+        return
+    try:
+        import glob as _glob
+        if pattern:
+            matches = _glob.glob(os.path.join(abs_path, pattern))
+            entries = sorted(os.path.relpath(m, abs_path) for m in matches)
+        else:
+            entries = sorted(os.listdir(abs_path))
+        lines = []
+        for name in entries[:100]:
+            full = os.path.join(abs_path, name)
+            if os.path.isdir(full):
+                lines.append(f"  {name}/")
+            else:
+                size = os.path.getsize(full)
+                if size > 1024 * 1024:
+                    sz = f"{size / 1024 / 1024:.1f}MB"
+                elif size > 1024:
+                    sz = f"{size / 1024:.1f}KB"
+                else:
+                    sz = f"{size}B"
+                lines.append(f"  {name}  ({sz})")
+        rel = os.path.relpath(abs_path, "/home/jasper")
+        header = f"── {rel}/ ({len(entries)} items) ──\n"
+        _bash_output = header + "\n".join(lines)
+        log_event("file", f"list: {dir_path} ({len(entries)} items)")
+    except Exception as e:
+        _bash_output = f"Error listing {dir_path}: {e}"
+        log_event("file", f"list error: {e}")
+
+
+def _file_grep(pattern, path=None, max_results=30):
+    """Search for a pattern in files under a directory."""
+    global _bash_output
+    dir_path = path or _FILE_ROOT
+    abs_path, err = _resolve_file_path(dir_path)
+    if err:
+        _bash_output = err
+        return
+    try:
+        import re
+        regex = re.compile(pattern, re.IGNORECASE)
+        results = []
+        for root, dirs, files in os.walk(abs_path):
+            # Skip hidden dirs and __pycache__
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']
+            for fname in files:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in _FILE_ALLOWED_EXTENSIONS:
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", errors="replace") as f:
+                        for i, line in enumerate(f, 1):
+                            if regex.search(line):
+                                rel = os.path.relpath(fpath, abs_path)
+                                results.append(f"  {rel}:{i}: {line.rstrip()[:120]}")
+                                if len(results) >= max_results:
+                                    break
+                except Exception:
+                    pass
+                if len(results) >= max_results:
+                    break
+            if len(results) >= max_results:
+                break
+        if results:
+            _bash_output = f"── grep '{pattern}' ({len(results)} matches) ──\n" + "\n".join(results)
+        else:
+            _bash_output = f"No matches for '{pattern}'"
+        log_event("file", f"grep: '{pattern}' → {len(results)} matches")
+    except Exception as e:
+        _bash_output = f"Error: {e}"
+        log_event("file", f"grep error: {e}")
+
+
 # ── Memory ──────────────────────────────────────────────────────────────
 
 MEMORY_FILE = os.path.join(ROVER_DIR, "memory.md")
@@ -1216,6 +1506,75 @@ _last_task_target = ""  # extracted target object for navigation tasks
 # Will be set in main() so voice_thread can call ser.stop() directly
 _ser_ref = None
 _imu = None  # IMUPoller, set in main()
+
+# ── Voltage Watchdog ─────────────────────────────────────────────────
+_LOW_VOLTAGE_THRESHOLD = 9.0   # volts
+_LOW_VOLTAGE_THROTTLE = 0.20   # 20% of nominal speed
+_CHARGE_RISE_THRESHOLD = 0.5   # V rise in 1-min average = charging
+_CHARGE_ABS_THRESHOLD = 12.3   # V above this while rising = definitely charging
+_voltage_throttle = 1.0        # current multiplier (1.0 = full, 0.2 = throttled)
+_voltage_warned = False        # only warn once per low episode
+_charging = False              # True when charger detected
+
+
+def _voltage_watchdog():
+    """Background thread: monitor battery voltage, throttle when low,
+    detect charging and auto-enable desk mode."""
+    global _voltage_throttle, _voltage_warned, _charging, desk_mode
+    from collections import deque
+    # Rolling buffer: one sample every 2s, 30 samples = 1 minute
+    history = deque(maxlen=30)
+    prev_avg = None
+
+    while True:
+        time.sleep(2.0)
+        if _imu is None or not _imu.state.fresh:
+            continue
+        v = _imu.state.voltage
+        if v <= 0:
+            continue  # no reading yet
+
+        # ── Rolling average ──
+        history.append(v)
+        avg = sum(history) / len(history)
+
+        # ── Charging detection ──
+        # Need at least 20s of history (10 samples) before deciding
+        if len(history) >= 10 and prev_avg is not None:
+            rise = avg - prev_avg
+            # Charging: average rose significantly, or voltage is high and rising
+            if (rise > _CHARGE_RISE_THRESHOLD
+                    or (avg > _CHARGE_ABS_THRESHOLD and rise > 0.1)):
+                if not _charging:
+                    _charging = True
+                    desk_mode = True
+                    log_event("battery",
+                              f"CHARGING detected (avg={avg:.2f}V, "
+                              f"rise={rise:+.2f}V/min) — desk mode ON")
+            # Discharging: average dropped or stable below charge threshold
+            elif rise < -0.1 and _charging:
+                _charging = False
+                # Don't auto-disable desk mode — user may want it on
+                log_event("battery",
+                          f"UNPLUGGED (avg={avg:.2f}V, "
+                          f"rise={rise:+.2f}V/min) — charging=false")
+        prev_avg = avg
+
+        # ── Low voltage throttle ──
+        if v < _LOW_VOLTAGE_THRESHOLD:
+            if _voltage_throttle != _LOW_VOLTAGE_THROTTLE:
+                _voltage_throttle = _LOW_VOLTAGE_THROTTLE
+                log_event("battery",
+                          f"LOW VOLTAGE {v:.1f}V < {_LOW_VOLTAGE_THRESHOLD}V "
+                          f"— throttling to {int(_LOW_VOLTAGE_THROTTLE * 100)}%")
+            if not _voltage_warned:
+                _voltage_warned = True
+        else:
+            if _voltage_throttle != 1.0:
+                _voltage_throttle = 1.0
+                _voltage_warned = False
+                log_event("battery",
+                          f"Voltage OK {v:.1f}V — full speed restored")
 _floor_nav = None  # FloorNavigator, set in main()
 _navigator = None  # Navigator, set in main()
 
@@ -1227,6 +1586,8 @@ _rover_x = 0.0        # world position meters
 _rover_y = 0.0
 _rover_heading = 0.0  # radians, 0 = +Y (forward at boot)
 _gimbal_pan = 0.0     # degrees
+_gimbal_tilt = 0.0    # degrees — updated by execute()
+_TILT_YOLO_SUPPRESS = 0  # tilt below 0° = looking at ground/own body, suppress YOLO
 _backup_allowed = False  # only True during stuck recovery
 LANDMARK_MAX_AGE = 300  # 5 minutes
 
@@ -1442,7 +1803,7 @@ def voice_thread(mic_dev, mic_card):
                 try:
                     import requests as _req
                     r = _req.post("http://localhost:11434/api/chat",
-                        json={"model": "qwen3.5:cloud",
+                        json={"model": "qwen3.5:9b",
                               "messages": [
                                   {"role": "system",
                                    "content": "Reply ONLY yes or no."},
@@ -1487,8 +1848,9 @@ def voice_thread(mic_dev, mic_card):
             command_queue.put(text)
 
 # Objects that are not obstacles (background / surface classes)
+# NOTE: "wall" is NOT ignored — a wall ahead is a real obstacle.
 _IGNORE_OBSTACLE = {
-    "floor", "ceiling", "wall", "rug", "window", "light", "lamp",
+    "floor", "ceiling", "rug", "window", "light", "lamp",
     "lamp/light fixture", "light_fixture", "light fixture",
     "wooden floor/deck", "pegboard", "tool pegboard",
 }
@@ -1823,6 +2185,32 @@ def run_plan(text, ser, cam, spk, mic_card):
         if not observe:
             observe = True  # force observe so LLM sees the output
 
+    # File tool execution
+    _file_tool_used = False
+    if resp.get("file_read"):
+        fr = resp["file_read"]
+        _file_read(fr.get("path", fr) if isinstance(fr, dict) else fr,
+                   fr.get("offset") if isinstance(fr, dict) else None,
+                   fr.get("limit") if isinstance(fr, dict) else None)
+        _file_tool_used = True
+    if resp.get("file_write"):
+        fw = resp["file_write"]
+        if isinstance(fw, dict) and "path" in fw:
+            _file_write(fw["path"], fw.get("content", ""), fw.get("append", False))
+        _file_tool_used = True
+    if resp.get("file_list"):
+        fl = resp["file_list"]
+        _file_list(fl.get("path") if isinstance(fl, dict) else None,
+                   fl.get("pattern") if isinstance(fl, dict) else None)
+        _file_tool_used = True
+    if resp.get("file_grep"):
+        fg = resp["file_grep"]
+        if isinstance(fg, dict) and "pattern" in fg:
+            _file_grep(fg["pattern"], fg.get("path"))
+        _file_tool_used = True
+    if _file_tool_used and not observe:
+        observe = True  # force observe so LLM sees file output
+
     if observe and commands:
         commands = _truncate_after_first_gimbal(commands)
 
@@ -2085,7 +2473,8 @@ def run_plan(text, ser, cam, spk, mic_card):
             drive_hint = (
                 f"You just spun the body. Center your head (pan→0), "
                 f"then observe to confirm the target is ahead before driving. ")
-        elif round_num <= 2:
+        elif round_num <= 1:
+            # Round 0-1: scan front hemisphere with gimbal
             if target:
                 drive_hint = (
                     f"Scan: pan head -90° to +90° in one sweep. "
@@ -2094,15 +2483,22 @@ def run_plan(text, ser, cam, spk, mic_card):
                     f"spin body 90° first to get a clear view. ")
             else:
                 drive_hint = "Survey first — pan head to find the best route. "
-        elif round_num <= 4:
+        elif round_num <= 3:
+            # Round 2-3: spin body 180° and scan rear hemisphere
+            drive_hint = (
+                f"Now spin your body 180° to scan behind you. "
+                f"Then pan head -90° to +90° to complete a full 360° survey. "
+                f'In "speak", describe what you see in this direction. '
+                f"Note anything relevant to the task — landmarks, doors, open paths, objects. ")
+        elif round_num <= 5:
             if target:
                 drive_hint = (
-                    f"Scan is DONE. COMMIT NOW: pick the direction where you saw "
-                    f"anything that could be the target and DRIVE there at 0.1 m/s. "
+                    f"360° scan is DONE. COMMIT NOW: spin body to face the direction where you saw "
+                    f"the best cue for \"{target}\" and DRIVE there at 0.1 m/s. "
                     f"If nothing matched, drive toward the most open area. "
                     f"Do NOT scan again from the same spot. ")
             else:
-                drive_hint = ("You've scanned enough. Now COMMIT: align body to target, "
+                drive_hint = ("360° scan complete. Now COMMIT: align body to the best direction, "
                               "center head, confirm target is ahead, then drive at 0.1 m/s. ")
         else:
             drive_hint = ("Keep driving toward the goal at 0.1 m/s. "
@@ -2114,7 +2510,7 @@ def run_plan(text, ser, cam, spk, mic_card):
                 f"If yes, drive to it now. ")
 
         # Stale scan warning: LLM keeps scanning without driving
-        if scan_only_rounds >= 3:
+        if scan_only_rounds >= 5:
             drive_hint += (
                 f"\n** WARNING: You have scanned for {scan_only_rounds} rounds "
                 f"without driving. STOP scanning. Your NEXT command MUST include "
@@ -2342,6 +2738,32 @@ def run_plan(text, ser, cam, spk, mic_card):
             if not observe:
                 observe = True  # force observe so LLM sees the output
 
+        # ── File tool execution ──
+        _ft_used = False
+        if resp.get("file_read"):
+            fr = resp["file_read"]
+            _file_read(fr.get("path", fr) if isinstance(fr, dict) else fr,
+                       fr.get("offset") if isinstance(fr, dict) else None,
+                       fr.get("limit") if isinstance(fr, dict) else None)
+            _ft_used = True
+        if resp.get("file_write"):
+            fw = resp["file_write"]
+            if isinstance(fw, dict) and "path" in fw:
+                _file_write(fw["path"], fw.get("content", ""), fw.get("append", False))
+            _ft_used = True
+        if resp.get("file_list"):
+            fl = resp["file_list"]
+            _file_list(fl.get("path") if isinstance(fl, dict) else None,
+                       fl.get("pattern") if isinstance(fl, dict) else None)
+            _ft_used = True
+        if resp.get("file_grep"):
+            fg = resp["file_grep"]
+            if isinstance(fg, dict) and "pattern" in fg:
+                _file_grep(fg["pattern"], fg.get("path"))
+            _ft_used = True
+        if _ft_used and not observe:
+            observe = True
+
         if say:
             _speak_async(say, spk, mic_card)
             plan_history.append(f"Round {round_num}: {say}")
@@ -2510,6 +2932,7 @@ def _orchestrated_navigate(nav_target, prior_history=None):
             step.target,
             plan_context=plan_context,
             step_budget=step.waypoint_budget,
+            plan=plan,
         )
 
         # Read step result
@@ -2528,14 +2951,8 @@ def _orchestrated_navigate(nav_target, prior_history=None):
                   f"{'succeeded' if result.success else 'failed'}: "
                   f"{result.reason} ({result.waypoints_used} wp)")
 
-        # Last step + success → done, skip evaluation
-        if result.success and plan.current_index == len(plan.steps) - 1:
-            plan.history.append(f"{step.target} (done)")
-            log_event("plan",
-                      f"[plan] Navigation complete: reached '{nav_target}'")
-            return {"reached": True, "history": plan.history}
-
-        # Evaluate step (1 LLM call)
+        # Orchestrator always evaluates — it decides when the task is done
+        # (executor's "arrived" is just input, not the final word)
         eval_jpeg = nav.tracker.get_jpeg()
         decision = orchestrator.evaluate_step(
             plan, result, jpeg_bytes=eval_jpeg, log_fn=log_event)
@@ -2543,13 +2960,20 @@ def _orchestrated_navigate(nav_target, prior_history=None):
         action = decision.get("decision", "continue" if result.success else "abort")
 
         # Record in history AFTER evaluation — skip/continue override failure
-        if action in ("continue", "skip"):
+        if action in ("done", "continue", "skip"):
             plan.history.append(f"{step.target} (done)")
         else:
             status = "done" if result.success else f"failed:{result.reason}"
             plan.history.append(f"{step.target} ({status})")
 
-        if action == "continue":
+        if action == "done":
+            # Orchestrator confirms mission goal is achieved
+            reason = decision.get("reason", "goal achieved")
+            log_event("plan",
+                      f"[plan] Orchestrator confirms done: {reason}")
+            return {"reached": True, "history": plan.history}
+
+        elif action == "continue":
             plan.current_index += 1
             # Last step accepted → success
             if plan.current_index >= len(plan.steps):
@@ -2574,6 +2998,12 @@ def _orchestrated_navigate(nav_target, prior_history=None):
                 hint = decision.get("retry_hint", "")
                 if hint:
                     plan.history.append(f"retry hint: {hint}")
+                # If failed due to budget, increase it for the retry
+                if result.reason == "budget" and step:
+                    old_budget = step.waypoint_budget
+                    step.waypoint_budget = min(30, old_budget + 10)
+                    log_event("plan",
+                              f"[plan] Budget increase: {old_budget} → {step.waypoint_budget}")
                 log_event("plan", f"[plan] Retrying step: {hint}")
                 # Loop will re-execute same step
             else:
@@ -2705,25 +3135,52 @@ def main():
         ser.send = _nav_send_hook
 
         def _nav_vision_fn(prompt, jpeg_bytes):
-            """Lightweight LLM vision call for Navigator — 15s timeout."""
+            """Lightweight LLM vision call for Navigator — 30s timeout.
+            Uses the orchestrator's current model (respects UI dropdown)."""
             import base64 as _b64
             import requests
+            model = orchestrator.OLLAMA_MODEL
             b64 = _b64.b64encode(jpeg_bytes).decode()
-            r = requests.post(
-                "http://localhost:11434/api/chat",
-                json={"model": "qwen3.5:cloud",
-                      "messages": [
-                          {"role": "system",
-                           "content": "Reply ONLY with the requested JSON."},
-                          {"role": "user", "content": prompt,
-                           "images": [b64]},
-                      ],
-                      "stream": False, "think": False,
-                      "options": {"temperature": 0.3, "num_predict": 300}},
-                timeout=15)
-            r.raise_for_status()
-            content = r.json()["message"].get("content", "")
-            return content
+            # Route claude models to Anthropic API
+            if model.startswith("claude-"):
+                r = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": os.environ.get("ANTHROPIC_API_KEY", ""),
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "system": "Reply ONLY with the requested JSON.",
+                        "messages": [{"role": "user", "content": [
+                            {"type": "image", "source": {
+                                "type": "base64", "media_type": "image/jpeg",
+                                "data": b64}},
+                            {"type": "text", "text": prompt},
+                        ]}],
+                        "max_tokens": 300,
+                        "temperature": 0.3,
+                    },
+                    timeout=30)
+                r.raise_for_status()
+                return r.json()["content"][0]["text"].strip()
+            else:
+                r = requests.post(
+                    orchestrator.OLLAMA_URL,
+                    json={"model": model,
+                          "messages": [
+                              {"role": "system",
+                               "content": "Reply ONLY with the requested JSON."},
+                              {"role": "user", "content": prompt,
+                               "images": [b64]},
+                          ],
+                          "stream": False, "think": False,
+                          "options": {"temperature": 0.3, "num_predict": 300}},
+                    timeout=30)
+                r.raise_for_status()
+                content = r.json()["message"].get("content", "")
+                return content
 
         def _nav_parse_fn(raw):
             """Parse JSON from LLM response."""
@@ -2757,6 +3214,7 @@ def main():
             pose=_nav_pose, voice_fn=lambda msg: _speak(msg, spk, mic_card),
             emergency_event=stop_event,
             exploration_grid=_exploration_grid,
+            log_fn=log_event,
         )
         log_event("system", f"Navigator active (yolo={'ON' if cam.detector else 'OFF'}"
                   f", exploration={'ON' if _exploration_grid else 'OFF'})")
@@ -2799,6 +3257,11 @@ def main():
 
     _xai_refs["imu"] = _imu
 
+    # ── Voltage watchdog thread ──
+    threading.Thread(target=_voltage_watchdog, daemon=True,
+                     name="voltage-watchdog").start()
+    log_event("system", f"Voltage watchdog active (threshold={_LOW_VOLTAGE_THRESHOLD}V)")
+
     # ── xAI Realtime voice (if requested via CLI) ──
     if _use_xai_realtime:
         set_provider("stt", "xai-realtime")
@@ -2806,6 +3269,9 @@ def main():
     # Start voice listener thread (STT disabled when xAI Realtime is active)
     vt = threading.Thread(target=voice_thread, args=(mic_dev, mic_card), daemon=True)
     vt.start()
+
+    # Restore saved LLM/orchestrator preferences
+    _restore_provider_prefs()
 
     log_event("system", "rover_brain_llm ready")
 
@@ -2909,6 +3375,41 @@ def main():
                     f"{'reached' if result['reached'] else 'could not reach'}"
                     f" '{nav_target}'")
                 continue
+
+        # ── Follow shortcut: bypass LLM, pure YOLO visual servo ──
+        _follow_words = {"follow", "following"}
+        if _follow_words & _clean_words(text):
+            plan_active.set()
+            stop_event.clear()
+            # Extract target from text: "follow me" → "person", "follow the dog" → "dog"
+            import string as _string
+            words = [w.strip(_string.punctuation) for w in text.strip().lower().split()]
+            words = [w for w in words if w]  # drop empty after stripping
+            _filler = {"the", "that", "this", "a", "an", "my"}
+            _rest = [w for w in words if w not in {"follow", "following"} | _filler]
+            _ftarget = "person"
+            if _rest:
+                w0 = _rest[0]
+                if w0 in ("me", "person", "human", "owner", "man", "woman"):
+                    _ftarget = "person"
+                else:
+                    _ftarget = w0
+            log_event("follow", f"YOLO follow mode: {text} (target={_ftarget})")
+            _speak("Following.", spk, mic_card)
+            from follow_target import follow
+            result = follow(_ftarget, ser, cam, _xai_refs.get("imu"),
+                            duration=300,
+                            stop_event=stop_event,
+                            log_fn=lambda msg: log_event("follow", msg),
+                            voice=_xai_voice, floor_nav=None,
+                            recovery_fn=_follow_recovery,
+                            speak_fn=lambda t: _speak(t, spk, mic_card),
+                            llm_fn=_follow_llm_fn,
+                            label_override_fn=_follow_label_override)
+            log_event("follow", f"Done: {result.get('status')}")
+            plan_active.clear()
+            stop_event.clear()
+            continue
 
         log_event("plan", f"Starting: {text}")
         result = run_plan(text, ser, cam, spk, mic_card)

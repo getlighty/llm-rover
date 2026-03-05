@@ -1,0 +1,216 @@
+{
+  "current_room": "living_room",
+  "current_confidence": 0.55,
+  "rooms": [
+    {
+      "name": "office",
+      "positive_features": [
+        "desk",
+        "monitor",
+        "keyboard",
+        "office chair",
+        "printer",
+        "cables",
+        "wicker basket",
+        "shelving",
+        "wooden floor",
+        "desk legs",
+        "power strip",
+        "trash bin",
+        "chair legs",
+        "storage unit under desk",
+        "bookshelf with binders",
+        "office chair base visible",
+        "desk leg",
+        "blue LED light",
+        "cluttered desk",
+        "cables on floor",
+        "storage bags",
+        "cluttered floor",
+        "cardboard boxes",
+        "desk with ornate carved front",
+        "shelving unit with books and items",
+        "cables and electronics",
+        "computer equipment",
+        "shelving units",
+        "monitor/screen",
+        "shelving unit",
+        "storage boxes",
+        "shelving with items",
+        "desk area",
+        "cables and equipment",
+        "warm lighting",
+        "monitor/screen visible"
+      ],
+      "negative_features": [
+        "stove",
+        "oven",
+        "sink",
+        "toilet",
+        "shower",
+        "bathtub",
+        "sofa",
+        "couch"
+      ],
+      "floor_type": "wooden floor",
+      "connections": [
+        "hallway"
+      ],
+      "entry_landmarks": [
+        {
+          "landmark": "doorway with yellow walls"
+        }
+      ],
+      "nav_hints": "Exit is the doorway with bright hallway light behind the desk area. Go around the chair, not through it.",
+      "last_visited": "2026-03-05 20:41",
+      "visit_count": 216,
+      "last_scene": "Low-angle view inside a cluttered room with yellow walls and wooden flooring. A large wooden cabinet is on the left, and various items including bags and boxes are scattered on the floor in the center and right. The arched doorway target is not visible in this frame.",
+      "last_yolo": "refrigerator(22%) legs(22%) backpack(22%,1.2m)"
+    },
+    {
+      "name": "hallway",
+      "positive_features": [
+        "stone tiles",
+        "yellow walls",
+        "plant pot",
+        "narrow corridor",
+        "stone tile floor",
+        "arched doorway"
+      ],
+      "negative_features": [
+        "desk",
+        "monitor",
+        "stove",
+        "sofa",
+        "toilet"
+      ],
+      "floor_type": "stone tiles",
+      "connections": [
+        "office",
+        "kitchen",
+        "living_room",
+        "bathroom"
+      ],
+      "entry_landmarks": [
+        {
+          "landmark": "stone-tiled floor transition"
+        }
+      ],
+      "nav_hints": "",
+      "last_visited": "2026-03-05 20:41",
+      "visit_count": 43,
+      "last_scene": "The arched doorway with bright hallway light is clearly visible on the left side of the frame. The view shows a transition from wooden flooring to stone tiles in the hallway beyond the arch. A large wooden structure (likely a door or furniture) obscures the right side.",
+      "last_yolo": "basket(68%) lamp_base(38%)"
+    },
+    {
+      "name": "kitchen",
+      "positive_features": [
+        "stove",
+        "oven",
+        "refrigerator",
+        "sink",
+        "counter",
+        "cabinets",
+        "orange arch"
+      ],
+      "negative_features": [
+        "desk",
+        "monitor",
+        "office chair",
+        "sofa",
+        "toilet"
+      ],
+      "floor_type": "tiles",
+      "connections": [
+        "hallway"
+      ],
+      "entry_landmarks": [
+        {
+          "landmark": "orange arched doorway"
+        }
+      ],
+      "nav_hints": "",
+      "last_visited": "2026-03-05 19:57",
+      "visit_count": 48,
+      "last_scene": "Stone-tiled floor with a staircase on the left. On the right wall, an orange arched doorway is visible in the distance, leading to another room.",
+      "last_yolo": "nothing"
+    },
+    {
+      "name": "living_room",
+      "positive_features": [
+        "sofa",
+        "couch",
+        "tv",
+        "coffee table",
+        "rug",
+        "parquet floor",
+        "arched doorway",
+        "wooden floor",
+        "lamp",
+        "basket with dog",
+        "blue laundry basket",
+        "plastic bag",
+        "pink toy",
+        "rug (partially visible)",
+        "coffee table (implied by clutter and layout)",
+        "shelving unit",
+        "pet bowls",
+        "basket",
+        "dog",
+        "shelves",
+        "bags"
+      ],
+      "negative_features": [
+        "desk",
+        "monitor",
+        "stove",
+        "oven",
+        "toilet"
+      ],
+      "floor_type": "parquet floor",
+      "connections": [
+        "hallway"
+      ],
+      "entry_landmarks": [
+        {
+          "landmark": "arched doorway from hallway"
+        }
+      ],
+      "nav_hints": "",
+      "last_visited": "2026-03-05 20:41",
+      "visit_count": 34,
+      "last_scene": "Low-angle view inside the office with yellow walls and wooden floor. A large open wooden cabinet is on the left, cluttered with items. The center and right foreground are blocked by a white box, plastic bags, and debris. The arched doorway target is not visible in this frame; likely located behind t",
+      "last_yolo": "car(30%)"
+    },
+    {
+      "name": "bathroom",
+      "positive_features": [
+        "toilet",
+        "shower",
+        "bathtub",
+        "sink",
+        "tiles",
+        "mirror"
+      ],
+      "negative_features": [
+        "desk",
+        "monitor",
+        "stove",
+        "sofa",
+        "couch"
+      ],
+      "floor_type": "tiles",
+      "connections": [
+        "hallway"
+      ],
+      "entry_landmarks": [
+        {
+          "landmark": "bathroom door"
+        }
+      ],
+      "nav_hints": "",
+      "last_visited": "",
+      "visit_count": 0
+    }
+  ]
+}

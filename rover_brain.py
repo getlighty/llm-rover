@@ -165,15 +165,144 @@ def _encoder_spin(rover, target_delta_deg, stop_event=None):
     return (actual_deg, timed_out)
 
 
-# --- Magnetometer-guided spin (DISABLED — needs firmware with working gyro/AHRS) ---
-# MAG_SPIN_TOLERANCE_DEG = 5.0
-# MAG_SPIN_OVERSHOOT_DEG = 30.0
-# MAG_SPIN_TIMEOUT_S = 4.0
-# MAG_SPIN_POLL_HZ = 10
-#
-# def _mag_spin(rover, imu_poller, target_delta_deg, stop_event=None):
-#     """Monitor magnetometer heading during spin. Needs working AHRS yaw."""
-#     pass  # Re-enable after flashing firmware with gyro + AHRS Euler angles
+# AHRS-guided spin parameters
+AHRS_SPIN_TOLERANCE_DEG = 5.0
+AHRS_SPIN_OVERSHOOT_DEG = 30.0
+AHRS_SPIN_TIMEOUT_S = 4.0
+AHRS_SPIN_POLL_HZ = 10
+
+
+def _ahrs_spin(rover, imu_poller, target_delta_deg, stop_event=None):
+    """Closed-loop rotation using AHRS heading from IMU poller.
+
+    Uses the Madgwick AHRS yaw (gyro-integrated, accel-corrected) to track
+    rotation.  More robust than encoder differential for skid-steer since
+    it measures actual body rotation rather than wheel slip.
+
+    Wheels must already be spinning when called.
+    Returns (actual_delta_deg, timed_out) or None if AHRS data unavailable.
+    """
+    if imu_poller is None or not imu_poller.state.fresh:
+        return None
+
+    target_abs = abs(target_delta_deg)
+    start_yaw = imu_poller.ahrs.euler[2]  # raw yaw in degrees
+    deadline = time.time() + AHRS_SPIN_TIMEOUT_S
+    poll_interval = 1.0 / AHRS_SPIN_POLL_HZ
+    timed_out = False
+    first_check = True
+
+    while time.time() < deadline:
+        if stop_event and stop_event.is_set():
+            break
+
+        time.sleep(poll_interval)
+
+        if not imu_poller.state.fresh:
+            continue
+
+        current_yaw = imu_poller.ahrs.euler[2]
+        # Compute shortest-path delta from start
+        delta = current_yaw - start_yaw
+        # Normalize to -180..180
+        delta = ((delta + 180) % 360) - 180
+        accumulated_abs = abs(delta)
+
+        # Responsiveness check
+        elapsed = time.time() - (deadline - AHRS_SPIN_TIMEOUT_S)
+        if first_check and elapsed >= 0.5:
+            first_check = False
+            if accumulated_abs < 2.0:
+                print(f"[ahrs_spin] No rotation detected after 0.5s, "
+                      f"falling back to encoder_spin")
+                return None  # DON'T stop wheels — caller falls back
+
+        # Target reached
+        if accumulated_abs >= target_abs - AHRS_SPIN_TOLERANCE_DEG:
+            break
+
+        # Overshoot protection
+        if accumulated_abs > target_abs + AHRS_SPIN_OVERSHOOT_DEG:
+            print(f"[ahrs_spin] Overshoot: {accumulated_abs:.1f}° vs "
+                  f"target {target_abs:.1f}°")
+            break
+    else:
+        timed_out = True
+
+    # Stop wheels
+    rover.send({"T": 1, "L": 0, "R": 0})
+
+    current_yaw = imu_poller.ahrs.euler[2]
+    actual_deg = ((current_yaw - start_yaw + 180) % 360) - 180
+    label = "TIMEOUT" if timed_out else "OK"
+    print(f"[ahrs_spin] target={target_delta_deg:+.0f}°, "
+          f"actual={actual_deg:+.1f}° {label}")
+    return (actual_deg, timed_out)
+
+
+def calibrate_mag(rover, imu_poller, cal_file="mag_cal.json"):
+    """Magnetometer calibration routine.
+
+    Slowly spins the rover 360° while collecting mag samples,
+    then fits a sphere to extract hard-iron offsets and saves to JSON.
+
+    Args:
+        rover: Serial rover instance with send() and read_imu()
+        imu_poller: IMUPoller instance (for AHRS mag_cal reference)
+        cal_file: Output calibration file path
+
+    Returns:
+        (offset, n_samples) on success, None on failure
+    """
+    from ahrs_filter import MagCalibration
+
+    print("[mag_cal] Starting magnetometer calibration...")
+    print("[mag_cal] Rover will spin slowly for ~15 seconds. Keep area clear.")
+    time.sleep(2)
+
+    samples = []
+    spin_speed = 0.12  # slow spin for clean data
+
+    # Start spinning
+    rover.send({"T": 1, "L": -spin_speed, "R": spin_speed})
+    t0 = time.time()
+    spin_duration = 15.0  # ~1.5 full rotations at slow speed
+
+    while time.time() - t0 < spin_duration:
+        data = rover.read_imu()
+        if data:
+            mx = float(data.get("mx", 0))
+            my = float(data.get("my", 0))
+            mz = float(data.get("mz", 0))
+            if mx != 0 or my != 0 or mz != 0:
+                samples.append((mx, my, mz))
+        time.sleep(0.1)
+
+    # Stop
+    rover.send({"T": 1, "L": 0, "R": 0})
+    print(f"[mag_cal] Collected {len(samples)} samples")
+
+    if len(samples) < 20:
+        print("[mag_cal] Not enough samples! Calibration failed.")
+        return None
+
+    # Fit sphere
+    cal = MagCalibration(cal_file)
+    try:
+        offset = cal.fit_ellipsoid(samples)
+        cal.save()
+        print(f"[mag_cal] Calibration saved to {cal_file}")
+        print(f"[mag_cal] Hard-iron offset: [{offset[0]:.1f}, {offset[1]:.1f}, {offset[2]:.1f}]")
+
+        # Update live AHRS if available
+        if imu_poller and imu_poller.ahrs:
+            imu_poller.ahrs.mag_cal = cal
+            print("[mag_cal] Live AHRS updated with new calibration")
+
+        return (offset, len(samples))
+    except Exception as e:
+        print(f"[mag_cal] Fit failed: {e}")
+        return None
 
 
 SYSTEM_PROMPT = """\
@@ -2796,36 +2925,39 @@ def main():
     rover._on_command = pose.on_command
     print(f"[pose] Tracker active (wheelbase={PoseTracker.WHEELBASE}m)")
 
-    # --- IMU Poller (DISABLED — magnetometer/gyro unusable with current firmware) ---
-    # Re-enable after flashing firmware with working gyro + AHRS Euler angles.
+    # --- IMU Poller + AHRS Fusion ---
     imu_poller = None
-    # try:
-    #     from imu import IMUPoller
-    #     imu_poller = IMUPoller(rover, log_fn=lambda cat, msg: print(f"[{cat}] {msg}"))
-    #     imu_poller.start()
-    #     time.sleep(0.5)
-    #     if imu_poller.read_once():
-    #         imu_poller.set_heading_offset()
-    #         print(f"[imu] Poller started, boot heading offset set ({imu_poller.state.mag_heading_raw:.1f}° raw)")
-    #     else:
-    #         print("[imu] Poller started, but initial read failed (heading uncalibrated)")
-    # except Exception as e:
-    #     print(f"[imu] IMU poller unavailable: {e}")
-    #     imu_poller = None
-    #
-    # if imu_poller:
-    #     _orig_on_command = pose.on_command
-    #     def _pose_and_imu_on_command(cmd):
-    #         _orig_on_command(cmd)
-    #         if isinstance(cmd, dict) and cmd.get("T") == 1:
-    #             v_l = cmd.get("L", 0)
-    #             v_r = cmd.get("R", 0)
-    #             if v_l != 0 or v_r != 0:
-    #                 imu_poller.wheels_active.set()
-    #             else:
-    #                 imu_poller.wheels_active.clear()
-    #     rover._on_command = _pose_and_imu_on_command
-    print("[imu] IMU poller disabled (using encoder-guided turns instead)")
+    try:
+        from imu import IMUPoller
+        import os as _os
+        _cal_file = _os.path.join(_os.path.dirname(__file__) or ".", "mag_cal.json")
+        imu_poller = IMUPoller(rover,
+                               log_fn=lambda cat, msg: print(f"[{cat}] {msg}"),
+                               cal_file=_cal_file)
+        imu_poller.start()
+        # Let AHRS collect a few samples before setting heading offset
+        time.sleep(0.8)
+        for _ in range(3):
+            imu_poller.read_once()
+            time.sleep(0.1)
+        imu_poller.set_heading_offset()
+        print(f"[imu] AHRS poller started, heading offset set")
+    except Exception as e:
+        print(f"[imu] IMU/AHRS poller unavailable: {e}")
+        imu_poller = None
+
+    if imu_poller:
+        _orig_on_command = pose.on_command
+        def _pose_and_imu_on_command(cmd):
+            _orig_on_command(cmd)
+            if isinstance(cmd, dict) and cmd.get("T") == 1:
+                v_l = cmd.get("L", 0)
+                v_r = cmd.get("R", 0)
+                if v_l != 0 or v_r != 0:
+                    imu_poller.wheels_active.set()
+                else:
+                    imu_poller.wheels_active.clear()
+        rover._on_command = _pose_and_imu_on_command
 
     # --- Adaptive light management ---
     def _check_ambient_light():
@@ -3107,28 +3239,38 @@ def main():
                 if "_pause" in cmd:
                     secs = float(cmd["_pause"])
                     if secs > 0:
-                        # Encoder-guided spin: use wheel encoders instead of timer
+                        # Closed-loop spin: try AHRS first, then encoder, then timed
                         if pending_spin:
                             expected_deg = pending_spin["omega_dps"] * secs
                             yaw_before = pose.body_yaw
                             spin_t0 = time.time()
-                            result = _encoder_spin(rover, expected_deg,
-                                                   stop_event=emergency_event)
+                            # Try AHRS-guided spin first (more robust for skid-steer)
+                            result = None
+                            if imu_poller is not None:
+                                result = _ahrs_spin(rover, imu_poller, expected_deg,
+                                                    stop_event=emergency_event)
+                                if result is not None:
+                                    print(f"  (_pause {secs:.2f}s → ahrs_spin)")
+                            # Fall back to encoder-guided spin
+                            if result is None:
+                                result = _encoder_spin(rover, expected_deg,
+                                                       stop_event=emergency_event)
+                                if result is not None:
+                                    print(f"  (_pause {secs:.2f}s → encoder_spin)")
                             if result is not None:
                                 actual_deg, timed_out = result
                                 drift = abs(abs(actual_deg) - abs(expected_deg))
                                 if drift > 10:
-                                    print(f"  [encoder_spin] Drift: expected={expected_deg:+.0f}°, "
+                                    print(f"  [spin] Drift: expected={expected_deg:+.0f}°, "
                                           f"actual={actual_deg:+.1f}° (slip={drift:.0f}°)")
-                                # Override PoseTracker with encoder measurement
+                                # Override PoseTracker with measured rotation
                                 pose.body_yaw = ((yaw_before + actual_deg + 180) % 360) - 180
                                 pending_spin = None
-                                print(f"  (_pause {secs:.2f}s → encoder_spin)")
                                 continue
-                            # _encoder_spin returned None — fall back to timed
+                            # Both failed — fall back to timed
                             already = time.time() - spin_t0
                             remaining = max(0, secs - already)
-                            print(f"  [encoder_spin] No data, falling back to timed ({remaining:.2f}s remaining)")
+                            print(f"  [spin] No sensor data, timed fallback ({remaining:.2f}s)")
                             time.sleep(remaining)
                             print(f"  (_pause {secs:.2f}s, timed fallback)")
                             pending_spin = None
@@ -3392,13 +3534,24 @@ def main():
                 yaw_before = pose.body_yaw
                 rover.send({"T": 1, "L": TURN_SPEED * sign, "R": -TURN_SPEED * sign})
                 spin_start = time.time()
-                result = _encoder_spin(rover, target_delta,
-                                       stop_event=emergency_event)
+                # Try AHRS first, then encoder, then timed
+                result = None
+                method = "timed"
+                if imu_poller is not None:
+                    result = _ahrs_spin(rover, imu_poller, target_delta,
+                                        stop_event=emergency_event)
+                    if result is not None:
+                        method = "ahrs"
+                if result is None:
+                    result = _encoder_spin(rover, target_delta,
+                                           stop_event=emergency_event)
+                    if result is not None:
+                        method = "encoder"
                 if result is not None:
                     actual_deg, timed_out = result
                     pose.body_yaw = ((yaw_before + actual_deg + 180) % 360) - 180
                     label = f"{abs(actual_deg):.0f}" if not timed_out else f"~{abs(actual_deg):.0f}"
-                    return True, f"Turned {direction} {label}° (encoder-guided)"
+                    return True, f"Turned {direction} {label}° ({method}-guided)"
                 else:
                     # Fallback: timed rotation (subtract time already spent)
                     rotation_time = degrees / TURN_RATE_DPS
@@ -3923,6 +4076,15 @@ def main():
                                    "yolo_label": yolo_label,
                                    "correct_label": correct_label})
 
+            elif fn_name == "calibrate_mag":
+                import os as _os
+                _cal = _os.path.join(_os.path.dirname(__file__) or ".", "mag_cal.json")
+                result = calibrate_mag(rover, imu_poller, cal_file=_cal)
+                if result:
+                    offset, n = result
+                    return json.dumps({"status": "ok", "offset": offset, "samples": n})
+                return json.dumps({"error": "Calibration failed (not enough samples)"})
+
             else:
                 return json.dumps({"error": f"Unknown function: {fn_name}"})
 
@@ -3992,6 +4154,11 @@ def main():
                     imu_line = imu_poller.get_prompt_line()
                     if imu_line:
                         user_input += f" [{imu_line}]"
+                    # Correct PoseTracker yaw from AHRS when mag is trusted
+                    if (imu_poller.ahrs.mag_weight > 0.8
+                            and imu_poller.state.fresh
+                            and not imu_poller.wheels_active.is_set()):
+                        pose.body_yaw = ((imu_poller.heading_deg + 180) % 360) - 180
 
                 # Try Gemini Live WebSocket first
                 if gemini_live and gemini_live.is_connected:

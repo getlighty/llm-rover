@@ -119,6 +119,24 @@ body{background:#1a1a2e;color:#e0e0e0;font-family:'Courier New',monospace;height
 #log .cat-interrupt{color:#e67e22}
 #log .cat-system{color:#888}
 #log .cat-error{color:#ff4444;font-weight:bold}
+#log .cat-nav{color:#1abc9c}
+#log .cat-orchestrator{color:#8e44ad}
+#log .cat-observe{color:#3498db}
+#log .cat-decide{color:#27ae60}
+#log .cat-bash{color:#d4ac0d}
+#log .cat-file{color:#d4ac0d}
+#log .cat-follow{color:#e91e63}
+#log .cat-battery{color:#f57f17;font-weight:bold}
+#log .cat-backup{color:#ff9800}
+#log .cat-detect{color:#00bcd4}
+#log .cat-yolo_corr{color:#00bcd4}
+#log .cat-imu{color:#78909c}
+#log .cat-track{color:#ab47bc}
+#log .cat-floor_nav{color:#607d8b}
+#log .cat-room{color:#26a69a}
+#log-filters{padding:4px 8px;background:#16213e;display:flex;flex-wrap:wrap;gap:4px;border-bottom:1px solid #333}
+#log-filters label{font-size:11px;color:#aaa;cursor:pointer;user-select:none}
+#log-filters input{margin-right:2px;cursor:pointer}
 #cmdbar{display:flex;padding:8px 12px;background:#16213e;gap:8px}
 #cmdbar input{flex:1;background:#0f3460;color:#e0e0e0;border:1px solid #333;padding:8px 12px;border-radius:4px;font-family:inherit;font-size:14px}
 #cmdbar input::placeholder{color:#555}
@@ -179,6 +197,21 @@ body{background:#1a1a2e;color:#e0e0e0;font-family:'Courier New',monospace;height
         <button id="gimbal-center">Center</button>
       </div>
     </div>
+    <div id="gridSection" style="max-width:640px;margin-top:8px">
+      <button id="gridToggle" style="background:#0f3460;color:#e0e0e0;border:1px solid #444;
+        padding:4px 12px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px;width:100%">
+        &#9632; Exploration Grid</button>
+      <div id="gridPanel" style="display:none;background:#0a0a1a;border:1px solid #333;
+        border-radius:0 0 4px 4px;padding:8px;text-align:center">
+        <img id="gridImg" style="width:320px;height:320px;image-rendering:pixelated;border-radius:4px;border:1px solid #333">
+        <div style="display:flex;justify-content:center;gap:12px;margin-top:6px;font-size:11px">
+          <span style="color:#2ecc71">&#9632; visited</span>
+          <span style="color:#3498db">&#9632; free</span>
+          <span style="color:#e74c3c">&#9632; occupied</span>
+          <span style="color:#ccc">&#9650; rover</span>
+        </div>
+      </div>
+    </div>
     <div id="calibSection" style="max-width:640px;margin-top:8px">
       <button id="calibToggle" style="background:#0f3460;color:#e0e0e0;border:1px solid #444;
         padding:4px 12px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px;width:100%">
@@ -213,10 +246,28 @@ body{background:#1a1a2e;color:#e0e0e0;font-family:'Courier New',monospace;height
           </div>
           <div id="calibResult" style="font-size:11px;color:#2ecc71;margin-top:6px"></div>
         </div>
+        <div style="border-top:1px solid #333;margin-top:10px;padding-top:10px">
+          <div style="font-size:12px;color:#8888aa;margin-bottom:6px">
+            Gimbal Pan Offset: <span id="gimbalOffCurrent" style="color:#2ecc71">0.0</span>&deg;
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button id="gimbalOffMinus" style="background:#0f3460;color:#e0e0e0;border:1px solid #444;
+              padding:4px 10px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px">-1&deg;</button>
+            <input id="gimbalOffVal" type="number" min="-30" max="30" step="0.5" value="0"
+              style="width:60px;background:#0f3460;color:#e0e0e0;border:1px solid #444;
+              padding:4px 6px;border-radius:4px;font-family:inherit;font-size:12px">
+            <button id="gimbalOffPlus" style="background:#0f3460;color:#e0e0e0;border:1px solid #444;
+              padding:4px 10px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px">+1&deg;</button>
+            <button id="gimbalOffSave" style="background:#2ecc71;color:#fff;border:none;
+              padding:4px 12px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px">Save</button>
+            <button id="gimbalOffTest" style="background:#0f3460;color:#e0e0e0;border:1px solid #444;
+              padding:4px 10px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px">Test Center</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
-  <div id="logpanel"><div id="log"></div></div>
+  <div id="logpanel"><div id="log-filters"></div><div id="log"></div></div>
 </div>
 <div id="cmdbar">
   <input id="cmd" type="text" placeholder="Type a command..." autocomplete="off">
@@ -325,15 +376,33 @@ restartBtn.onclick=()=>{
   });
 };
 
-// SSE log stream
+// SSE log stream with filters
+const LOG_CATS=['llm','serial','heard','speak','plan','stuck','interrupt','system','error','nav','orchestrator','observe','decide','bash','file','follow','battery','backup','detect','yolo_corr','imu','track','floor_nav','room'];
+const logHidden=new Set(['serial']);
+const filtersDiv=document.getElementById('log-filters');
+LOG_CATS.forEach(cat=>{
+  const lbl=document.createElement('label');
+  const cb=document.createElement('input');
+  cb.type='checkbox';cb.checked=!logHidden.has(cat);
+  cb.onchange=()=>{
+    if(cb.checked)logHidden.delete(cat);else logHidden.add(cat);
+    document.querySelectorAll('#log div').forEach(el=>{
+      const c=el.dataset.cat;if(c)el.style.display=logHidden.has(c)?'none':'';
+    });
+  };
+  lbl.appendChild(cb);lbl.appendChild(document.createTextNode(cat));
+  filtersDiv.appendChild(lbl);
+});
 const es=new EventSource('/events');
 es.onmessage=e=>{
   const d=JSON.parse(e.data);
   const t=new Date(d.ts*1000).toLocaleTimeString();
   const line=document.createElement('div');
+  line.dataset.cat=d.cat;
+  line.style.display=logHidden.has(d.cat)?'none':'';
   line.innerHTML='<span class="ts">'+t+'</span> <span class="cat-'+d.cat+'">['+d.cat+']</span> '+escHtml(d.data);
   log.appendChild(line);
-  if(log.children.length>500)log.removeChild(log.firstChild);
+  if(log.children.length>1000)log.removeChild(log.firstChild);
   log.scrollTop=log.scrollHeight;
 };
 
@@ -351,6 +420,8 @@ cmd.addEventListener('keydown',e=>{if(e.key==='Enter')sendCmd()});
 let gimbalPan=0, gimbalTilt=0;
 let gimbalDragging=false;
 let gimbalLastSend=0;
+let gimbalPanOffset=0; // loaded from /nav/config
+fetch('/nav/config').then(r=>r.json()).then(d=>{gimbalPanOffset=d.gimbal_pan_offset||0;}).catch(()=>{});
 const GIMBAL_PAN_MIN=-180, GIMBAL_PAN_MAX=180;
 const GIMBAL_TILT_MIN=-30, GIMBAL_TILT_MAX=90;
 const GIMBAL_SEND_INTERVAL=100; // 10Hz throttle
@@ -692,6 +763,20 @@ document.getElementById('annTrain').onclick=()=>{
     },3000);
   });
 };
+// ── Exploration Grid ──────────────────────────────────────
+(function(){
+  const tog=document.getElementById('gridToggle');
+  const panel=document.getElementById('gridPanel');
+  const img=document.getElementById('gridImg');
+  let timer=null;
+  function refresh(){img.src='/nav/grid?t='+Date.now();}
+  tog.onclick=()=>{
+    const vis=panel.style.display==='none';
+    panel.style.display=vis?'block':'none';
+    if(vis){refresh();timer=setInterval(refresh,2000);}
+    else if(timer){clearInterval(timer);timer=null;}
+  };
+})();
 // ── Turn Calibration ──────────────────────────────────────
 (function(){
   const tog=document.getElementById('calibToggle');
@@ -723,7 +808,7 @@ document.getElementById('annTrain').onclick=()=>{
   document.getElementById('calibApply').onclick=()=>{
     const actual=parseFloat(actualIn.value);
     if(!actual||actual<=0){resultEl.textContent='Enter a valid angle';return;}
-    const newDPS=curDPS*(cmdDeg/actual);
+    const newDPS=curDPS*(actual/cmdDeg);
     fetch('/nav/config',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({turn_rate_dps:Math.round(newDPS*10)/10})
     }).then(r=>r.json()).then(d=>{
@@ -731,6 +816,36 @@ document.getElementById('annTrain').onclick=()=>{
       resultEl.textContent='Saved! '+oldDPS.toFixed(1)+' -> '+curDPS.toFixed(1)+' deg/s';
       prompt.style.display='none';
     });
+  };
+})();
+// ── Gimbal Pan Offset ─────────────────────────────────────
+(function(){
+  const curEl=document.getElementById('gimbalOffCurrent');
+  const valIn=document.getElementById('gimbalOffVal');
+  let off=0;
+  function load(){
+    fetch('/nav/config').then(r=>r.json()).then(d=>{
+      off=d.gimbal_pan_offset||0;curEl.textContent=off.toFixed(1);valIn.value=off;});
+  }
+  // Load when calibration panel opens (reuse toggle)
+  document.getElementById('calibToggle').addEventListener('click',load);
+  function save(v){
+    fetch('/nav/config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({gimbal_pan_offset:v})
+    }).then(r=>r.json()).then(d=>{
+      off=d.gimbal_pan_offset||0;curEl.textContent=off.toFixed(1);valIn.value=off;
+    });
+  }
+  document.getElementById('gimbalOffMinus').onclick=()=>{save(off-1);};
+  document.getElementById('gimbalOffPlus').onclick=()=>{save(off+1);};
+  document.getElementById('gimbalOffSave').onclick=()=>{
+    const v=parseFloat(valIn.value)||0;
+    save(v);gimbalPanOffset=v;  // update global for trackpad+center
+  };
+  document.getElementById('gimbalOffTest').onclick=()=>{
+    // Send gimbal to 0+offset to test if it looks centered
+    fetch('/esp',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({"T":133,"X":parseFloat(valIn.value)||0,"Y":0,"SPD":200,"ACC":10})});
   };
 })();
 </script>
@@ -960,11 +1075,25 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body.encode())
+        elif self.path == "/nav/grid":
+            import navigator
+            grid = navigator._exploration_grid
+            if grid:
+                jpg = grid.render_image(scale=4)
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(jpg)))
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(jpg)
+            else:
+                self.send_error(503, "No exploration grid")
         elif self.path == "/nav/config":
             import navigator
             from navigator import _load_nav_config
             cfg = _load_nav_config()
             cfg.setdefault("turn_rate_dps", navigator.TURN_RATE_DPS)
+            cfg.setdefault("gimbal_pan_offset", navigator.GIMBAL_PAN_OFFSET)
             body = json.dumps(cfg)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1153,17 +1282,32 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.wfile.write(body.encode())
         elif self.path == "/nav/config":
             import navigator
-            from navigator import _save_nav_config
+            from navigator import _load_nav_config, _save_nav_config
+            cfg = _load_nav_config()
+            changed = False
             if "turn_rate_dps" in data:
                 new_dps = float(data["turn_rate_dps"])
                 navigator.TURN_RATE_DPS = new_dps
-                cfg = {"turn_rate_dps": new_dps,
-                       "calibrated_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-                _save_nav_config(cfg)
+                cfg["turn_rate_dps"] = new_dps
+                changed = True
                 if _log_event:
                     _log_event("system",
                                f"TURN_RATE_DPS calibrated to {new_dps:.1f}")
-            body = json.dumps({"turn_rate_dps": navigator.TURN_RATE_DPS})
+            if "gimbal_pan_offset" in data:
+                new_off = float(data["gimbal_pan_offset"])
+                navigator.GIMBAL_PAN_OFFSET = new_off
+                cfg["gimbal_pan_offset"] = new_off
+                changed = True
+                if _log_event:
+                    _log_event("system",
+                               f"Gimbal pan offset set to {new_off:+.1f}°")
+            if changed:
+                cfg["calibrated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                _save_nav_config(cfg)
+            body = json.dumps({
+                "turn_rate_dps": navigator.TURN_RATE_DPS,
+                "gimbal_pan_offset": navigator.GIMBAL_PAN_OFFSET,
+            })
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -1262,10 +1406,12 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body.encode())
-            # Restart after response is sent
+            # Restart after response is sent — use nohup+setsid so the
+            # restart command survives the service stopping itself
             threading.Thread(target=lambda: (
                 __import__('time').sleep(0.5),
-                __import__('os').system('systemctl restart rover-brain-llm.service')
+                __import__('os').system(
+                    'setsid systemctl restart rover-brain-llm.service &')
             ), daemon=True).start()
         else:
             self.send_error(404)

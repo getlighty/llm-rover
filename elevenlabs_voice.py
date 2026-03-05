@@ -28,12 +28,11 @@ from elevenlabs.conversational_ai.conversation import (
     Conversation,
 )
 
+from tools import tool_names as _tool_names, DATA_TOOLS as _DATA_TOOLS
+
 STOP_WORD_PATTERN = re.compile(
     r"\b(stop|halt|freeze|shut\s*up|be\s*quiet|emergency)\b", re.IGNORECASE
 )
-
-# Tool names that return data the LLM should incorporate into its response
-_DATA_TOOLS = {"look_at_camera", "get_status", "search_for", "navigate_to"}
 
 
 class ALSAAudioInterface(AudioInterface):
@@ -260,15 +259,7 @@ class ElevenLabsVoice:
         self._audio._mic_muted = self.__mic_muted
 
         client_tools = ClientTools()
-        for tool_name in [
-            "send_rover_commands",
-            "look_at_camera",
-            "navigate_to",
-            "search_for",
-            "remember",
-            "get_status",
-            "set_speed",
-        ]:
+        for tool_name in _tool_names():
             client_tools.register(tool_name, self._make_tool_handler(tool_name))
 
         self._conversation = Conversation(

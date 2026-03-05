@@ -36,13 +36,13 @@ class FloorNavigator:
     # --- Floor zone ---
     FLOOR_HORIZON = 0.55        # floor region starts at 55% down the frame
     NUM_COLUMNS = 16            # clearance map resolution
-    MIN_GAP_COLS = 3            # minimum consecutive clear columns to fit through
+    MIN_GAP_COLS = 2            # minimum consecutive clear columns to fit through
 
     # --- Drive ---
     DRIVE_SPEED = 0.15          # m/s default forward speed
     STEER_GAIN = 0.004          # wheel differential per pixel offset from target col
     MAX_STEER = 0.12            # max steering differential (m/s)
-    OBSTACLE_CLOSE_BW = 0.35    # bbox width fraction — object is dangerously close
+    OBSTACLE_CLOSE_BW = 0.50    # bbox width fraction — object is dangerously close
 
     # --- Arrival ---
     ARRIVE_BW = 0.40            # target object bbox width fraction = arrived
@@ -340,25 +340,75 @@ class FloorNavigator:
     # Internal: floor obstacle analysis
     # ------------------------------------------------------------------
 
-    def _get_floor_obstacles(self, detections, frame_w, frame_h):
-        """Filter detections that overlap the floor zone.
+    # Classes that are structural / wall-mounted — never floor obstacles
+    _IGNORE_FLOOR = {
+        # Structural
+        "floor", "ceiling", "wall", "rug", "window", "door", "doorway",
+        "archway", "light", "lamp", "light fixture",
+        # Wall-mounted / elevated
+        "shelf", "shelves", "cabinet", "monitor", "tv", "clock",
+        "speaker", "camera", "fan",
+        # Common YOLO misidentifications of doorways/walls
+        "couch", "bed", "bench", "dining table",
+    }
 
-        Any YOLO bbox whose bottom edge is below FLOOR_HORIZON is an obstacle.
+    def _get_floor_obstacles(self, detections, frame_w, frame_h):
+        """Filter detections that are genuine floor-level obstacles.
+
+        Filters out:
+        - Structural/wall-mounted classes (shelves, doorways, walls)
+        - Detections that barely graze the floor zone (need substantial overlap)
+        - Very wide detections (>55% of frame) — likely doorways/walls, not obstacles
+        - Low-confidence detections (<0.40)
+
         Returns list of (x1_px, x2_px, name, bbox_width_frac).
         """
         floor_y = int(frame_h * self.FLOOR_HORIZON)
         obstacles = []
+
+        # Import label overrides to use corrected names
+        try:
+            from local_detector import LABEL_OVERRIDES
+        except ImportError:
+            LABEL_OVERRIDES = {}
+
         for d in detections:
+            name = d["name"]
+
+            # Apply label overrides (corrected names from LLM calibration)
+            name = LABEL_OVERRIDES.get(name, name)
+
+            # Skip structural / wall-mounted classes
+            if name in self._IGNORE_FLOOR:
+                continue
+
+            # Skip low confidence (likely false positives near doorways)
+            if d["conf"] < 0.40:
+                continue
+
             x1, y1, x2, y2 = d["bbox"]
-            # Does the bottom portion of this bbox intrude into the floor zone?
+            bw_frac = (x2 - x1) / frame_w
+            bh_px = y2 - y1
+
+            # Skip very wide detections — doorways/walls, not point obstacles
+            if bw_frac > 0.55:
+                continue
+
+            # Require substantial overlap with floor zone — at least 20% of
+            # the bbox height must be in the floor zone (not just bottom edge)
+            overlap = max(0, y2 - floor_y)
+            if bh_px > 0 and overlap / bh_px < 0.20:
+                continue
+
+            # Must actually intrude into floor zone
             if y2 > floor_y:
-                bw_frac = (x2 - x1) / frame_w
-                obstacles.append((x1, x2, d["name"], bw_frac))
+                obstacles.append((x1, x2, name, bw_frac))
+
         return obstacles
 
     def _anything_too_close(self, floor_obstacles):
         """True if any floor obstacle has a bbox width >= OBSTACLE_CLOSE_BW."""
-        for _, _, _, bw in floor_obstacles:
+        for _, _, name, bw in floor_obstacles:
             if bw >= self.OBSTACLE_CLOSE_BW:
                 return True
         return False

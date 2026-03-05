@@ -1,6 +1,6 @@
 """reflection.py — Orchestrator-level post-plan reflection.
 
-Fully self-contained module with its own LLM connection (Anthropic Claude Opus 4.6).
+Uses Ollama (same as orchestrator) for lesson extraction.
 Runs in a separate conversation context from the move-directing LLM.
 Receives only processed/summarized data — never raw frames or movement history.
 """
@@ -10,10 +10,8 @@ import requests
 
 import lessons
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_MODEL = "claude-opus-4-6"
+OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "qwen3.5:9b"
 
 # ── Orchestrator system prompt — high-level principles only ────────────
 
@@ -41,24 +39,20 @@ No quotes, no explanation, no preamble."""
 
 
 def _call_orchestrator(user_prompt):
-    """Make a direct text-only LLM call to Anthropic Opus 4.6. Separate from rover's LLM."""
-    if not ANTHROPIC_API_KEY:
-        return None
+    """Make a text-only LLM call to Ollama for reflection."""
     messages = [
+        {"role": "system", "content": ORCHESTRATOR_SYSTEM},
         {"role": "user", "content": user_prompt},
     ]
     try:
-        r = requests.post(ANTHROPIC_URL,
-            headers={"x-api-key": ANTHROPIC_API_KEY,
-                     "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"},
-            json={"model": ANTHROPIC_MODEL,
-                  "system": ORCHESTRATOR_SYSTEM,
+        r = requests.post(OLLAMA_URL,
+            json={"model": OLLAMA_MODEL,
                   "messages": messages,
-                  "temperature": 0.3, "max_tokens": 100},
-            timeout=30)
+                  "stream": False,
+                  "options": {"temperature": 0.3, "num_predict": 100}},
+            timeout=60)
         r.raise_for_status()
-        return r.json()["content"][0]["text"].strip()
+        return r.json()["message"]["content"].strip()
     except Exception:
         return None
 

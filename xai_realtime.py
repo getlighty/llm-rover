@@ -7,8 +7,9 @@ with xAI's Realtime API: direct speech-in/speech-out via WebSocket with
 built-in Grok LLM and function tool calling.
 
 Usage:
-    from xai_realtime import XAIRealtimeVoice, XAI_TOOLS, XAI_SYSTEM_INSTRUCTIONS
-    rt = XAIRealtimeVoice(api_key, mic_device, playback_device, ...)
+    from xai_realtime import XAIRealtimeVoice
+    rt = XAIRealtimeVoice(api_key, mic_device, playback_device,
+                          instructions=..., tools=..., ...)
     rt.start()
     ...
     rt.stop()
@@ -55,192 +56,7 @@ STOP_WORD_PATTERN = re.compile(
     r"\b(stop|halt|freeze|shut\s*up|be\s*quiet|emergency)\b", re.IGNORECASE
 )
 
-# ---------------------------------------------------------------------------
-# Load memory.md tail for system instructions
-# ---------------------------------------------------------------------------
 ROVER_DIR = os.path.dirname(os.path.abspath(__file__))
-MEMORY_FILE = os.path.join(ROVER_DIR, "memory.md")
-
-
-def _load_memory_tail(n=20):
-    try:
-        with open(MEMORY_FILE) as f:
-            lines = f.readlines()
-        return "".join(lines[-n:]).strip()
-    except Exception:
-        return ""
-
-
-# ---------------------------------------------------------------------------
-# System instructions for xAI voice session
-# ---------------------------------------------------------------------------
-XAI_SYSTEM_INSTRUCTIONS = f"""\
-You are Jasper, a 6-wheel rover robot built on the Waveshare UGV Rover PT platform. Your owner is Ovi.
-
-## Personality
-- Terse. 5-10 words max per response. You're a robot, not a chatbot.
-- Express yourself physically using send_rover_commands: nod (tilt up then down), shake head (pan left-right), tilt head when curious.
-- Every response should include physical expression via send_rover_commands.
-- Warm but minimal. Don't narrate surroundings unless asked.
-- Don't say Ovi's name every time.
-
-## Hardware
-- 6 wheels, skid-steer. Max speed 1.0 m/s but DEFAULT to 0.20 m/s (Ovi's preference — move slowly).
-- Pan-tilt gimbal (your head): pan -180..+180, tilt -30..+90. SPD 200-400 normal, 500+ quick gestures. X=0,Y=0 is center.
-- Lights: base (IO4) + head (IO5), 0-255 PWM. Dim when room is bright.
-- OLED: 4 lines, ~16 chars each.
-- Battery: ~10.5V (12V boost damaged, reduced power).
-
-## ESP32 Commands (for send_rover_commands)
-- Wheels: {{"T":1, "L":<left_speed>, "R":<right_speed>}} — positive=forward, negative=backward
-- Gimbal absolute: {{"T":133, "X":<pan>, "Y":<tilt>, "SPD":<speed>, "ACC":<accel>}}
-- Lights: {{"T":132, "IO4":<base 0-255>, "IO5":<head 0-255>}}
-- OLED: {{"T":3, "lineNum":<0-3>, "Text":"<msg>"}}
-- Emergency stop: {{"T":0}}
-- Feedback: {{"T":130}}
-
-## Physical expressions (use these!)
-- Yes/agree: Nod — {{"T":133,"X":0,"Y":20,"SPD":400,"ACC":20}} then {{"T":133,"X":0,"Y":-5,"SPD":400,"ACC":20}} then {{"T":133,"X":0,"Y":0,"SPD":200,"ACC":10}}
-- No/disagree: Shake — {{"T":133,"X":-40,"Y":0,"SPD":500,"ACC":20}} then {{"T":133,"X":40,"Y":0,"SPD":500,"ACC":20}} then {{"T":133,"X":0,"Y":0,"SPD":200,"ACC":10}}
-- Thinking: Tilt — {{"T":133,"X":20,"Y":10,"SPD":200,"ACC":10}}
-- Greeting: Look up slightly, small nod
-
-## Vision
-You CANNOT see directly. Use look_at_camera to see via the camera. Always use it when you need visual info about your surroundings.
-
-## Safety
-- When user says stop/halt/freeze, IMMEDIATELY call send_rover_commands with {{"T":1,"L":0,"R":0}}.
-- Max wheel speed 0.20 m/s unless user explicitly says faster.
-- Look around before backing up.
-
-## Ovi's preferences
-- Move slowly (0.15-0.20 m/s max)
-- Dim lights when ambient light is sufficient
-- Don't say his name constantly
-- Upgrades need clear purpose
-
-## Recent memory
-{_load_memory_tail(20)}
-"""
-
-# ---------------------------------------------------------------------------
-# Tool definitions for xAI function calling
-# ---------------------------------------------------------------------------
-XAI_TOOLS = [
-    {
-        "type": "function",
-        "name": "send_rover_commands",
-        "description": "Send raw ESP32 JSON commands to control wheels, gimbal, lights, and OLED. Use this for ALL physical actions: moving, turning, nodding, shaking head, blinking lights. Commands are sent sequentially. Include a duration (seconds) to auto-stop wheels after that time.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "commands": {
-                    "type": "array",
-                    "description": "List of ESP32 JSON command objects to send sequentially.",
-                    "items": {"type": "object"},
-                },
-                "duration": {
-                    "type": "number",
-                    "description": "Optional: seconds to wait before sending wheel-stop command. Use for timed movements.",
-                },
-            },
-            "required": ["commands"],
-        },
-    },
-    {
-        "type": "function",
-        "name": "look_at_camera",
-        "description": "Move the gimbal to a position and describe what the camera sees. Use this whenever you need to see something. You CANNOT see without calling this. Returns a text description of the scene.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "pan": {
-                    "type": "number",
-                    "description": "Gimbal pan angle (-180 to 180). 0=forward. Default 0.",
-                },
-                "tilt": {
-                    "type": "number",
-                    "description": "Gimbal tilt angle (-30 to 90). 0=level. Default 0.",
-                },
-                "question": {
-                    "type": "string",
-                    "description": "What to look for or describe. E.g. 'what do you see', 'is there a person', 'describe the room'.",
-                },
-            },
-            "required": [],
-        },
-    },
-    {
-        "type": "function",
-        "name": "navigate_to",
-        "description": "Autonomously navigate toward a named object or location. The rover will search, find, and drive to the target using camera vision. Takes 10-60 seconds. Returns success/failure.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "target": {
-                    "type": "string",
-                    "description": "Object or location to navigate to. E.g. 'door', 'basket', 'printer', 'desk'.",
-                },
-            },
-            "required": ["target"],
-        },
-    },
-    {
-        "type": "function",
-        "name": "search_for",
-        "description": "Systematically sweep the gimbal to search for a named object. Checks all angles. Returns whether the object was found and its location.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "target": {
-                    "type": "string",
-                    "description": "Object to search for. E.g. 'person', 'cup', 'chair'.",
-                },
-            },
-            "required": ["target"],
-        },
-    },
-    {
-        "type": "function",
-        "name": "remember",
-        "description": "Save a note to persistent memory. Use when the user asks you to remember something.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "note": {
-                    "type": "string",
-                    "description": "The note to remember.",
-                },
-            },
-            "required": ["note"],
-        },
-    },
-    {
-        "type": "function",
-        "name": "get_status",
-        "description": "Get rover status: battery voltage, current pose, tracker state, spatial map summary.",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    },
-    {
-        "type": "function",
-        "name": "set_speed",
-        "description": "Set the rover's speed scale. Level 1 = 10% (very slow), level 5 = 50%, level 10 = 100% (max). Default is level 2 (20%).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "level": {
-                    "type": "integer",
-                    "description": "Speed level 1-10.",
-                },
-            },
-            "required": ["level"],
-        },
-    },
-]
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +139,41 @@ class XAIRealtimeVoice:
             self._thread.join(timeout=3)
         log.info("xAI Realtime voice stopped")
 
+    def send_text(self, text):
+        """Inject a text message into the conversation (from web UI, etc.).
+        Grok will respond with audio + tool calls as usual."""
+        ws = self._ws
+        loop = self._loop
+        if not ws or not loop or not self._running:
+            log.warning("[text] Cannot send — no active session")
+            return
+        async def _send():
+            try:
+                if not self._ws:
+                    log.warning("[text] WebSocket gone before send")
+                    return
+                await self._ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                }))
+                await self._ws.send(json.dumps({
+                    "type": "response.create",
+                    "response": {"modalities": ["text", "audio"]},
+                }))
+                self._response_pending = True
+                self._response_pending_since = time.monotonic()
+                log.info(f"[text] Sent: {text[:100]}")
+            except Exception as e:
+                log.error(f"[text] Send error: {e}")
+        try:
+            loop.call_soon_threadsafe(asyncio.ensure_future, _send())
+        except RuntimeError:
+            log.warning("[text] Event loop not running")
+
     def set_stop_word_checker(self, whisper_model, fire_fn):
         """Enable local stop-word detection using a whisper model."""
         self._whisper_model = whisper_model
@@ -338,20 +189,32 @@ class XAIRealtimeVoice:
         try:
             self._loop.run_until_complete(self._reconnect_loop())
         except Exception as e:
-            log.error(f"Event loop crashed: {e}")
+            if self._running:
+                log.error(f"Event loop crashed: {e}")
         finally:
+            try:
+                # Cancel all pending tasks before closing
+                for task in asyncio.all_tasks(self._loop):
+                    task.cancel()
+                self._loop.run_until_complete(asyncio.gather(*asyncio.all_tasks(self._loop), return_exceptions=True))
+            except Exception:
+                pass
             self._loop.close()
 
     async def _reconnect_loop(self):
-        """Connect, run, reconnect on failure."""
+        """Connect, run, reconnect on failure with exponential backoff."""
+        delay = RECONNECT_DELAY
         while self._running:
             try:
                 await self._session()
+                delay = RECONNECT_DELAY  # reset on successful session
             except Exception as e:
                 log.error(f"Session error: {e}")
+                if "429" in str(e):
+                    delay = min(delay * 2, 60)  # backoff up to 60s on rate limit
             if self._running:
-                log.info(f"Reconnecting in {RECONNECT_DELAY}s...")
-                await asyncio.sleep(RECONNECT_DELAY)
+                log.info(f"Reconnecting in {delay:.0f}s...")
+                await asyncio.sleep(delay)
 
     # ---- WebSocket session ----
 
@@ -693,7 +556,8 @@ class XAIRealtimeVoice:
                 # Only request continuation for tools that return data the user should hear.
                 # Fire-and-forget tools (commands, remember, set_speed) don't need continuation
                 # — otherwise the model loops (speaks + gesture → continuation → speaks + gesture → ...).
-                needs_continuation = fn_name in ("look_at_camera", "navigate_to", "search_for", "get_status")
+                from tools import DATA_TOOLS
+                needs_continuation = fn_name in DATA_TOOLS
                 if needs_continuation:
                     self._response_pending = True
                     self._response_pending_since = time.monotonic()
