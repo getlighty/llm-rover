@@ -1577,6 +1577,7 @@ def _voltage_watchdog():
                           f"Voltage OK {v:.1f}V — full speed restored")
 _floor_nav = None  # FloorNavigator, set in main()
 _navigator = None  # Navigator, set in main()
+_room_scanner = None  # VectorRoomScanner, set in main()
 
 # ── 2D World Map ──────────────────────────────────────────────────────
 
@@ -1590,6 +1591,14 @@ _gimbal_tilt = 0.0    # degrees — updated by execute()
 _TILT_YOLO_SUPPRESS = 0  # tilt below 0° = looking at ground/own body, suppress YOLO
 _backup_allowed = False  # only True during stuck recovery
 LANDMARK_MAX_AGE = 300  # 5 minutes
+_room_scan_state = {
+    "scan_ts": 0.0,
+    "task": "",
+    "elements": [],
+    "scene_summary": "",
+    "room_guess": {"name": None, "confidence": 0.0, "reason": ""},
+    "candidates": [],
+}
 
 def _dist_to_meters(d):
     """Convert dist field to meters. Accepts number or legacy string."""
@@ -1683,10 +1692,24 @@ def _get_map_state():
             imu_data = _imu.get_map_data()
             if imu_data:
                 rover_data["imu"] = imu_data
+        room_scan = dict(_room_scan_state)
         return {
             "landmarks": lm,
             "rover": rover_data,
+            "room_scan": room_scan,
         }
+
+
+def _run_task_room_scan(task_text):
+    """Run an LLM vector room scan and persist latest state for UI + routing."""
+    global _room_scan_state
+    if not _room_scanner:
+        return None
+    heading_deg = math.degrees(_rover_heading)
+    state = _room_scanner.scan_room(task_text=task_text, body_yaw_deg=heading_deg)
+    with _map_lock:
+        _room_scan_state = dict(state)
+    return state
 
 def _truncate_after_first_gimbal(commands):
     """Keep only up to the first gimbal move + its pause. Returns truncated list."""
@@ -3117,7 +3140,7 @@ def main():
     _xai_refs.update(ser=ser, cam=cam, spk=spk, mic_dev=mic_dev)
 
     # Initialize Navigator (LLM-centric nav with YOLO fast fallback)
-    global _navigator
+    global _navigator, _room_scanner
     try:
         import navigator
         from navigator import Navigator
@@ -3218,8 +3241,27 @@ def main():
         )
         log_event("system", f"Navigator active (yolo={'ON' if cam.detector else 'OFF'}"
                   f", exploration={'ON' if _exploration_grid else 'OFF'})")
+
+        # Vector room scanner (LLM-estimated distances + sizes).
+        try:
+            from room_scanner import VectorRoomScanner
+
+            def _room_scan_vision_fn(prompt, jpeg_bytes):
+                raw = _nav_vision_fn(prompt, jpeg_bytes)
+                return _nav_parse_fn(raw) if raw else None
+
+            _room_scanner = VectorRoomScanner(
+                rover=ser, tracker=cam,
+                vision_json_fn=_room_scan_vision_fn,
+                log_fn=lambda msg: log_event("room", msg),
+            )
+            log_event("system", "Room scanner active (vector LLM scan)")
+        except Exception as _rs_err:
+            _room_scanner = None
+            log_event("system", f"Room scanner unavailable: {_rs_err}")
     except Exception as e:
         log_event("system", f"Navigator not available: {e}")
+        _room_scanner = None
         import traceback; traceback.print_exc()
 
     log_event("system", f"LLM provider: {llm_mod.NAME}")
@@ -3323,6 +3365,22 @@ def main():
             # Store this as the last meaningful task
             _last_task = text
             _last_task_target = _extract_target(text)
+
+        # Task-level room scan: build vector map + best room guess before acting.
+        if _room_scanner:
+            scan_skip = {"stop", "halt", "cancel", "never mind", "nevermind", "abort"}
+            if text.strip().lower() not in scan_skip:
+                try:
+                    scan_state = _run_task_room_scan(text)
+                    if scan_state:
+                        guess = scan_state.get("room_guess", {})
+                        g_name = guess.get("name") or "unknown"
+                        g_conf = float(guess.get("confidence", 0.0))
+                        log_event("room",
+                                  f"Best room guess for task '{text}': "
+                                  f"{g_name} ({g_conf:.2f})")
+                except Exception as e:
+                    log_event("error", f"Room vector scan failed: {e}")
 
         # ── Navigator shortcut for movement commands ──
         nav_target = _extract_target(text)

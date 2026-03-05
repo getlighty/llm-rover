@@ -107,6 +107,9 @@ body{background:#1a1a2e;color:#e0e0e0;font-family:'Courier New',monospace;height
 #gimbal-readout{font-size:12px;color:#8888aa;flex:1}
 #gimbal-center{background:#0f3460;color:#e0e0e0;border:1px solid #444;padding:4px 12px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px}
 #gimbal-center:hover{background:#1a4a80}
+#room-map-wrap{width:100%;max-width:640px;background:#0a0a1a;border:1px solid #333;border-radius:4px;padding:8px}
+#room-map{width:100%;aspect-ratio:16/10;border-radius:4px;border:1px solid #333;background:#050511;display:block}
+#room-guess{font-size:12px;color:#88d1d1;margin-top:6px}
 #logpanel{flex:1;display:flex;flex-direction:column;min-width:0}
 #log{flex:1;overflow-y:auto;padding:8px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-all}
 #log .ts{color:#666}
@@ -197,6 +200,10 @@ body{background:#1a1a2e;color:#e0e0e0;font-family:'Courier New',monospace;height
         <button id="gimbal-center">Center</button>
       </div>
     </div>
+    <div id="room-map-wrap">
+      <canvas id="room-map"></canvas>
+      <div id="room-guess">Room guess: unknown</div>
+    </div>
     <div id="gridSection" style="max-width:640px;margin-top:8px">
       <button id="gridToggle" style="background:#0f3460;color:#e0e0e0;border:1px solid #444;
         padding:4px 12px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px;width:100%">
@@ -278,6 +285,9 @@ const log=document.getElementById('log');
 const cmd=document.getElementById('cmd');
 const gimbalCanvas=document.getElementById('gimbal');
 const gctx=gimbalCanvas.getContext('2d');
+const roomMapCanvas=document.getElementById('room-map');
+const roomMapCtx=roomMapCanvas.getContext('2d');
+const roomGuessEl=document.getElementById('room-guess');
 
 // Load provider options + desk mode
 const deskCb=document.getElementById('deskmode');
@@ -468,6 +478,73 @@ function drawGimbal(pan, tilt){
   gctx.beginPath();gctx.arc(px,py,3,0,Math.PI*2);gctx.fill();
 }
 
+function sizeRoomMapCanvas(){
+  const rect=roomMapCanvas.getBoundingClientRect();
+  roomMapCanvas.width=rect.width;
+  roomMapCanvas.height=Math.round(rect.width*0.62);
+}
+
+function drawRoomMap(scan){
+  const W=roomMapCanvas.width, H=roomMapCanvas.height;
+  if(!W||!H)return;
+  roomMapCtx.fillStyle='#050511';
+  roomMapCtx.fillRect(0,0,W,H);
+
+  const ox=W*0.5, oy=H*0.84;
+  const elements=(scan&&Array.isArray(scan.elements))?scan.elements:[];
+  const maxDist=Math.max(2.5, ...elements.map(e=>Math.abs(e.distance_m||0)));
+  const range=Math.min(6.0, maxDist+0.6);
+  const scale=(oy-14)/range;
+
+  // Distance rings
+  roomMapCtx.strokeStyle='rgba(88,120,160,0.35)';
+  roomMapCtx.lineWidth=1;
+  roomMapCtx.fillStyle='#6a86a8';
+  roomMapCtx.font='10px monospace';
+  for(let m=1;m<=Math.floor(range);m++){
+    const r=m*scale;
+    roomMapCtx.beginPath();
+    roomMapCtx.arc(ox,oy,r,Math.PI,2*Math.PI);
+    roomMapCtx.stroke();
+    roomMapCtx.fillText(m+'m', ox+r+4, oy-2);
+  }
+
+  // Rover marker
+  roomMapCtx.fillStyle='#f6f7fb';
+  roomMapCtx.beginPath();
+  roomMapCtx.moveTo(ox, oy-10);
+  roomMapCtx.lineTo(ox-7, oy+8);
+  roomMapCtx.lineTo(ox+7, oy+8);
+  roomMapCtx.closePath();
+  roomMapCtx.fill();
+
+  // Elements
+  roomMapCtx.font='11px monospace';
+  elements.slice(0,24).forEach(e=>{
+    const x=ox+(Number(e.x)||0)*scale;
+    const y=oy-(Number(e.y)||0)*scale;
+    const span=Math.max(Number(e.width_m)||0.2, Number(e.depth_m)||0.2);
+    const r=Math.max(3, Math.min(18, span*scale*0.5));
+    const conf=Math.max(0.2, Math.min(1.0, Number(e.confidence)||0.4));
+    roomMapCtx.fillStyle='rgba(66,185,131,'+conf.toFixed(2)+')';
+    roomMapCtx.beginPath();
+    roomMapCtx.arc(x,y,r,0,Math.PI*2);
+    roomMapCtx.fill();
+    roomMapCtx.fillStyle='#d8fff0';
+    const sizeTxt=((Number(e.width_m)||0.2).toFixed(1)+'x'+(Number(e.depth_m)||0.2).toFixed(1)+'m');
+    roomMapCtx.fillText((e.name||'obj')+' '+sizeTxt, x+r+3, y-4);
+  });
+
+  if(scan&&scan.room_guess){
+    const g=scan.room_guess;
+    const name=g.name||'unknown';
+    const conf=Number(g.confidence||0);
+    roomGuessEl.textContent='Room guess: '+name+' ('+(conf*100).toFixed(0)+'%)';
+  }else{
+    roomGuessEl.textContent='Room guess: unknown';
+  }
+}
+
 function canvasToGimbal(e){
   const rect=gimbalCanvas.getBoundingClientRect();
   const x=e.clientX-rect.left, y=e.clientY-rect.top;
@@ -536,10 +613,17 @@ setInterval(()=>{
       gimbalTilt=Math.round(rv.gimbal_tilt||0);
       drawGimbal(gimbalPan, gimbalTilt);
     }
+    drawRoomMap(data.room_scan||null);
   }).catch(()=>{});
 },500);
 
 drawGimbal(0,0);
+sizeRoomMapCanvas();
+drawRoomMap(null);
+window.addEventListener('resize', ()=>{
+  sizeRoomMapCanvas();
+  fetch('/landmarks').then(r=>r.json()).then(data=>drawRoomMap(data.room_scan||null)).catch(()=>drawRoomMap(null));
+});
 
 // ── Annotation Mode ──────────────────────────────────────────────
 const annToggle=document.getElementById('annToggle');
