@@ -3668,18 +3668,70 @@ def main():
                     continue
                 continue
 
-        # Task-level room scan: build vector map + best room guess before acting.
-        # Pass all targets so scan can stop early if it spots any of them.
+        # Ask LLM whether a sweep is needed before navigation.
+        # Show it the current camera frame + task and let it decide.
         _scan_target_found = None
         _scan_target_pan = None
         nav_target = _extract_target(text)
         all_targets = _extract_all_targets(text)
-        # Use the last target as the scan find_target (it's usually the
-        # most specific — e.g. "fridge" in "go to kitchen and find fridge")
         _scan_find = all_targets[-1] if all_targets else nav_target
-        if _room_scanner:
-            scan_skip = {"stop", "halt", "cancel", "never mind", "nevermind", "abort"}
-            if text.strip().lower() not in scan_skip:
+
+        if _room_scanner and _navigator:
+            jpeg = cam.get_jpeg() if hasattr(cam, 'get_jpeg') else None
+            need_sweep = True  # default: sweep
+            if jpeg:
+                try:
+                    import base64 as _b64
+                    b64 = _b64.b64encode(jpeg).decode()
+                    model = orchestrator.OLLAMA_MODEL
+                    # Quick LLM call: do you need to look around?
+                    if model.startswith("claude-"):
+                        import requests as _req
+                        r = _req.post("https://api.anthropic.com/v1/messages",
+                            headers={"x-api-key": os.environ.get("ANTHROPIC_API_KEY", ""),
+                                     "anthropic-version": "2023-06-01",
+                                     "content-type": "application/json"},
+                            json={"model": model, "max_tokens": 100,
+                                  "messages": [{"role": "user", "content": [
+                                      {"type": "image", "source": {"type": "base64",
+                                       "media_type": "image/jpeg", "data": b64}},
+                                      {"type": "text", "text":
+                                       f"Task: '{text}'. Can you already see the target "
+                                       f"or the path to it in this image? "
+                                       f"Reply ONLY JSON: "
+                                       f'{{\"need_sweep\": true/false, '
+                                       f'\"reason\": \"brief\"}}'
+                                      }]}]},
+                            timeout=10)
+                        r.raise_for_status()
+                        raw = r.json()["content"][0]["text"]
+                    else:
+                        import requests as _req
+                        r = _req.post(orchestrator.OLLAMA_URL,
+                            json={"model": model, "stream": False,
+                                  "messages": [{"role": "user",
+                                   "content": f"Task: '{text}'. Can you already see "
+                                   f"the target or the path to it in this image? "
+                                   f"Reply ONLY JSON: "
+                                   f'{{\"need_sweep\": true/false, '
+                                   f'\"reason\": \"brief\"}}',
+                                   "images": [b64]}]},
+                            timeout=10)
+                        r.raise_for_status()
+                        raw = r.json().get("message", {}).get("content", "")
+                    # Parse response
+                    import re as _re
+                    m = _re.search(r'\{[^}]+\}', raw)
+                    if m:
+                        decision = json.loads(m.group())
+                        need_sweep = decision.get("need_sweep", True)
+                        reason = decision.get("reason", "")
+                        log_event("room", f"Sweep decision: "
+                                  f"{'YES' if need_sweep else 'SKIP'} — {reason}")
+                except Exception as e:
+                    log_event("room", f"Sweep decision failed ({e}), defaulting to sweep")
+
+            if need_sweep:
                 try:
                     scan_state = _run_task_room_scan(
                         text, find_target=_scan_find)
@@ -3690,7 +3742,6 @@ def main():
                         log_event("room",
                                   f"Best room guess for task '{text}': "
                                   f"{g_name} ({g_conf:.2f})")
-                        # Check if target was spotted during sweep
                         if scan_state.get("target_found"):
                             _scan_target_found = scan_state["target_found"]
                             _scan_target_pan = scan_state.get("target_pan", 0)
