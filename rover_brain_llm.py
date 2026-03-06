@@ -3610,6 +3610,27 @@ def main():
             _last_task = text
             _last_task_target = _extract_target(text)
 
+        # ── Direct commands: skip sweep, go straight to handler/LLM ──
+        # These are simple imperatives that don't need a room scan.
+        _direct_prefixes = (
+            "follow", "stop", "halt", "back up", "back off", "reverse",
+            "come here", "come back", "turn left", "turn right", "turn around",
+            "spin", "nod", "shake", "look ", "say ", "speak ",
+            "lights ", "light ", "be quiet", "shut up",
+            "what do you see", "what is ", "who is ", "describe",
+            "how are you", "hello", "hi ", "hey ", "good ",
+        )
+        _is_direct = any(text_lower.startswith(p) for p in _direct_prefixes)
+        if _is_direct:
+            # Follow mode gets its own shortcut below; everything else
+            # goes straight to run_plan (the LLM) — no sweep needed.
+            if not (_clean_words(text) & {"follow", "following"}):
+                log_event("plan", f"Direct: {text}")
+                result = run_plan(text, ser, cam, spk, mic_card)
+                if result is None:
+                    continue
+                continue
+
         # Task-level room scan: build vector map + best room guess before acting.
         # Pass all targets so scan can stop early if it spots any of them.
         _scan_target_found = None
