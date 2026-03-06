@@ -1620,6 +1620,9 @@ _room_scan_state = {
     "room_guess": {"name": None, "confidence": 0.0, "reason": ""},
     "candidates": [],
 }
+TOPO_ROOM_MIN_CONF = 0.55
+TOPO_ROOM_MISMATCH_MARGIN = 2
+TOPO_ROOM_SCAN_FRESH_S = 20.0
 
 def _dist_to_meters(d):
     """Convert dist field to meters. Accepts number or legacy string."""
@@ -1731,11 +1734,26 @@ def _run_task_room_scan(task_text, find_target=None):
     if not _room_scanner:
         return None
     heading_deg = math.degrees(_rover_heading)
-    state = _room_scanner.scan_room(task_text=task_text,
-                                     body_yaw_deg=heading_deg,
-                                     find_target=find_target)
+    try:
+        state = _room_scanner.scan_room(task_text=task_text,
+                                        body_yaw_deg=heading_deg,
+                                        find_target=find_target)
+    except Exception as e:
+        log_event("error", f"Room vector scan failed: {e}")
+        return None
     with _map_lock:
         _room_scan_state = dict(state)
+    return state
+
+
+def _get_recent_room_scan_state(max_age_s=TOPO_ROOM_SCAN_FRESH_S):
+    with _map_lock:
+        state = dict(_room_scan_state)
+    scan_ts = float(state.get("scan_ts", 0.0) or 0.0)
+    if not scan_ts:
+        return None
+    if time.time() - scan_ts > max_age_s:
+        return None
     return state
 
 def _truncate_after_first_gimbal(commands):
@@ -2038,7 +2056,12 @@ def _obstacle_avoidance_hint(cam):
 
 def _extract_target(text):
     """Pull the search target noun(s) from a task string."""
-    lower = text.lower()
+    lower = text.lower().strip()
+    # Strip wake word prefix
+    for wake in ("jasper ", "hey jasper ", "ok jasper "):
+        if lower.startswith(wake):
+            lower = lower[len(wake):]
+            break
     for prefix in ("find the ", "find a ", "find ", "go to the ", "go to ",
                    "navigate to the ", "navigate to ", "look for the ",
                    "look for a ", "look for ", "search for the ",
@@ -2058,7 +2081,12 @@ def _extract_all_targets(text):
     "go to the kitchen and find the fridge" → ["kitchen", "fridge"]
     "find the exit and go to hallway" → ["exit", "hallway"]
     """
-    lower = text.lower()
+    lower = text.lower().strip()
+    # Strip wake word prefix
+    for wake in ("jasper ", "hey jasper ", "ok jasper "):
+        if lower.startswith(wake):
+            lower = lower[len(wake):]
+            break
     targets = []
     # Split on "and then", "then", "and"
     parts = re.split(r'\s+and\s+then\s+|\s+then\s+|\s+and\s+', lower)
@@ -2958,6 +2986,312 @@ def _topo_room_check(scene_text):
     return None, 0.0
 
 
+def _canonical_room_id(room_name):
+    """Resolve free-form room text to a known topo room id when possible."""
+    if not room_name:
+        return None
+    room_id = str(room_name).strip().lower().replace(" ", "_")
+    if _topo_map:
+        for room in _topo_map.rooms():
+            if room_id in (
+                room.id.lower(),
+                room.label.lower().replace(" ", "_"),
+            ):
+                return room.id
+    return room_id
+
+
+def _semantic_text_list(items, limit=6):
+    values = []
+    seen = set()
+    for item in items or []:
+        text = str(item).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(text[:64])
+        if len(values) >= limit:
+            break
+    return values
+
+
+def _sync_topo_room_guess(room_name, confidence, source=""):
+    """Update topo current room from a validated room guess."""
+    global _topo_map
+    if not _topo_map:
+        return None
+    room_id = _canonical_room_id(room_name)
+    conf = float(confidence or 0.0)
+    if room_id:
+        _topo_map.current_room = room_id
+        _topo_map.current_confidence = conf
+    else:
+        _topo_map.current_room = None
+        _topo_map.current_confidence = 0.0
+    _topo_map.save()
+    if source:
+        if room_id:
+            log_event("room", f"{source}: current room -> {room_id} ({conf:.2f})")
+        else:
+            log_event("room", f"{source}: cleared stale current room")
+    return room_id
+
+
+def _sync_topo_room_from_scan_state(scan_state, source="Room scan"):
+    """Apply a recent vector room scan result to the topo map."""
+    if not scan_state:
+        return None
+    guess = scan_state.get("room_guess", {}) if isinstance(scan_state, dict) else {}
+    room_name = guess.get("name")
+    conf = float(guess.get("confidence", 0.0) or 0.0)
+    if room_name and conf >= TOPO_ROOM_MIN_CONF:
+        return _sync_topo_room_guess(room_name, conf, source=source)
+    return None
+
+
+def _validate_topo_current_room(task_text="", find_target=None):
+    """Validate persisted current_room against the live scene before topo nav.
+
+    If the live scene contradicts the persisted room, force a fresh room scan.
+    Returns the trusted current room id, or None if no room should be trusted.
+    """
+    global _topo_map
+    nav = _navigator
+    if not _topo_map or not nav or not _topo_map.current_room:
+        return None
+
+    persisted_room = _canonical_room_id(_topo_map.current_room)
+    persisted_conf = float(_topo_map.current_confidence or 0.0)
+    if not persisted_room:
+        return None
+
+    recent_scan = _get_recent_room_scan_state()
+    recent_room = _sync_topo_room_from_scan_state(
+        recent_scan, source="Recent room scan")
+    if recent_room:
+        return recent_room
+
+    if persisted_conf < TOPO_ROOM_MIN_CONF:
+        log_event(
+            "room",
+            f"Current room '{persisted_room}' confidence {persisted_conf:.2f} "
+            f"is stale — refreshing room scan"
+        )
+        if _room_scanner:
+            scan_state = _run_task_room_scan(task_text, find_target=find_target)
+            scanned_room = _sync_topo_room_from_scan_state(
+                scan_state, source="Room scan refresh")
+            if scanned_room:
+                return scanned_room
+        return _sync_topo_room_guess(
+            None, 0.0, source=f"Stale room '{persisted_room}'")
+
+    jpeg = nav.tracker.get_jpeg() if hasattr(nav, "tracker") else None
+    if not jpeg:
+        return persisted_room
+
+    dets, yolo_summary, age = nav._get_detections()
+    if age >= 1.5:
+        yolo_summary = ""
+
+    glance = nav._llm_call(
+        "Briefly describe this room in one sentence. Focus on the most "
+        "diagnostic floor type, fixtures, and furniture. "
+        'Reply ONLY JSON: {"scene":"..."}',
+        jpeg)
+    scene_text = ""
+    if isinstance(glance, dict):
+        scene_text = str(glance.get("scene", "")).strip()
+    elif glance:
+        scene_text = str(glance).strip()
+    if not scene_text:
+        return persisted_room
+
+    ranked = room_context.identify_room(scene_text, yolo_summary)
+    if not ranked:
+        return persisted_room
+
+    best_room, best_score, best_conf = ranked[0]
+    best_room = _canonical_room_id(best_room)
+    persisted_score = next(
+        (score for name, score, _conf in ranked
+         if _canonical_room_id(name) == persisted_room),
+        -999,
+    )
+
+    if best_room == persisted_room:
+        room_context.get_current_room(scene_text, yolo_summary)
+        _sync_topo_room_guess(
+            persisted_room,
+            max(persisted_conf, float(best_conf or 0.0)),
+            source="",
+        )
+        return persisted_room
+
+    mismatch = (
+        best_room
+        and best_room != persisted_room
+        and best_score > 0
+        and float(best_conf or 0.0) >= TOPO_ROOM_MIN_CONF
+        and (persisted_score <= 0
+             or (best_score - persisted_score) >= TOPO_ROOM_MISMATCH_MARGIN)
+    )
+    if not mismatch:
+        return persisted_room
+
+    log_event(
+        "room",
+        f"Current room mismatch: persisted={persisted_room} "
+        f"({persisted_conf:.2f}) vs live={best_room} ({best_conf:.2f}) "
+        f"| scores persisted={persisted_score:+d}, live={best_score:+d}"
+    )
+
+    if _room_scanner:
+        scan_state = _run_task_room_scan(task_text, find_target=find_target)
+        scanned_room = _sync_topo_room_from_scan_state(
+            scan_state, source="Mismatch room scan")
+        if scanned_room:
+            return scanned_room
+
+    room_context.get_current_room(scene_text, yolo_summary)
+    return _sync_topo_room_guess(
+        best_room,
+        best_conf,
+        source="Live room validation override",
+    )
+
+
+def _semantic_reorganize_after_reach(nav_target, actual_room, from_room=None,
+                                     transition_id=None, scene_text="",
+                                     yolo_summary=""):
+    """Persist relationship-oriented memory after a successful room reach."""
+    global _topo_map
+    nav = _navigator
+    if not nav or not _topo_map:
+        return
+
+    actual_room = _canonical_room_id(actual_room)
+    from_room = _canonical_room_id(from_room)
+    if not actual_room:
+        return
+
+    peek = getattr(nav, "_last_transition_peek", None)
+    room_map_json = None
+    if nav.room_map:
+        rx = nav.pose.x if hasattr(nav.pose, 'x') else 0
+        ry = nav.pose.y if hasattr(nav.pose, 'y') else 0
+        yaw = nav.pose.body_yaw if hasattr(nav.pose, 'body_yaw') else 0
+        room_map_json = nav.room_map.room_json(rx, ry, yaw, max_objects=10)
+
+    prompt = (
+        f"You are reorganizing the rover's spatial memory after a SUCCESSFUL "
+        f"navigation reach.\n"
+        f"Reached target: {nav_target}\n"
+        f"Arrived room: {actual_room}\n"
+        f"Previous room: {from_room or 'unknown'}\n"
+        f"Transition id: {transition_id or 'unknown'}\n"
+        f"Arrival scene: {scene_text or 'unknown'}\n"
+        f"YOLO summary: {yolo_summary or 'none'}\n"
+        f"Doorway peek before crossing: "
+        f"{json.dumps(peek or {}, ensure_ascii=True)}\n"
+        f"Room map context: {json.dumps(room_map_json, ensure_ascii=True) if room_map_json else 'null'}\n\n"
+        f"Task: extract relationship-based navigation memory. Prefer "
+        f"relationships between elements over metric distances.\n"
+        f"- What identifies this doorway from the previous room?\n"
+        f"- What can be seen just inside the doorway or immediately after crossing?\n"
+        f"- What short rule would help the rover choose this doorway next time?\n\n"
+        f"Reply ONLY JSON:\n"
+        f'{{"arrived_room":"{actual_room}", '
+        f'"floor_type":"<short or empty>", '
+        f'"room_features":["short phrases"], '
+        f'"entry_landmarks":["what is near the room entrance"], '
+        f'"transition_update":{{'
+        f'"transition_id":"{transition_id or ""}", '
+        f'"doorway_landmarks":["what identifies the doorway from the source side"], '
+        f'"inside_features":["what appears inside or just beyond it"], '
+        f'"inside_room_guess":"<room or empty>", '
+        f'"navigational_hint":"one short relationship rule", '
+        f'"confidence":<0-1>}}}}'
+    )
+
+    result = nav._llm_call(prompt)
+    if not isinstance(result, dict):
+        return
+
+    floor_type = str(result.get("floor_type", "")).strip()[:48]
+    room_features = _semantic_text_list(result.get("room_features", []), limit=8)
+    entry_landmarks = _semantic_text_list(result.get("entry_landmarks", []), limit=6)
+    transition_update = result.get("transition_update", {})
+    if not isinstance(transition_update, dict):
+        transition_update = {}
+
+    doorway_landmarks = _semantic_text_list(
+        transition_update.get("doorway_landmarks", []), limit=6)
+    inside_features = _semantic_text_list(
+        transition_update.get("inside_features", []), limit=6)
+    if not doorway_landmarks and isinstance(peek, dict):
+        doorway_landmarks = _semantic_text_list(
+            peek.get("doorway_landmarks", []), limit=6)
+    if not inside_features and isinstance(peek, dict):
+        inside_features = _semantic_text_list(
+            peek.get("inside_features", []), limit=6)
+
+    inside_room_guess = (_canonical_room_id(
+        transition_update.get("inside_room_guess")) or actual_room)
+    navigational_hint = str(
+        transition_update.get("navigational_hint", "")).strip()[:200]
+    confidence = float(transition_update.get("confidence", 0.0) or 0.0)
+    if confidence <= 0:
+        confidence = float((_topo_map.current_confidence or 0.65))
+
+    room_context.merge_room_observation(
+        actual_room,
+        features=room_features,
+        entry_landmarks=entry_landmarks,
+        scene_text=scene_text,
+        yolo_summary=yolo_summary,
+        floor_type=floor_type,
+        connected_to=from_room,
+        mark_current=True,
+        confidence=confidence,
+    )
+
+    _topo_map.update_room_semantics(
+        actual_room, features=room_features, floor_type=floor_type)
+    _topo_map.current_room = actual_room
+    _topo_map.current_confidence = confidence
+
+    if from_room and from_room != actual_room:
+        transition = _topo_map.ensure_transition_between(
+            from_room, actual_room, transition_id=transition_id)
+        _topo_map.update_transition_semantics(
+            transition.id,
+            from_room,
+            actual_room,
+            doorway_landmarks=doorway_landmarks,
+            inside_features=inside_features,
+            navigational_hint=navigational_hint,
+            inside_room_guess=inside_room_guess,
+            confidence=confidence,
+            scene_text=scene_text,
+        )
+        log_event(
+            "room",
+            f"Semantic reorg: {from_room} -> {actual_room} via {transition.id} | "
+            f"door={doorway_landmarks[:3]} | inside={inside_features[:3]}"
+        )
+    else:
+        log_event(
+            "room",
+            f"Semantic reorg: updated {actual_room} | features={room_features[:4]}"
+        )
+
+    _topo_map.save()
+
+
 def _topo_navigate(nav_target, stop_event):
     """Topological navigation: plan route through room graph, execute each leg.
 
@@ -3012,7 +3346,16 @@ def _topo_navigate(nav_target, stop_event):
     if not from_room:
         log_event("plan", "Can't determine current room, "
                           "using reactive nav")
-        return nav.navigate_reactive(nav_target)
+        reached = nav.navigate_reactive(nav_target)
+        if reached and target_room:
+            _semantic_reorganize_after_reach(
+                nav_target,
+                target_room,
+                from_room=None,
+                scene_text=getattr(nav, "_last_scene", ""),
+                yolo_summary=getattr(nav, "_last_yolo", ""),
+            )
+        return reached
 
     if from_room == target_room:
         log_event("plan", f"Already in {target_room}!")
@@ -3023,13 +3366,26 @@ def _topo_navigate(nav_target, stop_event):
     if not legs:
         log_event("plan", f"No topo route from {from_room} to "
                           f"{target_room}, using reactive nav")
-        return nav.navigate_reactive(nav_target)
+        reached = nav.navigate_reactive(nav_target)
+        if reached:
+            _semantic_reorganize_after_reach(
+                nav_target,
+                target_room,
+                from_room=from_room,
+                scene_text=getattr(nav, "_last_scene", ""),
+                yolo_summary=getattr(nav, "_last_yolo", ""),
+            )
+        return reached
 
     route_str = _topo_map.route_summary(legs)
     log_event("plan", f"Route: {route_str}")
 
-    # Execute each leg
-    for i, leg in enumerate(legs):
+    # Execute each leg (while-loop so replanning can replace remaining legs)
+    replans = 0
+    MAX_REPLANS = 1
+    i = 0
+    while i < len(legs):
+        leg = legs[i]
         if stop_event.is_set():
             log_event("plan", "Topo nav stopped")
             return False
@@ -3047,32 +3403,84 @@ def _topo_navigate(nav_target, stop_event):
 
         if success:
             arrived_room = new_room or leg.to_room
-            _topo_map.current_room = arrived_room
-            _topo_map.current_confidence = 0.8
-            log_event("plan", f"Leg {i+1} complete: now in {arrived_room}")
+            log_event("plan", f"Leg {i+1} nav says: {arrived_room}")
 
-            # Entry verification: panoramic scan to confirm room
+            # Entry verification: dedicated image check to confirm room
             nav._move_gimbal(0, 0)
             time.sleep(0.5)
             jpeg = nav.tracker.get_jpeg()
+            verified_room = None
             if jpeg:
                 verify = nav._llm_call(
-                    f"I just entered a new room. Describe what you see. "
-                    f"Mention the floor type and key objects.",
+                    f"What room am I in RIGHT NOW? Look at the objects "
+                    f"around me (not through a doorway). Key clues:\n"
+                    f"- stove/counter/cabinets → kitchen\n"
+                    f"- sofa/TV/coffee table → living room\n"
+                    f"- desk/monitor/office chair → office\n"
+                    f"- narrow corridor, stone tiles → hallway\n"
+                    f"- toilet/shower/bathtub → bathroom\n"
+                    f"Mention floor type and key objects.",
                     jpeg)
                 if verify:
                     vscene = verify.get("scene", str(verify))
                     vroom, vconf = _topo_room_check(vscene)
-                    if vroom:
-                        _topo_map.current_room = vroom
-                        _topo_map.current_confidence = vconf
+                    if vroom and vconf >= 0.55:
+                        verified_room = vroom
                         log_event("plan", f"Entry verified: {vroom} "
                                           f"({vconf})")
-                        if vroom != leg.to_room:
-                            log_event("plan",
-                                f"Wrong room! Expected {leg.to_room}, "
-                                f"got {vroom}")
-                            # Don't abort — the route planner can replan
+
+            # Decide actual room: verification image > nav scene text
+            if verified_room:
+                actual_room = verified_room
+            else:
+                actual_room = arrived_room
+                log_event("plan",
+                    f"Verification inconclusive, using nav: "
+                    f"{arrived_room}")
+
+            _topo_map.current_room = actual_room
+            _topo_map.current_confidence = vconf if verified_room else 0.5
+            log_event("plan", f"Leg {i+1} complete: now in {actual_room}")
+            actual_scene = vscene if verified_room else scene
+            _semantic_reorganize_after_reach(
+                nav_target,
+                actual_room,
+                from_room=leg.from_room,
+                transition_id=leg.transition,
+                scene_text=actual_scene,
+                yolo_summary=getattr(nav, "_last_yolo", ""),
+            )
+
+            if actual_room != leg.to_room and replans < MAX_REPLANS:
+                replans += 1
+                log_event("plan",
+                    f"Wrong room! Expected {leg.to_room}, "
+                    f"got {actual_room}. "
+                    f"Replan {replans}/{MAX_REPLANS}.")
+                new_legs = _topo_map.plan_route(
+                    actual_room, target_room)
+                if new_legs:
+                    log_event("plan",
+                        f"Replanned: "
+                        f"{_topo_map.route_summary(new_legs)}")
+                    legs[i+1:] = new_legs
+                elif actual_room == target_room:
+                    pass  # already there
+                else:
+                    log_event("plan",
+                        f"No route from {actual_room} to "
+                        f"{target_room}, trying reactive")
+                    reached = nav.navigate_reactive(target_room)
+                    if reached:
+                        _semantic_reorganize_after_reach(
+                            nav_target,
+                            target_room,
+                            from_room=actual_room,
+                            scene_text=getattr(nav, "_last_scene", ""),
+                            yolo_summary=getattr(nav, "_last_yolo", ""),
+                        )
+                    _topo_map.save()
+                    return reached
         else:
             log_event("plan", f"Leg {i+1} failed: could not cross "
                               f"{leg.transition}")
@@ -3083,15 +3491,42 @@ def _topo_navigate(nav_target, stop_event):
             if reached:
                 _topo_map.current_room = leg.to_room
                 _topo_map.current_confidence = 0.6
+                _semantic_reorganize_after_reach(
+                    nav_target,
+                    leg.to_room,
+                    from_room=leg.from_room,
+                    transition_id=leg.transition,
+                    scene_text=getattr(nav, "_last_scene", ""),
+                    yolo_summary=getattr(nav, "_last_yolo", ""),
+                )
                 log_event("plan", f"Reactive fallback reached {leg.to_room}")
             else:
                 log_event("plan", f"Could not reach {leg.to_room}")
                 return False
 
-    # Save updated topo map state
+        i += 1
+
+    # Verify we actually ended up in the target room
     _topo_map.save()
-    log_event("plan", f"Topo nav complete: arrived at {target_room}")
-    return True
+    actual = _topo_map.current_room
+    if actual == target_room:
+        log_event("plan", f"Topo nav complete: arrived at {target_room}")
+        return True
+    else:
+        log_event("plan",
+            f"Topo nav ended in {actual}, not {target_room}. "
+            f"Trying reactive fallback.")
+        reached = nav.navigate_reactive(target_room)
+        if reached:
+            _semantic_reorganize_after_reach(
+                nav_target,
+                target_room,
+                from_room=actual,
+                scene_text=getattr(nav, "_last_scene", ""),
+                yolo_summary=getattr(nav, "_last_yolo", ""),
+            )
+        _topo_map.save()
+        return reached
 
 
 # ── Orchestrated Navigation (legacy) ─────────────────────────────────
@@ -3673,30 +4108,36 @@ def main():
         # how to get there — the leg navigator will handle the rest).
         nav_target = _extract_target(text)
         all_targets = _extract_all_targets(text)
+        scan_target = all_targets[-1] if all_targets else nav_target
 
         _has_topo_route = False
         if _topo_map and _topo_map.current_room:
-            # Check if the target resolves to a known room with a route
-            target_lower = nav_target.lower().strip() if nav_target else ""
-            for room in _topo_map.rooms():
-                if (room.id in target_lower or
-                        room.label.lower() in target_lower or
-                        target_lower in room.id or
-                        target_lower in room.label.lower()):
-                    legs = _topo_map.plan_route(_topo_map.current_room, room.id)
-                    if legs:
-                        _has_topo_route = True
-                        log_event("room", f"Topo route exists "
-                                  f"({_topo_map.current_room}→{room.id}) "
-                                  f"— skipping sweep")
-                    break
+            _validate_topo_current_room(text, find_target=scan_target)
+            if _topo_map.current_room:
+                # Check if the target resolves to a known room with a route
+                target_lower = nav_target.lower().strip() if nav_target else ""
+                for room in _topo_map.rooms():
+                    if (room.id in target_lower or
+                            room.label.lower() in target_lower or
+                            target_lower in room.id or
+                            target_lower in room.label.lower()):
+                        legs = _topo_map.plan_route(_topo_map.current_room, room.id)
+                        if legs:
+                            _has_topo_route = True
+                            log_event("room", f"Topo route exists "
+                                      f"({_topo_map.current_room}→{room.id}) "
+                                      f"— skipping sweep")
+                        break
 
-        if not _has_topo_route and _room_scanner:
-            _scan_find = all_targets[-1] if all_targets else nav_target
+        recent_scan = _get_recent_room_scan_state()
+        same_task_scan = recent_scan and recent_scan.get("task") == text
+        if not _has_topo_route and _room_scanner and not same_task_scan:
             try:
                 scan_state = _run_task_room_scan(
-                    text, find_target=_scan_find)
+                    text, find_target=scan_target)
                 if scan_state:
+                    _sync_topo_room_from_scan_state(
+                        scan_state, source="Pre-nav room scan")
                     guess = scan_state.get("room_guess", {})
                     g_name = guess.get("name") or "unknown"
                     g_conf = float(guess.get("confidence", 0.0))
@@ -3709,6 +4150,11 @@ def main():
         # ── Navigator shortcut for movement commands ──
         if _navigator:
             text_lower_strip = text.strip().lower()
+            # Strip wake word for prefix matching
+            for _wake in ("jasper ", "hey jasper ", "ok jasper "):
+                if text_lower_strip.startswith(_wake):
+                    text_lower_strip = text_lower_strip[len(_wake):]
+                    break
             is_nav = any(text_lower_strip.startswith(p) for p in (
                 "go to ", "go out", "go through",
                 "navigate to ", "drive to ", "move to ",

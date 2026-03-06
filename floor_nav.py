@@ -66,7 +66,8 @@ class FloorNavigator:
     # ------------------------------------------------------------------
 
     def drive_toward(self, target_direction="center", speed=None,
-                     timeout=10.0, stop_condition=None):
+                     timeout=10.0, stop_condition=None,
+                     prefer_widest=False):
         """Drive forward avoiding obstacles.  ~10 Hz control loop.
 
         Args:
@@ -107,7 +108,8 @@ class FloorNavigator:
                 return False
 
             clearance = self._build_clearance_map(floor_obs, w)
-            gap_col = self._find_best_gap(clearance, target_col)
+            gap_col = self._find_best_gap(
+                clearance, target_col, prefer_widest=prefer_widest)
 
             if gap_col is None:
                 self._stop()
@@ -260,7 +262,8 @@ class FloorNavigator:
                 target_col = midpoint_col
             else:
                 # Fall back to widest gap
-                gap_col = self._find_best_gap(clearance, self.NUM_COLUMNS // 2)
+                gap_col = self._find_best_gap(
+                    clearance, self.NUM_COLUMNS // 2, prefer_widest=True)
                 if gap_col is None:
                     self._stop()
                     print("[floor_nav] No gap found in doorway")
@@ -275,7 +278,8 @@ class FloorNavigator:
         print("[floor_nav] Timeout in doorway")
         return False
 
-    def check_floor_clear(self, detections, frame_w, frame_h, direction_col=None):
+    def check_floor_clear(self, detections, frame_w, frame_h, direction_col=None,
+                          prefer_widest=False):
         """Quick check: is the floor ahead clear in the given direction?
 
         Useful for visual_servo to query before driving forward.
@@ -301,7 +305,8 @@ class FloorNavigator:
         clearance = self._build_clearance_map(floor_obs, frame_w)
 
         # Check if the requested direction is in a passable gap
-        gap_col = self._find_best_gap(clearance, direction_col)
+        gap_col = self._find_best_gap(
+            clearance, direction_col, prefer_widest=prefer_widest)
         if gap_col is None:
             return False, None
 
@@ -430,10 +435,13 @@ class FloorNavigator:
 
         return clearance
 
-    def _find_best_gap(self, clearance, target_col):
-        """Find the widest gap of consecutive clear columns nearest to target_col.
+    def _find_best_gap(self, clearance, target_col, prefer_widest=False):
+        """Find a passable gap to drive through.
 
-        Returns center column of the best gap, or None if no gap is wide enough.
+        Returns center column of the selected gap, or None if no gap is wide
+        enough. By default this prefers the gap nearest to target_col and uses
+        width as a tiebreaker. Set prefer_widest=True to escape toward the
+        widest opening first, then break ties by proximity to target_col.
         """
         # Find all runs of consecutive True columns
         gaps = []
@@ -454,11 +462,14 @@ class FloorNavigator:
         if not passable:
             return None
 
-        # Pick the gap whose center is nearest to target_col, breaking ties by width
+        # Normal driving biases toward the requested direction. Escape/recovery
+        # can instead bias toward the widest opening.
         def score(gap):
             center = (gap[0] + gap[1]) / 2.0
             dist = abs(center - target_col)
             width = gap[1] - gap[0] + 1
+            if prefer_widest:
+                return (-width, dist)  # prefer wider, then closer
             return (dist, -width)  # prefer closer, then wider
 
         best = min(passable, key=score)

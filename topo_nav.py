@@ -41,6 +41,9 @@ class TopoNode:
         self.azimuth_from = attrs.get("azimuth_from", {})  # {room_id: degrees}
         self.width_m = attrs.get("width_m", 0.8)
         self.nav_hints = attrs.get("nav_hints", "")
+        sem = attrs.get("semantic_views", {})
+        self.semantic_views = sem if isinstance(sem, dict) else {}
+        self.observation_count = int(attrs.get("observation_count", 0) or 0)
 
     def to_dict(self):
         d = {
@@ -60,6 +63,10 @@ class TopoNode:
             d["width_m"] = self.width_m
         if self.nav_hints:
             d["nav_hints"] = self.nav_hints
+        if self.semantic_views:
+            d["semantic_views"] = self.semantic_views
+        if self.observation_count:
+            d["observation_count"] = self.observation_count
         return d
 
 
@@ -94,6 +101,23 @@ class TopoMap:
         self.edges.setdefault(a_id, set()).add(b_id)
         self.edges.setdefault(b_id, set()).add(a_id)
 
+    @staticmethod
+    def _merge_unique(existing, new_items, limit=8):
+        merged = []
+        seen = set()
+        for value in list(existing or []) + list(new_items or []):
+            text = str(value).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(text)
+            if limit and len(merged) >= limit:
+                break
+        return merged
+
     def rooms(self):
         return [n for n in self.nodes.values() if n.type == "room"]
 
@@ -110,6 +134,105 @@ class TopoMap:
             if room_a in nbrs and room_b in nbrs:
                 return t
         return None
+
+    def ensure_room(self, room_id, label="", features=None, floor_type=""):
+        """Ensure a room node exists and optionally enrich it."""
+        room = self.nodes.get(room_id)
+        if room and room.type == "room":
+            if features:
+                room.features = self._merge_unique(room.features, features, limit=20)
+            if floor_type and not room.floor_type:
+                room.floor_type = floor_type
+            if label and not room.label:
+                room.label = label
+            return room
+
+        room = TopoNode(
+            room_id, "room",
+            label or room_id.replace("_", " ").title(),
+            features=list(features or []),
+            floor_type=floor_type,
+        )
+        self.add_node(room)
+        return room
+
+    def ensure_transition_between(self, room_a, room_b, transition_id=None,
+                                  label=""):
+        """Ensure a transition node exists between two rooms."""
+        existing = self.transition_between(room_a, room_b)
+        if existing:
+            return existing
+
+        if not transition_id:
+            a, b = sorted([room_a, room_b])
+            transition_id = f"{a}_{b}_transition"
+
+        transition = TopoNode(
+            transition_id, "transition",
+            label or transition_id.replace("_", " ").title(),
+        )
+        self.add_node(transition)
+        self.add_edge(room_a, transition.id)
+        self.add_edge(transition.id, room_b)
+        return transition
+
+    def update_room_semantics(self, room_id, features=None, floor_type=""):
+        """Merge newly learned room features into a room node."""
+        room = self.ensure_room(room_id, features=features, floor_type=floor_type)
+        if features:
+            room.features = self._merge_unique(room.features, features, limit=20)
+        if floor_type and not room.floor_type:
+            room.floor_type = floor_type
+        return room
+
+    def update_transition_semantics(self, transition_id, from_room, to_room,
+                                    doorway_landmarks=None, inside_features=None,
+                                    navigational_hint="", inside_room_guess="",
+                                    confidence=0.0, scene_text=""):
+        """Store learned relationship cues for a transition as seen from one room."""
+        if not from_room or not to_room:
+            return None
+
+        self.ensure_room(from_room)
+        self.ensure_room(to_room)
+        transition = self.nodes.get(transition_id)
+        if not transition or transition.type != "transition":
+            transition = self.ensure_transition_between(
+                from_room, to_room, transition_id=transition_id)
+
+        view = transition.semantic_views.get(from_room, {})
+        if not isinstance(view, dict):
+            view = {}
+
+        view["to_room"] = to_room
+        view["doorway_landmarks"] = self._merge_unique(
+            view.get("doorway_landmarks", []), doorway_landmarks, limit=6)
+        view["inside_features"] = self._merge_unique(
+            view.get("inside_features", []), inside_features, limit=6)
+        if inside_room_guess:
+            view["inside_room_guess"] = inside_room_guess
+        if navigational_hint:
+            view["navigational_hint"] = str(navigational_hint).strip()[:200]
+        if scene_text:
+            view["last_scene"] = str(scene_text).strip()[:240]
+        if confidence:
+            view["confidence"] = round(max(
+                float(view.get("confidence", 0.0) or 0.0),
+                min(1.0, float(confidence))), 2)
+        view["last_observed"] = time.strftime("%Y-%m-%d %H:%M")
+        view["observation_count"] = int(view.get("observation_count", 0) or 0) + 1
+
+        transition.semantic_views[from_room] = view
+        transition.observation_count = max(
+            transition.observation_count, view["observation_count"])
+
+        combined_cues = list(doorway_landmarks or []) + list(inside_features or [])
+        if combined_cues:
+            transition.visual_cues = self._merge_unique(
+                transition.visual_cues, combined_cues, limit=10)
+        if navigational_hint and not transition.nav_hints:
+            transition.nav_hints = str(navigational_hint).strip()[:200]
+        return view
 
     def rooms_through(self, transition_id):
         """Return the two room ids connected by a transition."""
@@ -185,6 +308,20 @@ class TopoMap:
         if from_node and from_node.nav_hints:
             instruction["room_nav_hints"] = from_node.nav_hints
 
+        semantic_view = t_node.semantic_views.get(leg.from_room, {})
+        if isinstance(semantic_view, dict):
+            doorway_landmarks = semantic_view.get("doorway_landmarks", [])
+            inside_features = semantic_view.get("inside_features", [])
+            relationship_hint = semantic_view.get("navigational_hint", "")
+            if doorway_landmarks:
+                instruction["doorway_landmarks"] = doorway_landmarks[:4]
+            if inside_features:
+                instruction["inside_features"] = inside_features[:5]
+            if relationship_hint:
+                instruction["relationship_hint"] = relationship_hint
+            if semantic_view.get("confidence"):
+                instruction["relationship_confidence"] = semantic_view["confidence"]
+
         return instruction
 
     def route_summary(self, legs):
@@ -234,6 +371,8 @@ class TopoMap:
                     azimuth_from=nd.get("azimuth_from", {}),
                     width_m=nd.get("width_m", 0.8),
                     nav_hints=nd.get("nav_hints", ""),
+                    semantic_views=nd.get("semantic_views", {}),
+                    observation_count=nd.get("observation_count", 0),
                 ))
             for ed in data.get("edges", []):
                 self.add_edge(ed["a"], ed["b"])
@@ -315,6 +454,19 @@ class TopoMap:
             nav_hints="Through the opening on the right.",
             width_m=1.2))
 
+        self.add_node(TopoNode("bathroom", "room", "Bathroom",
+            features=["toilet", "shower", "bathtub", "sink",
+                       "tiles", "mirror"],
+            floor_type="tiles"))
+
+        self.add_node(TopoNode("hall_bathroom_door", "transition",
+            "Hallway-Bathroom Door",
+            visual_cues=["bathroom door", "tiled floor beyond",
+                         "toilet visible"],
+            azimuth_from={"hallway": 0},
+            nav_hints="Look for the bathroom door in the hallway.",
+            width_m=0.7))
+
         # --- Edges (room ↔ transition) ---
         self.add_edge("office", "office_hall_door")
         self.add_edge("office_hall_door", "hallway")
@@ -330,6 +482,9 @@ class TopoMap:
 
         self.add_edge("living_room", "living_dining_pass")
         self.add_edge("living_dining_pass", "dining")
+
+        self.add_edge("hallway", "hall_bathroom_door")
+        self.add_edge("hall_bathroom_door", "bathroom")
 
         self.current_room = "office"
         self.current_confidence = 0.5

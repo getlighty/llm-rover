@@ -11,6 +11,7 @@ import time
 ROVER_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOMS_FILE = os.path.join(ROVER_DIR, "rooms.json")
 ROOM_GRAPH_FILE = os.path.join(ROVER_DIR, "room_graph.json")
+TOPO_MAP_FILE = os.path.join(ROVER_DIR, "topo_map.json")
 
 
 def _graph_to_rooms(graph):
@@ -146,6 +147,122 @@ def _write_rooms(data):
         pass
 
 
+def _normalize_room_name(name):
+    return str(name or "").strip().lower().replace(" ", "_")
+
+
+def _merge_unique_text(existing, new_items, limit=12):
+    merged = []
+    seen = set()
+    for item in list(existing or []) + list(new_items or []):
+        text = str(item).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(text)
+        if limit and len(merged) >= limit:
+            break
+    return merged
+
+
+def _merge_landmarks(existing, new_landmarks, limit=6):
+    existing_text = []
+    for entry in existing or []:
+        if isinstance(entry, dict):
+            existing_text.append(entry.get("landmark", ""))
+        else:
+            existing_text.append(str(entry))
+    merged = _merge_unique_text(existing_text, new_landmarks, limit=limit)
+    return [{"landmark": text} for text in merged]
+
+
+def _ensure_room_entry(data, room_name):
+    room_id = _normalize_room_name(room_name)
+    if not room_id:
+        return None
+
+    for room in data.get("rooms", []):
+        if room.get("name") == room_id:
+            return room
+
+    room = {
+        "name": room_id,
+        "positive_features": [],
+        "negative_features": [],
+        "floor_type": "",
+        "connections": [],
+        "entry_landmarks": [],
+        "nav_hints": "",
+        "last_visited": "",
+        "visit_count": 0,
+        "last_scene": "",
+        "last_yolo": "",
+    }
+    data.setdefault("rooms", []).append(room)
+    return room
+
+
+def _load_topo_data():
+    if not os.path.exists(TOPO_MAP_FILE):
+        return {}
+    try:
+        with open(TOPO_MAP_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "nodes" in data:
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _relationship_lines(current_room=None, target_room=None, max_lines=4):
+    topo = _load_topo_data()
+    if not topo:
+        return []
+
+    current_room = _normalize_room_name(current_room)
+    target_room = _normalize_room_name(target_room)
+    lines = []
+
+    for node in topo.get("nodes", []):
+        if node.get("type") != "transition":
+            continue
+        views = node.get("semantic_views", {})
+        if not isinstance(views, dict) or not views:
+            continue
+
+        if current_room and current_room in views:
+            pairs = [(current_room, views[current_room])]
+        else:
+            pairs = list(views.items())
+
+        for from_room, view in pairs:
+            if not isinstance(view, dict):
+                continue
+            to_room = _normalize_room_name(view.get("to_room"))
+            if target_room and to_room and to_room != target_room:
+                continue
+
+            doorway = ", ".join(view.get("doorway_landmarks", [])[:2])
+            inside = ", ".join(view.get("inside_features", [])[:3])
+            hint = str(view.get("navigational_hint", "")).strip()
+            parts = [f"{from_room.replace('_', ' ')} -> {to_room.replace('_', ' ')}"]
+            if doorway:
+                parts.append(f"door near {doorway}")
+            if inside:
+                parts.append(f"inside {inside}")
+            if hint:
+                parts.append(hint)
+            lines.append("; ".join(parts))
+            if len(lines) >= max_lines:
+                return lines
+
+    return lines
+
+
 def load_room_graph():
     """Return explicit room graph JSON (nodes + edges)."""
     if os.path.exists(ROOM_GRAPH_FILE):
@@ -274,7 +391,7 @@ def get_current_room(scene_text, yolo_summary=""):
     return best_name, best_conf
 
 
-def format_room_clues():
+def format_room_clues(target_room=None):
     """Compact one-liner for navigator waypoint prompt (replaces hardcoded room_ctx)."""
     data = load_rooms()
     rooms = data.get("rooms", [])
@@ -308,7 +425,21 @@ def format_room_clues():
                 if room.get("nav_hints"):
                     hint = f" NAV: {room['nav_hints']}"
                 break
-    return f"ROOM CLUES: {prefix}{'. '.join(clues)}.{hint}\n"
+    rel_lines = _relationship_lines(current_room=current, target_room=target_room,
+                                    max_lines=3)
+    rel = ""
+    if rel_lines:
+        rel = " RELATION CLUES: " + " | ".join(rel_lines)
+    return f"ROOM CLUES: {prefix}{'. '.join(clues)}.{hint}{rel}\n"
+
+
+def format_relationship_clues(current_room=None, target_room=None, max_lines=3):
+    """Compact relationship-oriented doorway hints for prompts."""
+    lines = _relationship_lines(current_room=current_room, target_room=target_room,
+                                max_lines=max_lines)
+    if not lines:
+        return ""
+    return "RELATION CLUES: " + " | ".join(lines) + "\n"
 
 
 def format_home_layout():
@@ -353,6 +484,11 @@ def format_home_layout():
             if room["name"] == current and room.get("nav_hints"):
                 lines.append(f"NAVIGATION WARNING: {room['nav_hints']}")
 
+    rel_lines = _relationship_lines(current_room=current, max_lines=6)
+    if rel_lines:
+        lines.append("\nLEARNED DOORWAY RELATIONSHIPS:")
+        lines.extend(f"- {line}" for line in rel_lines)
+
     lines.append("\nUse this layout to plan routes with specific room names and visual landmarks.")
     lines.append('For "go to kitchen": exit current room → hallway → find orange arched doorway → enter.')
     return "\n".join(lines)
@@ -379,6 +515,11 @@ def format_for_prompt():
         key = ", ".join(room.get("positive_features", [])[:4])
         lines.append(f"- {name}: {key}. Floor: {floor}. → {connections}")
 
+    rel_lines = _relationship_lines(current_room=current, max_lines=4)
+    if rel_lines:
+        lines.append("Known doorway relationships:")
+        lines.extend(f"- {line}" for line in rel_lines)
+
     return "\n".join(lines)
 
 
@@ -394,6 +535,98 @@ def update_room_features(room_name, features):
             _write_rooms(data)
             return True
     return False
+
+
+def link_rooms(room_a, room_b):
+    """Ensure two rooms are connected in rooms.json."""
+    a_name = _normalize_room_name(room_a)
+    b_name = _normalize_room_name(room_b)
+    if not a_name or not b_name or a_name == b_name:
+        return False
+
+    data = load_rooms()
+    a_room = _ensure_room_entry(data, a_name)
+    b_room = _ensure_room_entry(data, b_name)
+
+    changed = False
+    if b_name not in a_room.get("connections", []):
+        a_room.setdefault("connections", []).append(b_name)
+        a_room["connections"] = sorted(_merge_unique_text(a_room["connections"], [], limit=20))
+        changed = True
+    if a_name not in b_room.get("connections", []):
+        b_room.setdefault("connections", []).append(a_name)
+        b_room["connections"] = sorted(_merge_unique_text(b_room["connections"], [], limit=20))
+        changed = True
+
+    if changed:
+        _write_rooms(data)
+    return changed
+
+
+def merge_room_observation(room_name, features=None, entry_landmarks=None,
+                           scene_text="", yolo_summary="", floor_type="",
+                           connected_to=None, mark_current=False,
+                           confidence=None):
+    """Merge a successful arrival observation into rooms.json."""
+    room_id = _normalize_room_name(room_name)
+    if not room_id:
+        return False
+
+    data = load_rooms()
+    room = _ensure_room_entry(data, room_id)
+    changed = False
+
+    merged_features = _merge_unique_text(
+        room.get("positive_features", []), features or [], limit=40)
+    if merged_features != room.get("positive_features", []):
+        room["positive_features"] = merged_features
+        changed = True
+
+    merged_landmarks = _merge_landmarks(
+        room.get("entry_landmarks", []), entry_landmarks or [], limit=8)
+    if merged_landmarks != room.get("entry_landmarks", []):
+        room["entry_landmarks"] = merged_landmarks
+        changed = True
+
+    if floor_type and not room.get("floor_type"):
+        room["floor_type"] = str(floor_type).strip()
+        changed = True
+
+    if scene_text:
+        clipped = str(scene_text).strip()[:300]
+        if clipped and clipped != room.get("last_scene"):
+            room["last_scene"] = clipped
+            changed = True
+
+    if yolo_summary:
+        clipped = str(yolo_summary).strip()[:200]
+        if clipped and clipped != room.get("last_yolo"):
+            room["last_yolo"] = clipped
+            changed = True
+
+    if mark_current:
+        data["current_room"] = room_id
+        if confidence is not None:
+            data["current_confidence"] = round(float(confidence), 2)
+        room["last_visited"] = time.strftime("%Y-%m-%d %H:%M")
+        room["visit_count"] = room.get("visit_count", 0) + 1
+        changed = True
+
+    if connected_to:
+        other = _ensure_room_entry(data, connected_to)
+        if other and other["name"] != room_id:
+            if other["name"] not in room.get("connections", []):
+                room.setdefault("connections", []).append(other["name"])
+                room["connections"] = sorted(_merge_unique_text(room["connections"], [], limit=20))
+                changed = True
+            if room_id not in other.get("connections", []):
+                other.setdefault("connections", []).append(room_id)
+                other["connections"] = sorted(_merge_unique_text(other["connections"], [], limit=20))
+                changed = True
+
+    if changed:
+        _write_rooms(data)
+    return changed
 
 
 def learn_nav_failure(room_name, failure_scene, failure_reason):

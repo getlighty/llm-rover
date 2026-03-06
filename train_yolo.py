@@ -308,7 +308,7 @@ def cmd_train(args):
         print("   Recommend at least 30-50 images from different angles.")
 
     # Load pretrained YOLOv8n
-    base_model = args.model if hasattr(args, 'model') else "yolov8n.pt"
+    base_model = args.model if hasattr(args, 'model') else "yolo26n.pt"
     print(f"\nLoading base model: {base_model}")
     model = YOLO(base_model)
 
@@ -502,8 +502,8 @@ def main():
     p_trn.add_argument("--epochs", type=int, default=50)
     p_trn.add_argument("--batch", type=int, default=8)
     p_trn.add_argument("--imgsz", type=int, default=640)
-    p_trn.add_argument("--model", default="yolov8n.pt",
-                       help="Base model (default: yolov8n.pt)")
+    p_trn.add_argument("--model", default="yolo26n.pt",
+                       help="Base model (default: yolo26n.pt)")
 
     # test
     p_tst = sub.add_parser("test", help="Test trained model")

@@ -1,7 +1,7 @@
 """
-Local object detection using YOLOv8 ONNX / TensorRT.
-Supports both YOLOv8n (COCO-80) and YOLO-World (custom classes).
-TensorRT FP16 GPU inference (~20+ FPS), falls back to OpenCV DNN CPU.
+Local object detection using Ultralytics YOLO TensorRT.
+Defaults to YOLO26n on this rover.
+TensorRT FP16 GPU inference (~20+ FPS), falls back to PyTorch when needed.
 
 Based on:
 - NVIDIA JetBot object_following example (SSD + proportional control)
@@ -9,7 +9,7 @@ Based on:
 - Ultralytics YOLOv8-OpenCV-ONNX-Python example
 
 Usage:
-    detector = LocalDetector()                    # YOLO-World TRT (default)
+    detector = LocalDetector()                    # YOLO26n TRT (default)
     detector = LocalDetector(model_path="...")     # custom model
     detections = detector.detect(bgr_frame)
     target = detector.find("cup", detections)
@@ -57,40 +57,15 @@ KNOWN_WIDTHS = {
 }
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-COCO_MODEL = os.path.join(MODEL_DIR, "yolov8n.onnx")
+YOLO26N_PT = os.path.join(MODEL_DIR, "yolo26n.pt")
+YOLO26N_TRT = os.path.join(MODEL_DIR, "yolo26n.engine")
 
-# YOLO11n TensorRT engine (COCO 80 classes, FP16 — fastest on Jetson)
-YOLO11N_TRT = os.path.join(MODEL_DIR, "yolo11n.engine")
-
-# YOLO-World workshop model (42 indoor/workshop classes, open-vocabulary baked in)
-WORLD_MODEL_PT = os.path.join(MODEL_DIR, "yolov8s-world-workshop.pt")
-WORLD_MODEL_ONNX = os.path.join(MODEL_DIR, "yolov8s-world-workshop.onnx")
-WORLD_MODEL_TRT = os.path.join(MODEL_DIR, "yolov8s-world-workshop.engine")
-
-# Default: prefer YOLO11n TRT > World TRT > PT > ONNX World > ONNX COCO
 def _pick_default_model():
-    if os.path.exists(YOLO11N_TRT):
-        return YOLO11N_TRT
-    if os.path.exists(WORLD_MODEL_TRT):
-        return WORLD_MODEL_TRT
-    if os.path.exists(WORLD_MODEL_PT):
-        return WORLD_MODEL_PT
-    if os.path.exists(WORLD_MODEL_ONNX):
-        return WORLD_MODEL_ONNX
-    return COCO_MODEL
+    if os.path.exists(YOLO26N_TRT):
+        return YOLO26N_TRT
+    return YOLO26N_PT
 
 DEFAULT_MODEL = _pick_default_model()
-WORLD_NAMES = [
-    "person", "door", "chair", "table", "desk",
-    "shelf", "cabinet", "box", "container", "bin",
-    "recycle bin", "trash can", "bottle", "cup", "bowl",
-    "monitor", "laptop", "keyboard", "mouse", "cable",
-    "light", "lamp", "fan", "clock", "phone",
-    "backpack", "bag", "book", "plant", "window",
-    "wall", "floor", "ceiling", "rug",
-    "toolbox", "tool", "screwdriver", "drill",
-    "wheel", "robot", "speaker", "camera",
-]
 
 # LLM-corrected label overrides (e.g. "cup" -> "recycle bin")
 LABEL_OVERRIDES = {}
@@ -139,15 +114,15 @@ class LocalDetector:
 
         # Pick class names based on model
         basename = os.path.basename(model_path).lower()
-        if "world" in basename or "workshop" in basename:
-            self.class_names = WORLD_NAMES
-            self._model_label = "YOLO-World"
-        elif "yolo11" in basename:
+        if "yolo26" in basename:
             self.class_names = COCO_NAMES
-            self._model_label = "YOLO11n"
+            self._model_label = "YOLO26n"
+        elif "yolo11" in basename or "yolov8" in basename:
+            self.class_names = COCO_NAMES
+            self._model_label = "Ultralytics YOLO"
         else:
             self.class_names = COCO_NAMES
-            self._model_label = "YOLOv8n"
+            self._model_label = "Ultralytics YOLO"
 
         # Backend state
         self._ultralytics_model = None  # PyTorch (Ultralytics YOLO)
@@ -157,16 +132,38 @@ class LocalDetector:
         if model_path.endswith(".pt"):
             self._init_pytorch(model_path)
         elif model_path.endswith(".engine"):
-            # Try Ultralytics first (handles its own engine wrapper format)
-            try:
-                self._init_pytorch(model_path)
-            except Exception:
+            # YOLO26 engines built with trtexec do not carry Ultralytics
+            # metadata, so load them through the raw TensorRT path.
+            if "yolo26" in basename:
                 self._init_tensorrt(model_path)
+            else:
+                # Try Ultralytics first (handles its own engine wrapper format)
+                try:
+                    self._init_pytorch(model_path)
+                except Exception:
+                    self._init_tensorrt(model_path)
         else:
             self._init_opencv_dnn(model_path)
 
         print(f"[detector] {self._model_label} loaded ({self.backend}, "
               f"{len(self.class_names)} classes, conf={conf})")
+
+    def _attach_metric_distance(self, det, name, bw_px):
+        """Attach a metric object distance when class geometry is known.
+
+        This is currently the only defensible metric distance source in the
+        detector. Monocular depth is kept as a separate relative cue.
+        """
+        known_w = KNOWN_WIDTHS.get(name)
+        if not known_w or bw_px <= 5:
+            return det
+        dist_m = (known_w * self.focal_length) / max(float(bw_px), 1.0)
+        # Larger boxes are more stable; tiny boxes are noisy.
+        size_conf = min(0.35, bw_px / 400.0)
+        det["dist_m"] = round(dist_m, 2)
+        det["dist_source"] = "bbox_width"
+        det["dist_conf"] = round(min(0.95, 0.55 + size_conf), 2)
+        return det
 
     def _init_pytorch(self, model_path):
         """Load model via Ultralytics for PyTorch/TRT GPU inference."""
@@ -222,6 +219,7 @@ class LocalDetector:
         self._trt_output_name = engine.get_tensor_name(1)
         in_shape = engine.get_tensor_shape(self._trt_input_name)
         out_shape = engine.get_tensor_shape(self._trt_output_name)
+        self._trt_output_shape = tuple(out_shape)
 
         self._trt_input = torch.zeros(*in_shape, dtype=torch.float32,
                                        device=self._torch_device)
@@ -316,9 +314,7 @@ class LocalDetector:
                     "bw": round(bw_px / w, 3),
                     "bh": round(bh_px / h, 3),
                 }
-                known_w = KNOWN_WIDTHS.get(name)
-                if known_w and bw_px > 5:
-                    det["dist_m"] = round((known_w * self.focal_length) / bw_px, 2)
+                self._attach_metric_distance(det, name, bw_px)
                 detections.append(det)
 
         with self._lock:
@@ -336,6 +332,40 @@ class LocalDetector:
 
     def _postprocess(self, outputs, h, w):
         """Post-process raw YOLO output into detection dicts."""
+        # TensorRT exports from recent Ultralytics builds may already include
+        # decoded boxes with NMS: (1, N, 6) = [x1, y1, x2, y2, conf, cls].
+        if outputs.ndim == 3 and outputs.shape[-1] == 6:
+            detections = []
+            for row in outputs[0]:
+                x1, y1, x2, y2, conf, cls = [float(v) for v in row]
+                if conf < self.conf:
+                    continue
+                cid = int(cls)
+                name = self.class_names[cid] if cid < len(self.class_names) else f"cls_{cid}"
+                name = LABEL_OVERRIDES.get(name, name)
+                x1_i, y1_i = int(max(0, x1)), int(max(0, y1))
+                x2_i, y2_i = int(min(w, x2)), int(min(h, y2))
+                bw_px = max(0, x2_i - x1_i)
+                bh_px = max(0, y2_i - y1_i)
+                if bw_px <= 1 or bh_px <= 1:
+                    continue
+                cx_r = (x1_i + x2_i) / 2.0
+                cy_r = (y1_i + y2_i) / 2.0
+                det = {
+                    "name": name,
+                    "conf": round(float(conf), 2),
+                    "bbox": (x1_i, y1_i, x2_i, y2_i),
+                    "cx": round(cx_r / w, 3),
+                    "cy": round(cy_r / h, 3),
+                    "bw": round(bw_px / w, 3),
+                    "bh": round(bh_px / h, 3),
+                }
+                self._attach_metric_distance(det, name, bw_px)
+                detections.append(det)
+            with self._lock:
+                self.last_detections = detections
+            return detections
+
         # YOLOv8 output: (1, N+4, 8400) -> transpose to (8400, N+4)
         out = outputs[0].T if outputs.ndim == 3 else outputs.T
         scores = out[:, 4:]
@@ -382,9 +412,7 @@ class LocalDetector:
                     "bw": round(bw_r / w, 3),
                     "bh": round(bh_r / h, 3),
                 }
-                known_w = KNOWN_WIDTHS.get(names[idx])
-                if known_w and bw_px > 5:
-                    det["dist_m"] = round((known_w * self.focal_length) / bw_px, 2)
+                self._attach_metric_distance(det, names[idx], bw_px)
                 detections.append(det)
 
         with self._lock:
@@ -551,9 +579,13 @@ class LocalDetector:
         return " ".join(parts)
 
 
-# ── Depth Estimation (Depth Anything V1 Small, TensorRT) ────────────
+# ── Depth Estimation (Depth Anything TensorRT) ───────────────────────
 
-DEPTH_ENGINE_PATH = os.path.join(MODEL_DIR, "depth_anything_vits14_308.trt")
+DEPTH_ENGINE_CANDIDATES = [
+    os.environ.get("ROVER_DEPTH_ENGINE", "").strip(),
+    os.path.join(MODEL_DIR, "depth_anything_v2_vits14_308.trt"),
+    os.path.join(MODEL_DIR, "depth_anything_vits14_308.trt"),
+]
 DEPTH_INPUT_SIZE = 308
 
 # ImageNet normalization (applied in BGR order to match model training)
@@ -562,9 +594,9 @@ _DEPTH_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 class DepthEstimator:
-    """Monocular depth estimation using Depth Anything V1 Small + TensorRT.
+    """Monocular depth estimation using a Depth Anything TensorRT engine.
 
-    Produces a relative float32 depth map (higher = farther).
+    Produces a relative float32 depth map (higher = closer).
     CUDA resources are lazily initialized on first estimate() call so that
     the pycuda context is created on the correct thread.
 
@@ -577,11 +609,20 @@ class DepthEstimator:
     def __init__(self, engine_path=None, input_size=DEPTH_INPUT_SIZE,
                  depth_scale=1.0):
         if engine_path is None:
-            engine_path = DEPTH_ENGINE_PATH
+            engine_path = next(
+                (p for p in DEPTH_ENGINE_CANDIDATES if p and os.path.exists(p)),
+                os.path.join(MODEL_DIR, "depth_anything_vits14_308.trt"),
+            )
         if not os.path.exists(engine_path):
             raise FileNotFoundError(f"Depth engine not found: {engine_path}")
 
+        self.engine_path = engine_path
+        self.engine_name = os.path.basename(engine_path)
         self.input_size = input_size
+        self.input_h = input_size
+        self.input_w = input_size
+        self.output_h = input_size
+        self.output_w = input_size
         self.depth_scale = depth_scale
         self._lock = threading.Lock()
         self.last_depth_map = None
@@ -596,9 +637,9 @@ class DepthEstimator:
         self._ready = False
         self._cuda_ctx = None
 
-        print(f"[depth] Depth Anything V1s engine loaded "
+        print(f"[depth] Depth engine loaded: {self.engine_name} "
               f"({len(self._engine_bytes) / 1024 / 1024:.0f} MB, "
-              f"{input_size}x{input_size}, scale={depth_scale})")
+              f"default={input_size}x{input_size}, scale={depth_scale})")
 
     def _lazy_init(self):
         """Initialize pycuda + TRT resources on the calling thread.
@@ -609,7 +650,10 @@ class DepthEstimator:
         import pycuda.driver as cuda
         cuda.init()
         dev = cuda.Device(0)
-        self._cuda_ctx = dev.retain_primary_ctx()
+        if hasattr(dev, "retain_primary_context"):
+            self._cuda_ctx = dev.retain_primary_context()
+        else:
+            self._cuda_ctx = dev.retain_primary_ctx()
         self._cuda_ctx.push()
         self._cuda = cuda
 
@@ -619,8 +663,26 @@ class DepthEstimator:
         del self._engine_bytes  # free the raw bytes
         self.context = self.engine.create_execution_context()
 
-        input_vol = 1 * 3 * self.input_size * self.input_size
-        output_vol = 1 * 1 * self.input_size * self.input_size
+        input_name = None
+        output_name = None
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                input_name = name
+            else:
+                output_name = name
+        input_shape = tuple(self.engine.get_tensor_shape(input_name))
+        output_shape = tuple(self.engine.get_tensor_shape(output_name))
+        if len(input_shape) == 4:
+            self.input_h = int(input_shape[-2])
+            self.input_w = int(input_shape[-1])
+            self.input_size = self.input_h
+        if len(output_shape) >= 2:
+            self.output_h = int(output_shape[-2])
+            self.output_w = int(output_shape[-1])
+
+        input_vol = 1 * 3 * self.input_h * self.input_w
+        output_vol = 1 * self.output_h * self.output_w
         self.h_input = cuda.pagelocked_empty(input_vol, dtype=np.float32)
         self.h_output = cuda.pagelocked_empty(output_vol, dtype=np.float32)
         self.d_input = cuda.mem_alloc(self.h_input.nbytes)
@@ -636,11 +698,32 @@ class DepthEstimator:
 
         self._ready = True
         print(f"[depth] CUDA context initialized on thread "
-              f"{threading.current_thread().name}")
+              f"{threading.current_thread().name} "
+              f"for {self.engine_name} ({self.input_w}x{self.input_h})")
+
+    def close(self):
+        ctx = getattr(self, "_cuda_ctx", None)
+        if ctx is None:
+            return
+        try:
+            ctx.pop()
+        except Exception:
+            pass
+        try:
+            ctx.detach()
+        except Exception:
+            pass
+        self._cuda_ctx = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _preprocess(self, bgr_frame):
         """Resize, normalize, transpose to CHW float32."""
-        img = cv2.resize(bgr_frame, (self.input_size, self.input_size),
+        img = cv2.resize(bgr_frame, (self.input_w, self.input_h),
                          interpolation=cv2.INTER_CUBIC)
         img = img.astype(np.float32) / 255.0
         img = (img - _DEPTH_MEAN) / _DEPTH_STD
@@ -664,7 +747,7 @@ class DepthEstimator:
         self.stream.synchronize()
         self.last_inference_ms = (time.time() - t0) * 1000
 
-        depth = self.h_output.reshape(self.input_size, self.input_size)
+        depth = self.h_output.reshape(self.output_h, self.output_w)
         depth = cv2.resize(depth, (w, h))
 
         with self._lock:
@@ -672,13 +755,17 @@ class DepthEstimator:
         return depth
 
     def enrich_detections(self, detections, depth_map):
-        """Add/update dist_m on each detection using the depth map.
+        """Attach relative depth cues to detections.
 
         Samples a small patch around each bbox center for robustness.
+        Metric object distance is intentionally left to bbox geometry when
+        available; raw monocular depth is not treated as meters here.
         """
         if depth_map is None or len(detections) == 0:
             return
         h, w = depth_map.shape[:2]
+        d_min = float(depth_map.min())
+        d_max = float(depth_map.max())
         for d in detections:
             x1, y1, x2, y2 = d["bbox"]
             # Sample 5x5 patch around bbox center
@@ -689,7 +776,10 @@ class DepthEstimator:
                               max(0, cx-r):min(w, cx+r+1)]
             if patch.size > 0:
                 raw_depth = float(np.median(patch))
-                d["dist_m"] = round(raw_depth * self.depth_scale, 2)
+                d["depth_rel"] = round(raw_depth, 4)
+                if d_max - d_min > 1e-6:
+                    closeness = (raw_depth - d_min) / (d_max - d_min + 1e-6)
+                    d["depth_closeness"] = round(float(closeness), 3)
 
     def colorize(self, depth_map):
         """Convert depth map to BGR colorized image for visualization."""

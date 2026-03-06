@@ -58,6 +58,14 @@ Use this to show short messages when you need words. Max ~16 chars per line.
 - Use "remember" field when asked to remember something
 - Read memory.md for past conversations and remembered things
 
+## Semantic Room Navigation
+- For room-to-room navigation, prefer relationships between learned elements over raw distance estimates.
+- Identify a doorway by what is near it from the current room and by what is visible just inside it.
+- Before crossing a doorway, look through it and infer what room is beyond it, like a human checking a room before entering.
+- When guiding toward a room such as the kitchen, use cues like nearby doorway landmarks, visible appliances, floor transitions, and objects just beyond the opening.
+- After a successful room reach, reorganize memory: update what defines the room, what marks its entrance, and what doorway relationships lead into it.
+- Use persisted room/transition knowledge in `rooms.json`, `room_graph.json`, and `topo_map.json` when it is available.
+
 ## Hardware Notes
 - 12V boost converter damaged — motors work at reduced power
 - ESP32 via WiFi AP (192.168.4.1)
