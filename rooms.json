@@ -1,6 +1,6 @@
 {
-  "current_room": "living_room",
-  "current_confidence": 0.55,
+  "current_room": "office",
+  "current_confidence": 0.95,
   "rooms": [
     {
       "name": "office",
@@ -62,10 +62,10 @@
         }
       ],
       "nav_hints": "Exit is the doorway with bright hallway light behind the desk area. Go around the chair, not through it.",
-      "last_visited": "2026-03-05 20:41",
-      "visit_count": 216,
-      "last_scene": "Low-angle view inside a cluttered room with yellow walls and wooden flooring. A large wooden cabinet is on the left, and various items including bags and boxes are scattered on the floor in the center and right. The arched doorway target is not visible in this frame.",
-      "last_yolo": "refrigerator(22%) legs(22%) backpack(22%,1.2m)"
+      "last_visited": "2026-03-06 07:34",
+      "visit_count": 306,
+      "last_scene": "Currently in office with yellow walls and wooden floor. Blue basket visible in center-left. Desk area with keyboard and monitor ahead-right. Office chairs obstruct direct forward path. The arched doorway with bright hallway light should be behind/beyond the desk area to the back-right of the office,",
+      "last_yolo": "rover/robot base(78%)"
     },
     {
       "name": "hallway",
@@ -177,10 +177,10 @@
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-05 20:41",
-      "visit_count": 34,
-      "last_scene": "Low-angle view inside the office with yellow walls and wooden floor. A large open wooden cabinet is on the left, cluttered with items. The center and right foreground are blocked by a white box, plastic bags, and debris. The arched doorway target is not visible in this frame; likely located behind t",
-      "last_yolo": "car(30%)"
+      "last_visited": "2026-03-06 07:13",
+      "visit_count": 47,
+      "last_scene": "Close-up view of a large white bag with green text and a brown paper bag blocking the immediate path. To the right, there is clear wooden floor space leading towards a couch area in the background. The camera is positioned low near the clutter.",
+      "last_yolo": "nothing"
     },
     {
       "name": "bathroom",

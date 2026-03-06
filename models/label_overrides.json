@@ -33,5 +33,12 @@
   "legs": "chair",
   "person": "legs",
   "dining table": "chair",
-  "desk_chair": "couch"
+  "desk_chair": "couch",
+  "basket_9": "basket_9_false",
+  "basket_8": "basket_8_false",
+  "basket_7": "basket_7_false",
+  "basket_6": "basket_6_false",
+  "basket_5": "basket_5_false",
+  "basket_4": "basket_4_false",
+  "basket_3": "basket_3_false"
 }

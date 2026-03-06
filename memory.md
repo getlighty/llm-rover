@@ -4,3 +4,7 @@
 - User corrected: currently in office, not living room. Saw puppy in wicker basket. [2026-03-05 20:15]
 - Confirmed location: office. Puppy visible in wicker basket on wooden floor. [2026-03-05 20:15]
 - Reversed 1.5m from puppy. Turned toward dark doorway on right. [2026-03-05 20:15]
+- Exited from under desk into open room. Puppy in basket on right side. [2026-03-05 21:43]
+- User updated task: scan the entire house. Currently in office, puppy on right. [2026-03-05 21:44]
+- Scanning house: exiting office toward hallway. [2026-03-05 21:44]
+- Scanning house: passed couch and puppy, heading to hallway. [2026-03-05 21:45]

@@ -745,6 +745,8 @@ class PoseTracker:
         self.body_yaw = 0.0     # degrees, 0 = initial heading
         self.cam_pan = 0.0      # current gimbal pan angle
         self.cam_tilt = 0.0     # current gimbal tilt angle
+        self.x = 0.0            # meters, estimated X position (right)
+        self.y = 0.0            # meters, estimated Y position (forward)
         self._last_wheel_time = None
         self._last_L = 0.0
         self._last_R = 0.0
@@ -776,6 +778,11 @@ class PoseTracker:
                     self.body_yaw += math.degrees(yaw_rate * dt)
                     # Normalize to -180..180
                     self.body_yaw = ((self.body_yaw + 180) % 360) - 180
+                    # Integrate XY position from forward velocity
+                    fwd_speed = (avg_L + avg_R) / 2.0
+                    yaw_rad = math.radians(self.body_yaw)
+                    self.x += fwd_speed * math.sin(yaw_rad) * dt
+                    self.y += fwd_speed * math.cos(yaw_rad) * dt
             self._last_wheel_time = now
             self._last_L = v_left
             self._last_R = v_right
@@ -792,6 +799,8 @@ class PoseTracker:
             "cam_pan": round(self.cam_pan, 1),
             "cam_tilt": round(self.cam_tilt, 1),
             "world_pan": round(self.world_pan, 1),
+            "x": round(self.x, 2),
+            "y": round(self.y, 2),
         }
 
     def after_body_turn(self, degrees):
@@ -801,6 +810,8 @@ class PoseTracker:
     def reset_yaw(self):
         """Reset body yaw to 0 (e.g. after manual repositioning)."""
         self.body_yaw = 0.0
+        self.x = 0.0
+        self.y = 0.0
         self._last_wheel_time = None
 
 
@@ -1079,6 +1090,30 @@ class ClaudeClient:
 
 
 # =====================================================================
+# Dynamic context injection — single source for all LLM providers
+# =====================================================================
+_dynamic_context_sources = []  # list of callables returning str or ""
+
+
+def register_context_source(fn):
+    """Register a callable that returns dynamic context text for LLM prompts."""
+    _dynamic_context_sources.append(fn)
+
+
+def get_dynamic_context():
+    """Build dynamic context string from all registered sources."""
+    parts = []
+    for fn in _dynamic_context_sources:
+        try:
+            text = fn()
+            if text:
+                parts.append(text)
+        except Exception:
+            pass
+    return "\n".join(parts)
+
+
+# =====================================================================
 # Ollama LLM Client (fallback)
 # =====================================================================
 class OllamaClient:
@@ -1112,6 +1147,9 @@ You have a camera. Every message includes the current camera frame as an image.
 You can SEE. When asked "what do you see" or "look around", describe the image.
 When navigating, use the image to make decisions about where to go.
 When you need a different view, move the gimbal first, then on the NEXT message you'll see the new view.""")
+        ctx = get_dynamic_context()
+        if ctx:
+            parts.append(f"\n{ctx}")
         return "\n".join(parts)
 
     def chat(self, user_msg, include_image=True):
@@ -1177,15 +1215,14 @@ When you need a different view, move the gimbal first, then on the NEXT message 
 GROQ_LLM_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
 
 class GroqLLMClient:
-    def __init__(self, api_key, model=GROQ_LLM_MODEL, image_getter=None, motion_getter=None, spatial_map=None,
-                 base_url="https://api.groq.com/openai/v1", vision_llm=None):
+    def __init__(self, api_key, model=GROQ_LLM_MODEL, image_getter=None, motion_getter=None,
+                 base_url="https://api.groq.com/openai/v1", vision_llm=None, **_kw):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.history = []
         self._image_getter = image_getter
         self._motion_getter = motion_getter  # returns JPEG only when motion detected
-        self._spatial_map = spatial_map
         self._vision_llm = vision_llm  # OllamaClient for local vision (two-stage pipeline)
         self._system_prompt = self._build_system_prompt()
 
@@ -1198,10 +1235,9 @@ class GroqLLMClient:
                 if content:
                     lines = content.strip().split("\n")[-20:]
                     parts.append(f"\n## Memory\n" + "\n".join(lines))
-        if self._spatial_map:
-            summary = self._spatial_map.summary()
-            if summary:
-                parts.append(f"\n{summary}")
+        ctx = get_dynamic_context()
+        if ctx:
+            parts.append(f"\n{ctx}")
         return "\n".join(parts)
 
     def _resize_jpeg(self, jpg_bytes, max_dim=320, quality=50):
@@ -1379,13 +1415,12 @@ class GroqLLMClient:
 # Anthropic Claude Client (Messages API)
 # =====================================================================
 class AnthropicClient:
-    def __init__(self, api_key, model="claude-sonnet-4-6", image_getter=None, motion_getter=None, spatial_map=None):
+    def __init__(self, api_key, model="claude-sonnet-4-6", image_getter=None, motion_getter=None, **_kw):
         self.api_key = api_key
         self.model = model
         self.history = []
         self._image_getter = image_getter
         self._motion_getter = motion_getter
-        self._spatial_map = spatial_map
         self._system_prompt = self._build_system_prompt()
 
     def _build_system_prompt(self):
@@ -1396,10 +1431,9 @@ class AnthropicClient:
                 if content:
                     lines = content.strip().split("\n")[-20:]
                     parts.append(f"\n## Memory\n" + "\n".join(lines))
-        if self._spatial_map:
-            summary = self._spatial_map.summary()
-            if summary:
-                parts.append(f"\n{summary}")
+        ctx = get_dynamic_context()
+        if ctx:
+            parts.append(f"\n{ctx}")
         return "\n".join(parts)
 
     def _build_image_content(self, jpg_bytes):
@@ -1505,14 +1539,13 @@ class GeminiClient:
     """Google Gemini via OpenAI-compatible endpoint. Native vision support."""
 
     def __init__(self, api_key, model=GEMINI_MODEL, image_getter=None,
-                 motion_getter=None, spatial_map=None):
+                 motion_getter=None, **_kw):
         self.api_key = api_key
         self.model = model
         self.base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
         self.history = []
         self._image_getter = image_getter
         self._motion_getter = motion_getter
-        self._spatial_map = spatial_map
         self._system_prompt = self._build_system_prompt()
 
     def _build_system_prompt(self):
@@ -1523,10 +1556,9 @@ class GeminiClient:
                 if content:
                     lines = content.strip().split("\n")[-20:]
                     parts.append(f"\n## Memory\n" + "\n".join(lines))
-        if self._spatial_map:
-            summary = self._spatial_map.summary()
-            if summary:
-                parts.append(f"\n{summary}")
+        ctx = get_dynamic_context()
+        if ctx:
+            parts.append(f"\n{ctx}")
         return "\n".join(parts)
 
     def _resize_jpeg(self, jpg_bytes, max_dim=512, quality=60):
@@ -1686,6 +1718,7 @@ class HumanTracker:
         self._llm_vision_fn = None  # chat_with_image(prompt, jpeg_bytes) -> str
         self._llm_hint_cooldown = 0  # throttle LLM calls during scan
         self._spatial_map = None     # SpatialMap reference (set from main)
+        self._room_map = None        # RoomMap reference (set from main)
         self._pose = None            # PoseTracker reference (set from main)
         self._track_history = []     # recent LLM tracking decisions for context
         self.yolo_detector = None    # LocalDetector for YOLO overlay (set from main)
@@ -1728,6 +1761,15 @@ class HumanTracker:
                     try:
                         self.yolo_detector.detect(frame)
                         self.yolo_detector.draw(frame)
+                        # Feed detections into room map every 30th frame (~1/s)
+                        if (frame_count % 30 == 0 and
+                                self._room_map is not None and
+                                self.yolo_detector.last_detections):
+                            self._room_map.record(
+                                self.yolo_detector.last_detections,
+                                self._pose.x, self._pose.y,
+                                self._pose.body_yaw,
+                                self._pose.cam_pan, self._pose.cam_tilt)
                     except Exception:
                         pass
                 _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -2920,8 +2962,18 @@ def main():
     LABEL_OVERRIDES = {}
     spatial_map = SpatialMap()
 
+    # --- Room Map (3D descriptive spatial map) ---
+    from room_map import RoomMap
+    room_map = RoomMap()
+    print(f"[room_map] Initialized ({room_map.object_count()} objects loaded)")
+
     # --- Pose Tracker ---
     pose = PoseTracker()
+
+    # --- Register dynamic context sources for all LLM providers ---
+    register_context_source(lambda: spatial_map.summary())
+    register_context_source(lambda: room_map.describe_room(
+        pose.x, pose.y, pose.body_yaw))
     rover._on_command = pose.on_command
     print(f"[pose] Tracker active (wheelbase={PoseTracker.WHEELBASE}m)")
 
@@ -2983,12 +3035,19 @@ def main():
             rover.send({"T": 132, "IO4": 80, "IO5": 120})
 
     def _light_manager_loop():
-        """Background thread: check ambient light every 10s."""
+        """Background thread: check ambient light every 10s, save room map every 30s."""
+        _save_counter = 0
         while running:
             try:
                 _check_ambient_light()
             except Exception:
                 pass
+            _save_counter += 1
+            if _save_counter % 3 == 0:  # every 30s
+                try:
+                    room_map.save()
+                except Exception:
+                    pass
             time.sleep(10)
 
     import numpy as np
@@ -3003,7 +3062,7 @@ def main():
         print("[error] GEMINI_API_KEY not set. Add it to .env or environment.")
         sys.exit(1)
     llm = GeminiClient(GEMINI_API_KEY, model, image_getter=tracker.get_jpeg,
-                       motion_getter=tracker.get_motion_jpeg, spatial_map=spatial_map)
+                       motion_getter=tracker.get_motion_jpeg)
     # Quick connectivity test
     try:
         r = requests.post(
@@ -3038,6 +3097,7 @@ def main():
         return r.json()["choices"][0]["message"]["content"]
     tracker._llm_vision_fn = _tracker_vision
     tracker._spatial_map = spatial_map
+    tracker._room_map = room_map
     tracker._pose = pose
     tracker.yolo_detector = local_detector
     print(f"[tracker] LLM-guided tracking enabled ({model})")
@@ -3377,7 +3437,7 @@ def main():
     MAX_OBSERVE_ROUNDS = 5
 
     def _map_objects(parsed):
-        """Extract objects from LLM response and store in spatial map."""
+        """Extract objects from LLM response and store in spatial + room maps."""
         if not parsed:
             return
         objects = parsed.get("objects", [])
@@ -3387,6 +3447,11 @@ def main():
             wp = pose.body_yaw + pan
             spatial_map.update(objects, wp, tilt)
             print(f"[spatial] Mapped at world_pan={wp:.1f}, tilt={tilt}: {objects}")
+            # Also feed into room map with YOLO distance data if available
+            if local_detector and local_detector.last_detections:
+                room_map.record(local_detector.last_detections,
+                                pose.x, pose.y, pose.body_yaw,
+                                pose.cam_pan, pose.cam_tilt)
 
     def observation_loop(initial_parsed, original_input):
         """Execute commands with visual feedback. LLM sees camera after each step."""
@@ -3863,6 +3928,7 @@ def main():
         llm_vision_fn=_tracker_vision, parse_fn=parse_llm_response,
         pose=pose, voice_fn=voice.speak if voice else None,
         emergency_event=emergency_event,
+        room_map=room_map,
     )
     print(f"[nav] Navigator ready (yolo={'ON' if local_detector else 'OFF'})")
 
@@ -4048,6 +4114,7 @@ def main():
                     "tracker": tracker.status,
                     "speed_scale": rover.speed_scale,
                     "spatial_objects": len(spatial_map._map),
+                    "room_map_objects": room_map.object_count(),
                 }
                 return json.dumps(status)
 

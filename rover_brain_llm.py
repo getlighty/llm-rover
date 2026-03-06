@@ -593,6 +593,21 @@ class Camera:
                             except Exception:
                                 pass
 
+                        # Feed into room map (~1/sec)
+                        if (hasattr(self, '_room_map') and self._room_map
+                                and hasattr(self, '_nav_pose') and self._nav_pose
+                                and dets):
+                            self._rm_counter = getattr(self, '_rm_counter', 0) + 1
+                            if self._rm_counter >= 10:  # every 10th detection = ~1/s
+                                self._rm_counter = 0
+                                try:
+                                    p = self._nav_pose
+                                    self._room_map.record(
+                                        dets, p.x, p.y, p.body_yaw,
+                                        p.cam_pan, p.cam_tilt)
+                                except Exception:
+                                    pass
+
                         # Additive scanning: merge with persistent detections
                         now = time.time()
                         current_names = {d["name"] for d in dets}
@@ -2925,11 +2940,20 @@ def _orchestrated_navigate(nav_target, prior_history=None):
         prior_ctx = ("PREVIOUS ATTEMPT FAILED: "
                      + "; ".join(prior_history[-5:])
                      + "\nPlan a DIFFERENT route.")
+    # Room map context for route planning
+    _rm_json = None
+    if nav.room_map:
+        rx = nav.pose.x if hasattr(nav.pose, 'x') else 0
+        ry = nav.pose.y if hasattr(nav.pose, 'y') else 0
+        yaw = nav.pose.body_yaw if hasattr(nav.pose, 'body_yaw') else 0
+        _rm_json = nav.room_map.room_json(rx, ry, yaw)
+
     plan = orchestrator.plan_route(
         nav_target, jpeg_bytes=jpeg,
         exploration_summary=(explore_summary +
                              ("\n" + prior_ctx if prior_ctx else "")),
-        log_fn=log_event)
+        log_fn=log_event,
+        room_map_json=_rm_json)
 
     log_event("plan",
               f"[plan] {len(plan.steps)} steps for '{nav_target}'")
@@ -2977,8 +3001,15 @@ def _orchestrated_navigate(nav_target, prior_history=None):
         # Orchestrator always evaluates — it decides when the task is done
         # (executor's "arrived" is just input, not the final word)
         eval_jpeg = nav.tracker.get_jpeg()
+        # Refresh room map for evaluation
+        if nav.room_map:
+            rx = nav.pose.x if hasattr(nav.pose, 'x') else 0
+            ry = nav.pose.y if hasattr(nav.pose, 'y') else 0
+            yaw = nav.pose.body_yaw if hasattr(nav.pose, 'body_yaw') else 0
+            _rm_json = nav.room_map.room_json(rx, ry, yaw)
         decision = orchestrator.evaluate_step(
-            plan, result, jpeg_bytes=eval_jpeg, log_fn=log_event)
+            plan, result, jpeg_bytes=eval_jpeg, log_fn=log_event,
+            room_map_json=_rm_json)
 
         action = decision.get("decision", "continue" if result.success else "abort")
 
@@ -3068,6 +3099,9 @@ def _orchestrated_navigate(nav_target, prior_history=None):
 
     # All steps exhausted without explicit success/abort
     log_event("plan", f"[plan] All steps exhausted for '{nav_target}'")
+    # Save room map after navigation
+    if nav.room_map:
+        nav.room_map.save()
     return {"reached": False, "history": plan.history}
 
 
@@ -3231,6 +3265,11 @@ def main():
         except Exception as _eg_err:
             print(f"[nav] Exploration grid unavailable: {_eg_err}")
 
+        # Room map — 3D descriptive spatial map of objects
+        from room_map import RoomMap
+        _room_map = RoomMap()
+        log_event("system", f"RoomMap active ({_room_map.object_count()} objects loaded)")
+
         _navigator = Navigator(
             rover=ser, detector=cam.detector, tracker=cam,
             llm_vision_fn=_nav_vision_fn, parse_fn=_nav_parse_fn,
@@ -3238,9 +3277,15 @@ def main():
             emergency_event=stop_event,
             exploration_grid=_exploration_grid,
             log_fn=log_event,
+            room_map=_room_map,
+            yolo_correction_fn=_apply_yolo_corrections,
         )
+        # Expose room map + pose to camera for detection recording
+        cam._room_map = _room_map
+        cam._nav_pose = _nav_pose
         log_event("system", f"Navigator active (yolo={'ON' if cam.detector else 'OFF'}"
-                  f", exploration={'ON' if _exploration_grid else 'OFF'})")
+                  f", exploration={'ON' if _exploration_grid else 'OFF'}"
+                  f", room_map={_room_map.object_count()} objects)")
 
         # Vector room scanner (LLM-estimated distances + sizes).
         try:
@@ -3400,8 +3445,9 @@ def main():
                 plan_active.set()
                 stop_event.clear()
 
-                # For search: try scan first
-                if is_search:
+                # Search-only mode: just find, don't drive
+                search_only = is_search and not is_nav and "go " not in text_lower_strip
+                if search_only:
                     log_event("plan",
                               f"Navigator: searching for '{nav_target}'")
                     direction = _navigator.search(nav_target)
@@ -3414,23 +3460,16 @@ def main():
                               f"Navigator: '{nav_target}' not visible, "
                               f"exploring")
 
-                # Orchestrated navigation with retry
+                # Reactive navigation — look → decide → drive → repeat
                 log_event("plan",
-                          f"Navigator: orchestrated nav to '{nav_target}'")
-                result = _orchestrated_navigate(nav_target)
-                if not result["reached"] and not stop_event.is_set():
-                    log_event("plan",
-                              f"Navigator: first attempt failed, "
-                              f"retrying with new plan")
-                    result = _orchestrated_navigate(
-                        nav_target,
-                        prior_history=result["history"])
+                          f"Navigator: reactive nav to '{nav_target}'")
+                reached = _navigator.navigate_reactive(nav_target)
 
                 plan_active.clear()
                 stop_event.clear()
                 log_event("plan",
                     f"Navigator: "
-                    f"{'reached' if result['reached'] else 'could not reach'}"
+                    f"{'reached' if reached else 'could not reach'}"
                     f" '{nav_target}'")
                 continue
 

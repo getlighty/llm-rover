@@ -77,6 +77,9 @@ OBSERVATION_MAX_TURNS = 2
 MAX_OBSERVATIONS = 20
 MAX_WAYPOINTS = 30          # safety limit on shoot-and-go iterations
 MAX_STUCK_EVENTS = 3
+AREA_STUCK_RADIUS = 0.6     # meters — if rover hasn't moved this far in N waypoints, it's area-stuck
+AREA_STUCK_WAYPOINTS = 8    # check displacement every N waypoints
+LLM_429_BACKOFF_S = 5.0     # seconds to wait after a 429 rate limit
 MAX_SUBTASK_DEPTH = 3
 SUBTASK_WAYPOINT_BUDGET = 10  # pop subtask if no progress after this many waypoints
 
@@ -97,6 +100,8 @@ NAV_IGNORE_CLASSES = {
     # Background furniture (above ground / not in collision path)
     "couch", "bed", "dining table", "tv", "laptop", "monitor",
     "clock", "wall_clock",
+    # People and animals (not ground obstacles for a low rover)
+    "person", "cat", "dog",
     # Common false positives from ground-level wide-angle view
     "skateboard", "surfboard", "snowboard", "sports ball", "frisbee",
     "kite", "baseball bat", "baseball glove", "tennis racket",
@@ -111,6 +116,8 @@ NAV_IGNORE_CLASSES = {
     # Mapped labels that are false positives
     "router", "plant_stem", "cables", "multimeter", "tools",
 }
+# Dynamic ignore set — LLM-confirmed false positives during this session
+_nav_learned_ignore = set()
 ROVER_WIDTH_M = 0.26        # body width for corridor checks
 
 SCAN_POSITIONS = [
@@ -178,7 +185,8 @@ class Navigator:
 
     def __init__(self, rover, detector, tracker, llm_vision_fn, parse_fn,
                  pose, voice_fn=None, emergency_event=None,
-                 exploration_grid=None, log_fn=None):
+                 exploration_grid=None, log_fn=None, room_map=None,
+                 yolo_correction_fn=None):
         self.rover = rover
         self.detector = detector
         self.tracker = tracker
@@ -189,6 +197,8 @@ class Navigator:
         self.emergency = emergency_event
         self.exploration = exploration_grid
         self._log_fn = log_fn  # callable(category, message) for web UI
+        self.room_map = room_map  # RoomMap for 3D object positions
+        self._yolo_correction_fn = yolo_correction_fn  # callable(dict) for LLM corrections
         self.observations = deque(maxlen=MAX_OBSERVATIONS)
         self._body_turns_since_start = 0
         self._subtask_stack = []
@@ -235,6 +245,13 @@ class Navigator:
         image_stuck_count = 0   # consecutive image-unchanged drives
         prefetch_future = None  # background LLM call
         llm_pool = ThreadPoolExecutor(max_workers=1)
+        self._consecutive_429s = 0
+
+        # Position-based stuck detection
+        _checkpoint_x = self.pose.x if hasattr(self.pose, 'x') else 0
+        _checkpoint_y = self.pose.y if hasattr(self.pose, 'y') else 0
+        _checkpoint_wp = 0
+        _area_escape_count = 0
 
         # Panoramic scan — or directed scan when plan provides context
         if not plan_context:
@@ -254,6 +271,35 @@ class Navigator:
             effective = self._current_subtask() or target
             self._log(f"Waypoint {wp}: goal='{effective}'"
                   + (f" (subtask of '{target}')" if effective != target else ""))
+
+            # 0. Position-based area stuck detection
+            if wp - _checkpoint_wp >= AREA_STUCK_WAYPOINTS:
+                cur_x = self.pose.x if hasattr(self.pose, 'x') else 0
+                cur_y = self.pose.y if hasattr(self.pose, 'y') else 0
+                displacement = math.sqrt(
+                    (cur_x - _checkpoint_x)**2 + (cur_y - _checkpoint_y)**2)
+                if displacement < AREA_STUCK_RADIUS:
+                    _area_escape_count += 1
+                    self._log(f"AREA STUCK: moved only {displacement:.2f}m in "
+                              f"{AREA_STUCK_WAYPOINTS} waypoints "
+                              f"(escape #{_area_escape_count})")
+                    if _area_escape_count >= 3:
+                        self._log("Area stuck 3x — giving up on this step")
+                        self._store_step_result(False,
+                            f"area_stuck ({displacement:.1f}m in "
+                            f"{AREA_STUCK_WAYPOINTS}wp)", wp + 1)
+                        llm_pool.shutdown(wait=False)
+                        return False
+                    # Big escape: reverse 0.5m, turn 90° away from last heading
+                    self._area_escape()
+                    prefetch_future = None
+                    total_rotation = 0
+                    consecutive_turns = 0
+                else:
+                    _area_escape_count = max(0, _area_escape_count - 1)
+                _checkpoint_x = cur_x
+                _checkpoint_y = cur_y
+                _checkpoint_wp = wp
 
             # 1. Align body to gimbal heading
             self._align_body()
@@ -670,6 +716,201 @@ class Navigator:
         """Search only (no drive).  Returns direction dict or None."""
         return self._search(target)
 
+    def navigate_reactive(self, goal, max_steps=40):
+        """Reactive navigation: look → decide → drive → repeat.
+
+        No pre-planned route. Each step the LLM sees the camera and decides:
+        - Which direction has the clearest path toward the goal
+        - How far to drive
+        - Whether we've arrived
+
+        Returns True if arrived, False if gave up.
+        """
+        self._nav_target = goal
+        self._plan_context = ""
+        self._plan = None
+        self._subtask_stack = []
+        self._consecutive_429s = 0
+
+        checkpoint_x = self.pose.x if hasattr(self.pose, 'x') else 0
+        checkpoint_y = self.pose.y if hasattr(self.pose, 'y') else 0
+        checkpoint_step = 0
+        area_escapes = 0
+
+        room_ctx = ""
+        if self.room_map:
+            rx = self.pose.x if hasattr(self.pose, 'x') else 0
+            ry = self.pose.y if hasattr(self.pose, 'y') else 0
+            yaw = self.pose.body_yaw if hasattr(self.pose, 'body_yaw') else 0
+            data = self.room_map.room_json(rx, ry, yaw, max_objects=8)
+            if data:
+                room_ctx = f"ROOM_MAP: {json.dumps(data)}\n"
+
+        self._log(f"Reactive nav to '{goal}' (max {max_steps} steps)")
+        consecutive_turns = 0
+        _prev_jpeg = None         # for image variance stuck detection
+        _img_same_count = 0       # consecutive similar images
+
+        for step in range(max_steps):
+            if self._aborted():
+                self._log("Reactive nav aborted")
+                return False
+
+            # Area stuck check every 6 steps
+            if step - checkpoint_step >= 6 and step > 0:
+                cx = self.pose.x if hasattr(self.pose, 'x') else 0
+                cy = self.pose.y if hasattr(self.pose, 'y') else 0
+                disp = math.sqrt((cx - checkpoint_x)**2 +
+                                 (cy - checkpoint_y)**2)
+                if disp < AREA_STUCK_RADIUS:
+                    area_escapes += 1
+                    self._log(f"AREA STUCK: {disp:.2f}m in 6 steps "
+                              f"(escape #{area_escapes})")
+                    if area_escapes >= 3:
+                        self._log("Giving up — stuck 3 times")
+                        self._say("I can't find a way out")
+                        return False
+                    self._area_escape()
+                checkpoint_x, checkpoint_y = cx, cy
+                checkpoint_step = step
+
+            # Refresh room map context every 5 steps
+            if step % 5 == 0 and self.room_map:
+                rx = self.pose.x if hasattr(self.pose, 'x') else 0
+                ry = self.pose.y if hasattr(self.pose, 'y') else 0
+                yaw = self.pose.body_yaw if hasattr(self.pose, 'body_yaw') else 0
+                data = self.room_map.room_json(rx, ry, yaw, max_objects=8)
+                if data:
+                    room_ctx = f"ROOM_MAP: {json.dumps(data)}\n"
+
+            # Get current view
+            self._move_gimbal(0, 0)
+            time.sleep(GIMBAL_SETTLE_S)
+            jpeg = self._get_annotated_jpeg()
+            if not jpeg:
+                time.sleep(0.5)
+                continue
+
+            # Get YOLO + depth info
+            dets, yolo_summary, _ = self._get_detections()
+            depth_map = (self.tracker.get_depth_map()
+                         if hasattr(self.tracker, 'get_depth_map') else None)
+            clear_dist = self._estimate_clear_distance(
+                depth_map, dets) if depth_map is not None else None
+            depth_info = (f"Depth: {clear_dist:.1f}m clear ahead.\n"
+                          if clear_dist else "")
+
+            prompt = (
+                f"I'm a small ground rover (26cm wide, 22mm ground clearance) "
+                f"navigating indoors. Goal: '{goal}'.\n"
+                f"Step {step+1}/{max_steps}. "
+                f"YOLO detections: {yolo_summary}\n"
+                f"{depth_info}"
+                f"{room_ctx}"
+                f"Look at this image. Pick the BEST action:\n"
+                f"- 'drive': drive toward goal. Set angle (-30 to +30) and "
+                f"distance (0.3-2.0m). Pick the clearest path.\n"
+                f"- 'turn': rotate to face a better direction. "
+                f"Set degrees (-180 to +180).\n"
+                f"- 'arrived': I'm at or inside the goal.\n\n"
+                f"YOLO labels are often WRONG. If any YOLO label is incorrect, "
+                f"add 'yolo_corrections' to fix them. Use '_false' for "
+                f"hallucinated objects, or the correct name.\n"
+                f"Reply ONLY JSON:\n"
+                f'{{"scene": "brief description", '
+                f'"action": "drive"|"turn"|"arrived", '
+                f'"angle": <drive angle degrees>, '
+                f'"distance": <meters>, '
+                f'"turn_degrees": <degrees if turning>, '
+                f'"reason": "why", '
+                f'"yolo_corrections": {{"wrong_label": "correct_or__false"}}}}'
+            )
+
+            result = self._llm_call(prompt, jpeg)
+            if result is None:
+                # LLM unavailable — drive forward cautiously
+                self._log(f"Step {step+1}: LLM unavailable, blind 0.3m")
+                self._blind_drive(0.3, 0)
+                continue
+
+            action = result.get("action", "drive")
+            scene = result.get("scene", "")
+            reason = result.get("reason", "")
+            self._log(f"Step {step+1}: {scene[:80]} → {action} ({reason[:60]})")
+
+            # Process YOLO corrections from LLM
+            yolo_corr = result.get("yolo_corrections")
+            if isinstance(yolo_corr, dict) and yolo_corr:
+                for wrong, correct in yolo_corr.items():
+                    if correct == "_false":
+                        _nav_learned_ignore.add(wrong.lower().strip())
+                        self._log(f"YOLO ignore: '{wrong}' (LLM says false)")
+                if self._yolo_correction_fn:
+                    self._yolo_correction_fn(yolo_corr)
+
+            # Image variance stuck detection
+            if _prev_jpeg and jpeg:
+                if not _frame_changed(_prev_jpeg, jpeg, 0.10):
+                    _img_same_count += 1
+                    if _img_same_count >= 4:
+                        self._log(f"IMAGE STUCK: scene unchanged for "
+                                  f"{_img_same_count} steps — escaping")
+                        self._area_escape()
+                        _img_same_count = 0
+                        _prev_jpeg = None
+                        consecutive_turns = 0
+                        continue
+                else:
+                    _img_same_count = 0
+            _prev_jpeg = jpeg
+
+            # Feed into room map
+            if (self.room_map and self.detector and
+                    self.detector.last_detections):
+                self.room_map.record(
+                    self.detector.last_detections,
+                    self.pose.x if hasattr(self.pose, 'x') else 0,
+                    self.pose.y if hasattr(self.pose, 'y') else 0,
+                    self.pose.body_yaw, self.pose.cam_pan,
+                    self.pose.cam_tilt)
+
+            if action == "arrived":
+                self._log(f"Arrived at '{goal}'!")
+                self._say(f"Reached {goal}")
+                return True
+
+            elif action == "turn":
+                consecutive_turns += 1
+                if consecutive_turns >= 3:
+                    # Force a drive — turning in circles
+                    self._log("3 consecutive turns — forcing drive 0.5m")
+                    consecutive_turns = 0
+                    self._blind_drive(0.5, 0)
+                else:
+                    degrees = int(result.get("turn_degrees", 0))
+                    if abs(degrees) > 5:
+                        self._spin_body(degrees)
+                        self._move_gimbal(0, 0)
+
+            elif action == "drive":
+                consecutive_turns = 0
+                angle = int(result.get("angle", 0))
+                dist = float(result.get("distance", 0.5))
+                dist = max(0.3, min(MAX_CLEAR_DIST, dist))
+                if clear_dist is not None:
+                    dist = min(dist, clear_dist * DRIVE_FRACTION)
+                    dist = max(0.3, dist)
+                drive_result = self._blind_drive(dist, angle)
+                if drive_result in ("obstacle", "stuck"):
+                    if self._llm_verify_obstacle():
+                        self._recover_stuck(goal)
+                    else:
+                        self._log("YOLO ghost — continuing")
+
+        self._log(f"Max steps ({max_steps}) reached")
+        self._say("Couldn't reach it")
+        return False
+
     def _store_step_result(self, success, reason, waypoints_used):
         """Build and store a StepResult for the orchestrator to read."""
         explore_summary = ""
@@ -1021,7 +1262,7 @@ class Navigator:
                     path_center = 0.5 + angle_shift
                     for d in dets:
                         # Skip classes that aren't real ground-level obstacles
-                        if d["name"] in NAV_IGNORE_CLASSES:
+                        if d["name"] in NAV_IGNORE_CLASSES or d["name"] in _nav_learned_ignore:
                             continue
                         # Correct for fisheye distortion
                         real_cx = _fisheye_cx(d["cx"])
@@ -1285,6 +1526,20 @@ class Navigator:
 
         room_ctx = room_context.format_room_clues()
 
+        # 3D room map context — structured JSON for navigation
+        room_map_ctx = ""
+        if self.room_map:
+            rx = self.pose.x if hasattr(self.pose, 'x') else 0
+            ry = self.pose.y if hasattr(self.pose, 'y') else 0
+            yaw = self.pose.body_yaw if hasattr(self.pose, 'body_yaw') else 0
+            nav_data = self.room_map.nav_json(target, rx, ry, yaw)
+            if nav_data:
+                room_map_ctx = f"TARGET_MAP: {json.dumps(nav_data)}\n"
+            else:
+                room_data = self.room_map.room_json(rx, ry, yaw, max_objects=10)
+                if room_data:
+                    room_map_ctx = f"ROOM_MAP: {json.dumps(room_data)}\n"
+
         if has_plan:
             strategy = (
                 f"FOCUS on reaching your CURRENT STEP target. "
@@ -1337,6 +1592,7 @@ class Navigator:
             f"{depth_info}"
             f"{explore_ctx}"
             f"{room_ctx}"
+            f"{room_map_ctx}"
             f"{mem}\n\n"
             f"{strategy}\n"
             f"Reply ONLY JSON:\n"
@@ -1349,13 +1605,16 @@ class Navigator:
             f'"turn_degrees": <number if turning>, '
             f'"subtask": "<specific spatial goal>", '
             f'"subtask_reason": "<why>", '
-            f'"subtask_achieved": false}}\n'
+            f'"subtask_achieved": false, '
+            f'"yolo_corrections": {{"wrong_label": "correct_or__false"}}}}\n'
             f'For drive_distance: I have obstacle avoidance and encoder-measured stopping. '
             f'If the path ahead is clear, drive the full distance (up to 2.0m). '
             f'If cluttered or uncertain, keep it short (0.3-0.5m).\n'
             f'Use "arrived" when the target fills most of the frame or '
             f'you are at/inside it (doorway, room, area). '
-            f'Use "approach_target" only for YOLO-detectable objects.'
+            f'Use "approach_target" only for YOLO-detectable objects.\n'
+            f'If any YOLO label is wrong, add yolo_corrections. '
+            f'Use "_false" for hallucinations.'
         )
         result = self._llm_call(prompt, jpeg)
         if result:
@@ -1367,6 +1626,24 @@ class Navigator:
                     "open_space": "center" if result.get("action") == "drive_forward" else "none"
                 })
                 room_name, _ = room_context.get_current_room(scene, yolo_summary)
+                # Process YOLO corrections from waypoint LLM
+                yolo_corr = result.get("yolo_corrections")
+                if isinstance(yolo_corr, dict) and yolo_corr:
+                    for wrong, correct in yolo_corr.items():
+                        if correct == "_false":
+                            _nav_learned_ignore.add(wrong.lower().strip())
+                            self._log(f"YOLO ignore: '{wrong}' (LLM says false)")
+                    if self._yolo_correction_fn:
+                        self._yolo_correction_fn(yolo_corr)
+                # Feed YOLO detections into room map
+                if (self.room_map and self.detector and
+                        self.detector.last_detections):
+                    self.room_map.record(
+                        self.detector.last_detections,
+                        self.pose.x if hasattr(self.pose, 'x') else 0,
+                        self.pose.y if hasattr(self.pose, 'y') else 0,
+                        self.pose.body_yaw, self.pose.cam_pan,
+                        self.pose.cam_tilt)
                 # Log to journey if plan is active
                 if getattr(self, '_plan', None) is not None:
                     heading = (self.pose.body_yaw
@@ -1423,7 +1700,7 @@ class Navigator:
                     for d in dets:
                         if d is target_det:
                             continue
-                        if d["name"] in NAV_IGNORE_CLASSES:
+                        if d["name"] in NAV_IGNORE_CLASSES or d["name"] in _nav_learned_ignore:
                             continue
                         in_path = 0.15 < d["cx"] < 0.85
                         close = (d["bw"] > 0.30 or
@@ -1553,6 +1830,28 @@ class Navigator:
 
     # ── Stuck Recovery ───────────────────────────────────────────────────
 
+    def _area_escape(self):
+        """Emergency escape when stuck in the same area for many waypoints.
+        Backs up significantly, turns 120° to find a completely different path."""
+        self._log("AREA ESCAPE: reversing 0.5m and turning 120°")
+        self._stop_wheels()
+        self._move_gimbal(0, 0)
+        time.sleep(0.2)
+
+        # Reverse 0.5m
+        self.rover.send({"T": 1, "L": 0.12, "R": 0.12})
+        time.sleep(3.0)
+        self._stop_wheels()
+        time.sleep(0.3)
+
+        # Turn 120° (alternating direction each escape)
+        escape_dir = 120 if (getattr(self, '_escape_dir', 1) > 0) else -120
+        self._escape_dir = -getattr(self, '_escape_dir', 1)
+        self._spin_body(escape_dir)
+        self._move_gimbal(0, 0)
+        time.sleep(0.3)
+        self._subtask_stack.clear()
+
     def _recover_stuck(self, target, encoder_stuck=False):
         """Back off, then gimbal-scan for clear path.
         Only looks down to diagnose if encoder_stuck=True (wheels physically stalled).
@@ -1584,11 +1883,11 @@ class Navigator:
         else:
             self._log("Recovering — backing up and scanning...")
 
-        # 2. Reverse slowly to create clearance
+        # 2. Reverse to create clearance (further than before)
         self._move_gimbal(0, 0)
-        self._log("Backing off...")
-        self.rover.send({"T": 1, "L": -0.10, "R": -0.10})
-        time.sleep(0.8)
+        self._log("Backing off 0.3m...")
+        self.rover.send({"T": 1, "L": 0.10, "R": 0.10})
+        time.sleep(2.0)
         self._stop_wheels()
         time.sleep(0.2)
 
@@ -1720,9 +2019,18 @@ class Navigator:
         full_prompt = f"TASK: {task_json}\n\n{prompt}"
         try:
             raw = self.llm_vision(full_prompt, jpeg)
+            self._consecutive_429s = 0
             return self.parse(raw)
         except Exception as e:
-            self._log(f"LLM call error: {e}")
+            err_str = str(e)
+            if "429" in err_str or "Too Many Requests" in err_str:
+                self._consecutive_429s = getattr(self, '_consecutive_429s', 0) + 1
+                wait = min(LLM_429_BACKOFF_S * self._consecutive_429s, 15.0)
+                self._log(f"Rate limited (429), waiting {wait:.0f}s "
+                          f"(#{self._consecutive_429s})")
+                time.sleep(wait)
+            else:
+                self._log(f"LLM call error: {e}")
             return None
 
     def _get_detections(self):

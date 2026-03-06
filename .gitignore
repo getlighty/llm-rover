@@ -13,6 +13,7 @@ models/*.tflite
 *.pt
 *.onnx
 spatial_map.json
+room_map.json
 learned_commands.json
 calibration_points.txt
 notes.txt

@@ -330,7 +330,8 @@ Respond with ONLY valid JSON:
  "route_reasoning": "1-2 sentence route description"}}"""
 
 
-def plan_route(task, jpeg_bytes=None, exploration_summary="", log_fn=None):
+def plan_route(task, jpeg_bytes=None, exploration_summary="", log_fn=None,
+               room_map_json=None):
     """Break a navigation task into spatial steps. Returns NavigationPlan.
 
     Makes 1 vision LLM call. Falls back to single-step plan on failure.
@@ -343,6 +344,8 @@ def plan_route(task, jpeg_bytes=None, exploration_summary="", log_fn=None):
             lessons_block += f"- {l['lesson']}\n"
 
     user_text = f'Navigation task: "{task}"\n'
+    if room_map_json:
+        user_text += f"\nROOM_MAP: {json.dumps(room_map_json)}\n"
     if exploration_summary:
         user_text += f"\nExploration grid:\n{exploration_summary}\n"
     if lessons_block:
@@ -415,7 +418,8 @@ Only include "retry_hint" if decision is "retry".
 If a step failed due to budget exhaustion ("budget" in reason), prefer "replan" with higher waypoint_budget values (up to 30) rather than "abort". The rover may just need more waypoints to navigate around obstacles. You can also simplify the remaining steps or pick a more direct route."""
 
 
-def evaluate_step(plan, result, jpeg_bytes=None, log_fn=None):
+def evaluate_step(plan, result, jpeg_bytes=None, log_fn=None,
+                   room_map_json=None):
     """Evaluate a completed step and decide next action. Returns decision dict.
 
     Makes 1 LLM call. Falls back to simple logic if budget exhausted or LLM fails.
@@ -441,6 +445,8 @@ def evaluate_step(plan, result, jpeg_bytes=None, log_fn=None):
         f"Scene: {result.final_scene}\n"
         f"YOLO: {result.final_yolo}\n"
     )
+    if room_map_json:
+        user_text += f"ROOM_MAP: {json.dumps(room_map_json)}\n"
     if journey:
         user_text += f"\n{journey}\n"
     if result.exploration_summary:

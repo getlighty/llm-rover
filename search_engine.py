@@ -153,7 +153,7 @@ class SearchEngine:
 
     def __init__(self, rover, tracker, pose, spatial_map,
                  llm_vision_fn, parse_fn, voice_fn=None, prompts=None,
-                 detector=None, emergency_event=None):
+                 detector=None, emergency_event=None, room_map=None):
         """
         Args:
             rover: Serial command sender (rover.send(json_dict))
@@ -177,6 +177,7 @@ class SearchEngine:
         self.prompts = prompts or {}
         self.detector = detector
         self._emergency = emergency_event
+        self.room_map = room_map
 
     def _stopped(self):
         return self._emergency is not None and self._emergency.is_set()
@@ -459,6 +460,13 @@ class SearchEngine:
                 wp = round(self.pose.world_pan, 1)
                 self.spatial_map.update(objects, wp, tilt)
                 print(f"[search] Mapped at world_pan={wp}°: {objects}")
+                # Feed YOLO detections (with distances) into room map
+                if self.room_map and self.detector and self.detector.last_detections:
+                    self.room_map.record(
+                        self.detector.last_detections,
+                        self.pose.x if hasattr(self.pose, 'x') else 0,
+                        self.pose.y if hasattr(self.pose, 'y') else 0,
+                        self.pose.body_yaw, self.pose.cam_pan, self.pose.cam_tilt)
 
             # Check if found — either LLM flagged it, or target appears
             # in the objects list (LLM sometimes lists it but forgets to
