@@ -51,7 +51,7 @@ INITIAL_TILT = 30         # tilt up to see target (rover is low to the ground)
 MIN_BW = 0.03             # ignore tiny detections (noise)
 
 # ── Bump detection via accelerometer ──────────────────────────────────
-BUMP_ACCEL_THRESHOLD = 1.2  # accel magnitude spike indicating a bump/collision
+BUMP_ACCEL_THRESHOLD = 0.5  # accel magnitude spike indicating a bump/collision
 BUMP_COOLDOWN_S = 2.0       # ignore bumps for this long after realignment
 
 # ── Histogram identity tracking ──────────────────────────────────────

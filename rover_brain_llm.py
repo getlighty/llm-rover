@@ -251,16 +251,20 @@ def _xai_tool_dispatch(fn_name, args):
             from follow_target import follow
             target = args.get("target", "person")
             duration = float(args.get("duration", 60))
-            result = follow(target, ser, cam, _xai_refs.get("imu"),
-                            duration=duration,
-                            stop_event=stop_event,
-                            log_fn=lambda msg: log_event("follow", msg),
-                            voice=_xai_voice, floor_nav=_floor_nav,
-                            recovery_fn=_follow_recovery,
-                            speak_fn=lambda t: _speak_async(t,
-                                _xai_refs.get("spk"), _xai_refs.get("mic_card")),
-                            llm_fn=_follow_llm_fn,
-                            label_override_fn=_follow_label_override)
+            cam._follow_mode = True
+            try:
+                result = follow(target, ser, cam, _xai_refs.get("imu"),
+                                duration=duration,
+                                stop_event=stop_event,
+                                log_fn=lambda msg: log_event("follow", msg),
+                                voice=_xai_voice, floor_nav=_floor_nav,
+                                recovery_fn=_follow_recovery,
+                                speak_fn=lambda t: _speak_async(t,
+                                    _xai_refs.get("spk"), _xai_refs.get("mic_card")),
+                                llm_fn=_follow_llm_fn,
+                                label_override_fn=_follow_label_override)
+            finally:
+                cam._follow_mode = False
             return json.dumps(result)
 
         elif fn_name == "correct_label":
@@ -575,11 +579,12 @@ class Camera:
             _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             raw_jpeg = buf.tobytes()
 
-            # Run YOLO + depth every 3rd frame (~10 Hz with TRT)
+            # Run YOLO + depth (every frame if following, else every 3rd)
             overlay_jpeg = None
             if self.detector is not None and yolo_enabled:
                 self._det_frame_count += 1
-                if self._det_frame_count >= 3:
+                _det_interval = 1 if getattr(self, '_follow_mode', False) else 3
+                if self._det_frame_count >= _det_interval:
                     self._det_frame_count = 0
                     try:
                         dets = self.detector.detect(frame)
@@ -3722,17 +3727,21 @@ def main():
             if not yolo_enabled:
                 _set_yolo_enabled(True)
                 log_event("follow", "Auto-enabled YOLO for follow mode")
+            cam._follow_mode = True  # YOLO every frame during follow
             _speak("Following.", spk, mic_card)
             from follow_target import follow
-            result = follow(_ftarget, ser, cam, _xai_refs.get("imu"),
-                            duration=300,
-                            stop_event=stop_event,
-                            log_fn=lambda msg: log_event("follow", msg),
-                            voice=_xai_voice, floor_nav=None,
-                            recovery_fn=_follow_recovery,
-                            speak_fn=lambda t: _speak(t, spk, mic_card),
-                            llm_fn=_follow_llm_fn,
-                            label_override_fn=_follow_label_override)
+            try:
+                result = follow(_ftarget, ser, cam, _xai_refs.get("imu"),
+                                duration=300,
+                                stop_event=stop_event,
+                                log_fn=lambda msg: log_event("follow", msg),
+                                voice=_xai_voice, floor_nav=None,
+                                recovery_fn=_follow_recovery,
+                                speak_fn=lambda t: _speak(t, spk, mic_card),
+                                llm_fn=_follow_llm_fn,
+                                label_override_fn=_follow_label_override)
+            finally:
+                cam._follow_mode = False  # restore 3-frame interval
             log_event("follow", f"Done: {result.get('status')}")
             plan_active.clear()
             stop_event.clear()
