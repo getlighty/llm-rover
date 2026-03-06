@@ -755,13 +755,18 @@ class Navigator:
         cues_str = ", ".join(cues) if cues else "a doorway"
         verify_str = ", ".join(verify_feats[:3]) if verify_feats else ""
 
-        self._log(f"Leg: find [{cues_str}] → {target_room}")
-
-        # Entry scan: do a panoramic sweep to find the target doorway
+        azimuth_hint = ""
         if azimuth is not None:
-            # Look in the expected direction first
-            self._move_gimbal(int(azimuth), 0)
-            time.sleep(GIMBAL_SETTLE_S)
+            azimuth_hint = (f"The doorway is approximately {azimuth}° from "
+                            f"your entry heading "
+                            f"({'right' if azimuth > 0 else 'left'}). ")
+        self._log(f"Leg: find [{cues_str}] → {target_room}"
+                  + (f" (azimuth {azimuth}°)" if azimuth else ""))
+
+        # Entry orientation: turn body to face the expected doorway direction
+        if azimuth is not None and abs(azimuth) > 15:
+            self._log(f"Orienting body {azimuth}° toward expected doorway")
+            self._spin_body(int(azimuth))
         self._move_gimbal(0, 0)
         time.sleep(GIMBAL_SETTLE_S)
 
@@ -843,6 +848,7 @@ class Navigator:
                 f"navigating indoors. Step {step+1}/{max_steps}.\n\n"
                 f"MISSION: Find and cross through: {cues_str}\n"
                 f"GUIDANCE: {exit_hint}\n"
+                f"{azimuth_hint}"
                 f"{'ROOM HINT: ' + room_hints + chr(10) if room_hints else ''}"
                 f"After crossing, I should see: {expected_floor} floor"
                 f"{', ' + verify_str if verify_str else ''}.\n\n"
