@@ -56,11 +56,17 @@ class VectorRoomScanner:
         with self._lock:
             return dict(self._last_scan)
 
-    def scan_room(self, task_text="", body_yaw_deg=0.0):
-        """Run a panoramic gimbal scan and return vector map state."""
+    def scan_room(self, task_text="", body_yaw_deg=0.0, find_target=None):
+        """Run a panoramic gimbal scan and return vector map state.
+
+        Args:
+            find_target: if set, stop sweep early when this object/landmark
+                         is spotted. Sets 'target_found' in returned state.
+        """
         t0 = time.time()
         observations = []
         scene_bits = []
+        target_found_pan = None
 
         self._log("Room scan: starting vector sweep")
         for pan in SCAN_PANS:
@@ -88,6 +94,19 @@ class VectorRoomScanner:
                 if obs:
                     observations.append(obs)
 
+            # Early exit: target spotted during sweep
+            if find_target and target_found_pan is None:
+                target_lower = find_target.lower()
+                scene_lower = scene.lower()
+                elem_names = " ".join(
+                    str(e.get("name", "")).lower() for e in elems)
+                if (target_lower in scene_lower or
+                        target_lower in elem_names):
+                    target_found_pan = pan
+                    self._log(f"Room scan: TARGET '{find_target}' spotted "
+                              f"at pan={pan}° — stopping sweep")
+                    break
+
         # Return gimbal to center after scan.
         self.rover.send({"T": 133, "X": 0, "Y": 0, "SPD": 250, "ACC": 20})
 
@@ -104,6 +123,9 @@ class VectorRoomScanner:
             "room_guess": room_guess,
             "candidates": candidates,
         }
+        if target_found_pan is not None:
+            state["target_found"] = find_target
+            state["target_pan"] = target_found_pan
         with self._lock:
             self._last_scan = state
 

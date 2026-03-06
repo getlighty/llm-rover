@@ -1716,13 +1716,19 @@ def _get_map_state():
         }
 
 
-def _run_task_room_scan(task_text):
-    """Run an LLM vector room scan and persist latest state for UI + routing."""
+def _run_task_room_scan(task_text, find_target=None):
+    """Run an LLM vector room scan and persist latest state for UI + routing.
+
+    Args:
+        find_target: if set, stop sweep early when this object is spotted.
+    """
     global _room_scan_state
     if not _room_scanner:
         return None
     heading_deg = math.degrees(_rover_heading)
-    state = _room_scanner.scan_room(task_text=task_text, body_yaw_deg=heading_deg)
+    state = _room_scanner.scan_room(task_text=task_text,
+                                     body_yaw_deg=heading_deg,
+                                     find_target=find_target)
     with _map_lock:
         _room_scan_state = dict(state)
     return state
@@ -1841,7 +1847,7 @@ def voice_thread(mic_dev, mic_card):
             if kind == "override" and _last_task:
                 try:
                     import requests as _req
-                    r = _req.post("http://localhost:11434/api/chat",
+                    r = _req.post("http://192.168.0.126:11434/api/chat",
                         json={"model": "qwen3.5:9b",
                               "messages": [
                                   {"role": "system",
@@ -3575,11 +3581,16 @@ def main():
             _last_task_target = _extract_target(text)
 
         # Task-level room scan: build vector map + best room guess before acting.
+        # Pass extracted target so scan can stop early if it spots it.
+        _scan_target_found = None
+        _scan_target_pan = None
+        nav_target = _extract_target(text)
         if _room_scanner:
             scan_skip = {"stop", "halt", "cancel", "never mind", "nevermind", "abort"}
             if text.strip().lower() not in scan_skip:
                 try:
-                    scan_state = _run_task_room_scan(text)
+                    scan_state = _run_task_room_scan(
+                        text, find_target=nav_target)
                     if scan_state:
                         guess = scan_state.get("room_guess", {})
                         g_name = guess.get("name") or "unknown"
@@ -3587,11 +3598,17 @@ def main():
                         log_event("room",
                                   f"Best room guess for task '{text}': "
                                   f"{g_name} ({g_conf:.2f})")
+                        # Check if target was spotted during sweep
+                        if scan_state.get("target_found"):
+                            _scan_target_found = scan_state["target_found"]
+                            _scan_target_pan = scan_state.get("target_pan", 0)
+                            log_event("room",
+                                f"Target '{_scan_target_found}' spotted "
+                                f"at pan={_scan_target_pan}° during scan!")
                 except Exception as e:
                     log_event("error", f"Room vector scan failed: {e}")
 
         # ── Navigator shortcut for movement commands ──
-        nav_target = _extract_target(text)
         if _navigator:
             text_lower_strip = text.strip().lower()
             is_nav = any(text_lower_strip.startswith(p) for p in (
@@ -3622,6 +3639,25 @@ def main():
                     log_event("plan",
                               f"Navigator: '{nav_target}' not visible, "
                               f"exploring")
+
+                # If target was spotted during room scan, orient and go directly
+                if _scan_target_found and _scan_target_pan is not None:
+                    log_event("plan",
+                        f"Target '{_scan_target_found}' visible at "
+                        f"pan={_scan_target_pan}° — driving directly")
+                    # Turn body to face where we saw it
+                    _navigator._spin_body(int(_scan_target_pan))
+                    _navigator._move_gimbal(0, 0)
+                    import time as _t; _t.sleep(0.3)
+                    # Navigate reactively toward it
+                    reached = _navigator.navigate_reactive(nav_target)
+                    plan_active.clear()
+                    stop_event.clear()
+                    log_event("plan",
+                        f"Navigator: "
+                        f"{'reached' if reached else 'could not reach'}"
+                        f" '{nav_target}'")
+                    continue
 
                 # Topological navigation: plan route through room graph,
                 # then navigate each leg (transition) reactively
