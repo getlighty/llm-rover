@@ -3622,9 +3622,46 @@ def main():
         )
         _is_direct = any(text_lower.startswith(p) for p in _direct_prefixes)
         if _is_direct:
-            # Follow mode gets its own shortcut below; everything else
-            # goes straight to run_plan (the LLM) — no sweep needed.
-            if not (_clean_words(text) & {"follow", "following"}):
+            # Follow mode — skip sweep, go straight to YOLO follow
+            if _clean_words(text) & {"follow", "following"}:
+                import string as _string
+                words = [w.strip(_string.punctuation) for w in text.strip().lower().split()]
+                words = [w for w in words if w]
+                _filler = {"the", "that", "this", "a", "an", "my"}
+                _rest = [w for w in words if w not in {"follow", "following"} | _filler]
+                _ftarget = "person"
+                if _rest:
+                    w0 = _rest[0]
+                    if w0 in ("me", "person", "human", "owner", "man", "woman"):
+                        _ftarget = "person"
+                    else:
+                        _ftarget = w0
+                plan_active.set()
+                stop_event.clear()
+                log_event("follow", f"YOLO follow: {text} (target={_ftarget})")
+                if not yolo_enabled:
+                    _set_yolo_enabled(True)
+                cam._follow_mode = True
+                _speak("Following.", spk, mic_card)
+                from follow_target import follow
+                try:
+                    result = follow(_ftarget, ser, cam, _shared_refs.get("imu"),
+                                    duration=300,
+                                    stop_event=stop_event,
+                                    log_fn=lambda msg: log_event("follow", msg),
+                                    voice=_xai_voice, floor_nav=None,
+                                    recovery_fn=_follow_recovery,
+                                    speak_fn=lambda t: _speak(t, spk, mic_card),
+                                    llm_fn=_follow_llm_fn,
+                                    label_override_fn=_follow_label_override)
+                finally:
+                    cam._follow_mode = False
+                log_event("follow", f"Done: {result.get('status')}")
+                plan_active.clear()
+                stop_event.clear()
+                continue
+            else:
+                # Everything else goes straight to LLM — no sweep
                 log_event("plan", f"Direct: {text}")
                 result = run_plan(text, ser, cam, spk, mic_card)
                 if result is None:
@@ -3725,48 +3762,6 @@ def main():
                     f"{'reached' if reached else 'could not reach'}"
                     f" '{nav_target}'")
                 continue
-
-        # ── Follow shortcut: bypass LLM, pure YOLO visual servo ──
-        _follow_words = {"follow", "following"}
-        if _follow_words & _clean_words(text):
-            plan_active.set()
-            stop_event.clear()
-            # Extract target from text: "follow me" → "person", "follow the dog" → "dog"
-            import string as _string
-            words = [w.strip(_string.punctuation) for w in text.strip().lower().split()]
-            words = [w for w in words if w]  # drop empty after stripping
-            _filler = {"the", "that", "this", "a", "an", "my"}
-            _rest = [w for w in words if w not in {"follow", "following"} | _filler]
-            _ftarget = "person"
-            if _rest:
-                w0 = _rest[0]
-                if w0 in ("me", "person", "human", "owner", "man", "woman"):
-                    _ftarget = "person"
-                else:
-                    _ftarget = w0
-            log_event("follow", f"YOLO follow mode: {text} (target={_ftarget})")
-            if not yolo_enabled:
-                _set_yolo_enabled(True)
-                log_event("follow", "Auto-enabled YOLO for follow mode")
-            cam._follow_mode = True  # YOLO every frame during follow
-            _speak("Following.", spk, mic_card)
-            from follow_target import follow
-            try:
-                result = follow(_ftarget, ser, cam, _shared_refs.get("imu"),
-                                duration=300,
-                                stop_event=stop_event,
-                                log_fn=lambda msg: log_event("follow", msg),
-                                voice=_xai_voice, floor_nav=None,
-                                recovery_fn=_follow_recovery,
-                                speak_fn=lambda t: _speak(t, spk, mic_card),
-                                llm_fn=_follow_llm_fn,
-                                label_override_fn=_follow_label_override)
-            finally:
-                cam._follow_mode = False  # restore 3-frame interval
-            log_event("follow", f"Done: {result.get('status')}")
-            plan_active.clear()
-            stop_event.clear()
-            continue
 
         log_event("plan", f"Starting: {text}")
         result = run_plan(text, ser, cam, spk, mic_card)
