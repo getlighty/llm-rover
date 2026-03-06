@@ -716,6 +716,249 @@ class Navigator:
         """Search only (no drive).  Returns direction dict or None."""
         return self._search(target)
 
+    def navigate_leg(self, instruction, room_check_fn=None, max_steps=30):
+        """Navigate one leg: find and cross a specific transition (doorway).
+
+        The navigator pursues the transition described in `instruction` until
+        `room_check_fn` confirms the room has changed, or max_steps is reached.
+
+        Args:
+            instruction: dict from TopoMap.leg_instruction() with keys:
+                - target_transition: id of doorway
+                - visual_cues: what the doorway looks like
+                - exit_hint: human-readable guidance
+                - expected_floor: floor type after crossing
+                - verify_features: room features to check after crossing
+                - expected_azimuth_deg: optional heading hint
+                - room_nav_hints: optional hints for navigating current room
+            room_check_fn: callable(scene_text) -> (room_id, confidence)
+                           If room changes, leg is complete.
+            max_steps: safety limit
+
+        Returns:
+            (success: bool, new_room: str or None, scene: str)
+        """
+        self._nav_target = instruction.get("exit_hint", "doorway")
+        self._plan_context = ""
+        self._plan = None
+        self._subtask_stack = []
+        self._consecutive_429s = 0
+
+        cues = instruction.get("visual_cues", [])
+        exit_hint = instruction.get("exit_hint", "find the exit")
+        target_room = instruction.get("target_room", "next room")
+        expected_floor = instruction.get("expected_floor", "")
+        azimuth = instruction.get("expected_azimuth_deg")
+        room_hints = instruction.get("room_nav_hints", "")
+        verify_feats = instruction.get("verify_features", [])
+
+        cues_str = ", ".join(cues) if cues else "a doorway"
+        verify_str = ", ".join(verify_feats[:3]) if verify_feats else ""
+
+        self._log(f"Leg: find [{cues_str}] → {target_room}")
+
+        # Entry scan: do a panoramic sweep to find the target doorway
+        if azimuth is not None:
+            # Look in the expected direction first
+            self._move_gimbal(int(azimuth), 0)
+            time.sleep(GIMBAL_SETTLE_S)
+        self._move_gimbal(0, 0)
+        time.sleep(GIMBAL_SETTLE_S)
+
+        checkpoint_x = self.pose.x if hasattr(self.pose, 'x') else 0
+        checkpoint_y = self.pose.y if hasattr(self.pose, 'y') else 0
+        checkpoint_step = 0
+        area_escapes = 0
+        consecutive_turns = 0
+        _prev_jpeg = None
+        _img_same_count = 0
+        last_scene = ""
+        obstacle_info = ""  # feedback from last drive
+
+        for step in range(max_steps):
+            if self._aborted():
+                return False, None, last_scene
+
+            # Area stuck check every 6 steps
+            if step - checkpoint_step >= 6 and step > 0:
+                cx = self.pose.x if hasattr(self.pose, 'x') else 0
+                cy = self.pose.y if hasattr(self.pose, 'y') else 0
+                disp = math.sqrt((cx - checkpoint_x)**2 +
+                                 (cy - checkpoint_y)**2)
+                if disp < AREA_STUCK_RADIUS:
+                    area_escapes += 1
+                    self._log(f"AREA STUCK in leg ({disp:.2f}m, "
+                              f"escape #{area_escapes})")
+                    if area_escapes >= 3:
+                        return False, None, last_scene
+                    self._area_escape()
+                    consecutive_turns = 0
+                checkpoint_x, checkpoint_y = cx, cy
+                checkpoint_step = step
+
+            # Get current view
+            self._move_gimbal(0, 0)
+            time.sleep(GIMBAL_SETTLE_S)
+            jpeg = self._get_annotated_jpeg()
+            if not jpeg:
+                time.sleep(0.5)
+                continue
+
+            # Image variance stuck detection
+            if _prev_jpeg and jpeg:
+                if not _frame_changed(_prev_jpeg, jpeg, 0.10):
+                    _img_same_count += 1
+                    if _img_same_count >= 4:
+                        self._log("IMAGE STUCK in leg — escaping")
+                        self._area_escape()
+                        _img_same_count = 0
+                        _prev_jpeg = None
+                        consecutive_turns = 0
+                        continue
+                else:
+                    _img_same_count = 0
+            _prev_jpeg = jpeg
+
+            # YOLO + depth
+            dets, yolo_summary, _ = self._get_detections()
+            depth_map = (self.tracker.get_depth_map()
+                         if hasattr(self.tracker, 'get_depth_map') else None)
+            clear_dist = self._estimate_clear_distance(
+                depth_map, dets) if depth_map is not None else None
+            depth_info = (f"Depth: {clear_dist:.1f}m clear ahead.\n"
+                          if clear_dist else "")
+
+            # Room map context
+            room_ctx = ""
+            if self.room_map:
+                rx = self.pose.x if hasattr(self.pose, 'x') else 0
+                ry = self.pose.y if hasattr(self.pose, 'y') else 0
+                yaw = self.pose.body_yaw if hasattr(self.pose, 'body_yaw') else 0
+                data = self.room_map.room_json(rx, ry, yaw, max_objects=6)
+                if data:
+                    room_ctx = f"ROOM_MAP: {json.dumps(data)}\n"
+
+            prompt = (
+                f"I'm a small ground rover (26cm wide, 22mm ground clearance) "
+                f"navigating indoors. Step {step+1}/{max_steps}.\n\n"
+                f"MISSION: Find and cross through: {cues_str}\n"
+                f"GUIDANCE: {exit_hint}\n"
+                f"{'ROOM HINT: ' + room_hints + chr(10) if room_hints else ''}"
+                f"After crossing, I should see: {expected_floor} floor"
+                f"{', ' + verify_str if verify_str else ''}.\n\n"
+                f"{obstacle_info}"
+                f"YOLO: {yolo_summary}\n"
+                f"{depth_info}"
+                f"{room_ctx}\n"
+                f"Look at this image. Have I crossed the doorway yet?\n"
+                f"Actions:\n"
+                f"- 'drive': drive toward the doorway. angle=-30..+30, "
+                f"distance=0.3-2.0m. Keep distance SHORT (0.3-0.5m) "
+                f"when obstacles are nearby.\n"
+                f"- 'turn': rotate to face the doorway. degrees=-180..+180\n"
+                f"- 'crossed': I have passed through the doorway and am "
+                f"now in the next room.\n\n"
+                f"Reply ONLY JSON:\n"
+                f'{{"scene": "what you see", '
+                f'"action": "drive"|"turn"|"crossed", '
+                f'"angle": <drive angle>, "distance": <meters>, '
+                f'"turn_degrees": <degrees>, '
+                f'"confidence": <0-1 how sure about crossing>, '
+                f'"reason": "why", '
+                f'"yolo_corrections": {{"wrong": "correct_or__false"}}}}'
+            )
+            obstacle_info = ""  # clear after use
+
+            result = self._llm_call(prompt, jpeg)
+            if result is None:
+                self._log(f"Leg step {step+1}: LLM unavailable, blind 0.3m")
+                self._blind_drive(0.3, 0)
+                continue
+
+            action = result.get("action", "drive")
+            scene = result.get("scene", "")
+            reason = result.get("reason", "")
+            last_scene = scene
+            self._log(f"Leg step {step+1}: {scene[:70]} → {action} "
+                      f"({reason[:50]})")
+
+            # YOLO corrections
+            yolo_corr = result.get("yolo_corrections")
+            if isinstance(yolo_corr, dict) and yolo_corr:
+                for wrong, correct in yolo_corr.items():
+                    if correct == "_false":
+                        _nav_learned_ignore.add(wrong.lower().strip())
+                        self._log(f"YOLO ignore: '{wrong}'")
+                if self._yolo_correction_fn:
+                    self._yolo_correction_fn(yolo_corr)
+
+            # Room map update
+            if (self.room_map and self.detector and
+                    self.detector.last_detections):
+                self.room_map.record(
+                    self.detector.last_detections,
+                    self.pose.x if hasattr(self.pose, 'x') else 0,
+                    self.pose.y if hasattr(self.pose, 'y') else 0,
+                    self.pose.body_yaw, self.pose.cam_pan,
+                    self.pose.cam_tilt)
+
+            if action == "crossed":
+                conf = result.get("confidence", 0.5)
+                self._log(f"Leg crossed! conf={conf:.2f}")
+                # Verify with room_check_fn if available
+                if room_check_fn and conf < 0.9:
+                    room_id, room_conf = room_check_fn(scene)
+                    if room_id == target_room:
+                        self._log(f"Room verified: {room_id} ({room_conf})")
+                        return True, room_id, scene
+                    elif room_conf > 0.6:
+                        self._log(f"Wrong room: {room_id} ({room_conf}), "
+                                  f"expected {target_room}")
+                        return False, room_id, scene
+                return True, target_room, scene
+
+            elif action == "turn":
+                consecutive_turns += 1
+                if consecutive_turns >= 3:
+                    self._log("3 turns in leg — forcing drive 0.5m")
+                    consecutive_turns = 0
+                    self._blind_drive(0.5, 0)
+                else:
+                    degrees = int(result.get("turn_degrees", 0))
+                    if abs(degrees) > 5:
+                        self._spin_body(degrees)
+                        self._move_gimbal(0, 0)
+
+            elif action == "drive":
+                consecutive_turns = 0
+                angle = int(result.get("angle", 0))
+                dist = float(result.get("distance", 0.5))
+                dist = max(0.3, min(MAX_CLEAR_DIST, dist))
+                if clear_dist is not None:
+                    dist = min(dist, clear_dist * DRIVE_FRACTION)
+                    dist = max(0.3, dist)
+                drive_result = self._blind_drive(dist, angle)
+                if drive_result in ("obstacle", "stuck"):
+                    obstacle_info = (
+                        f"WARNING: Last drive was BLOCKED by obstacle "
+                        f"at angle {angle}°. Try a DIFFERENT angle or "
+                        f"turn to find a clear path around it.\n")
+                    if self._llm_verify_obstacle():
+                        self._recover_stuck(self._nav_target)
+                    else:
+                        self._log("YOLO ghost — continuing")
+
+            # After each drive, check room change via scene description
+            if room_check_fn and action == "drive" and scene:
+                room_id, room_conf = room_check_fn(scene)
+                if room_id == target_room and room_conf > 0.5:
+                    self._log(f"Room changed to {room_id} ({room_conf}) "
+                              f"— leg complete!")
+                    return True, room_id, scene
+
+        self._log(f"Leg exhausted ({max_steps} steps)")
+        return False, None, last_scene
+
     def navigate_reactive(self, goal, max_steps=40):
         """Reactive navigation: look → decide → drive → repeat.
 
@@ -750,6 +993,7 @@ class Navigator:
         consecutive_turns = 0
         _prev_jpeg = None         # for image variance stuck detection
         _img_same_count = 0       # consecutive similar images
+        obstacle_info = ""
 
         for step in range(max_steps):
             if self._aborted():
@@ -804,12 +1048,13 @@ class Navigator:
                 f"I'm a small ground rover (26cm wide, 22mm ground clearance) "
                 f"navigating indoors. Goal: '{goal}'.\n"
                 f"Step {step+1}/{max_steps}. "
+                f"{obstacle_info}"
                 f"YOLO detections: {yolo_summary}\n"
                 f"{depth_info}"
                 f"{room_ctx}"
                 f"Look at this image. Pick the BEST action:\n"
                 f"- 'drive': drive toward goal. Set angle (-30 to +30) and "
-                f"distance (0.3-2.0m). Pick the clearest path.\n"
+                f"distance (0.3-2.0m). Keep SHORT (0.3-0.5m) near obstacles.\n"
                 f"- 'turn': rotate to face a better direction. "
                 f"Set degrees (-180 to +180).\n"
                 f"- 'arrived': I'm at or inside the goal.\n\n"
@@ -894,6 +1139,7 @@ class Navigator:
 
             elif action == "drive":
                 consecutive_turns = 0
+                obstacle_info = ""
                 angle = int(result.get("angle", 0))
                 dist = float(result.get("distance", 0.5))
                 dist = max(0.3, min(MAX_CLEAR_DIST, dist))
@@ -902,6 +1148,9 @@ class Navigator:
                     dist = max(0.3, dist)
                 drive_result = self._blind_drive(dist, angle)
                 if drive_result in ("obstacle", "stuck"):
+                    obstacle_info = (
+                        f"WARNING: Last drive BLOCKED at angle {angle}°. "
+                        f"Try a DIFFERENT angle to go around.\n")
                     if self._llm_verify_obstacle():
                         self._recover_stuck(goal)
                     else:
@@ -1832,7 +2081,8 @@ class Navigator:
 
     def _area_escape(self):
         """Emergency escape when stuck in the same area for many waypoints.
-        Backs up significantly, turns 120° to find a completely different path."""
+        Backs up significantly, turns to find a different path,
+        then does a quick gimbal sweep to relocate the target."""
         self._log("AREA ESCAPE: reversing 0.5m and turning 120°")
         self._stop_wheels()
         self._move_gimbal(0, 0)
@@ -1851,6 +2101,38 @@ class Navigator:
         self._move_gimbal(0, 0)
         time.sleep(0.3)
         self._subtask_stack.clear()
+
+        # Quick gimbal sweep to relocate target doorway/exit
+        # Check 5 directions, ask LLM which has the exit
+        self._log("Post-escape scan: relocating target")
+        best_pan = 0
+        for pan in [-90, -45, 0, 45, 90]:
+            if self._aborted():
+                break
+            self._move_gimbal(pan, 0)
+            time.sleep(GIMBAL_SETTLE_S)
+        # Ask LLM which direction looks like an exit
+        self._move_gimbal(0, 0)
+        time.sleep(GIMBAL_SETTLE_S)
+        jpeg = self._get_annotated_jpeg()
+        if jpeg:
+            target = getattr(self, '_nav_target', 'exit')
+            result = self._llm_call(
+                f"I just escaped from being stuck. I need to find: "
+                f"'{target}'. Looking at this forward view, which "
+                f"direction should I go? Look for doorways, open space, "
+                f"bright light, or hallway entrances.\n"
+                f"Reply JSON: {{\"best_direction\": <degrees, "
+                f"neg=left, pos=right, 0=ahead>, "
+                f"\"reason\": \"what you see\"}}", jpeg)
+            if result and "best_direction" in result:
+                best_pan = int(result["best_direction"])
+                best_pan = max(-180, min(180, best_pan))
+                self._log(f"Post-escape: face {best_pan}° — "
+                          f"{result.get('reason', '?')[:60]}")
+                if abs(best_pan) > 15:
+                    self._spin_body(best_pan)
+                    self._move_gimbal(0, 0)
 
     def _recover_stuck(self, target, encoder_stuck=False):
         """Back off, then gimbal-scan for clear path.

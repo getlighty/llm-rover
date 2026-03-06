@@ -22,6 +22,7 @@ import numpy as np
 
 # ── Extracted modules ──────────────────────────────────────────────────
 
+import room_context
 import audio
 import imu as imu_mod
 import orchestrator
@@ -2908,7 +2909,156 @@ def _set_killed(val):
         stt_enabled = True
         log_event("system", "Kill switch released — resuming")
 
-# ── Orchestrated Navigation ──────────────────────────────────────────
+# ── Topological Navigation ────────────────────────────────────────────
+
+_topo_map = None  # TopoMap, initialized in main()
+
+
+def _topo_room_check(scene_text):
+    """Check which room the scene describes. Returns (room_id, confidence)."""
+    ranked = room_context.identify_room(scene_text)
+    if ranked and ranked[0][1] > 0:
+        return ranked[0][0], ranked[0][2]
+    return None, 0.0
+
+
+def _topo_navigate(nav_target, stop_event):
+    """Topological navigation: plan route through room graph, execute each leg.
+
+    1. Resolve nav_target to a destination room
+    2. Plan route as sequence of legs (transitions)
+    3. Navigate each leg: find doorway → cross → verify room
+    4. Fall back to reactive nav if no topo route exists
+
+    Returns True if destination reached.
+    """
+    global _topo_map
+    nav = _navigator
+    if not nav or not _topo_map:
+        log_event("plan", "Topo nav unavailable, falling back to reactive")
+        return nav.navigate_reactive(nav_target) if nav else False
+
+    # Resolve target to a room id
+    target_room = None
+    target_lower = nav_target.lower().strip()
+    for room in _topo_map.rooms():
+        if (room.id in target_lower or
+                room.label.lower() in target_lower or
+                target_lower in room.id or
+                target_lower in room.label.lower()):
+            target_room = room.id
+            break
+
+    if not target_room:
+        log_event("plan", f"'{nav_target}' not a known room, "
+                          f"using reactive nav")
+        return nav.navigate_reactive(nav_target)
+
+    # Determine current room
+    from_room = _topo_map.current_room
+    if not from_room:
+        # Try to identify current room from camera
+        jpeg = nav.tracker.get_jpeg()
+        if jpeg:
+            scene_result = nav._llm_call(
+                "Briefly describe this room. What room are you in? "
+                "Mention floor type and key furniture.",
+                jpeg)
+            if scene_result:
+                scene = scene_result.get("scene", str(scene_result))
+                from_room, conf = _topo_room_check(scene)
+                if from_room:
+                    _topo_map.current_room = from_room
+                    _topo_map.current_confidence = conf
+                    log_event("plan", f"Identified starting room: "
+                                      f"{from_room} ({conf})")
+
+    if not from_room:
+        log_event("plan", "Can't determine current room, "
+                          "using reactive nav")
+        return nav.navigate_reactive(nav_target)
+
+    if from_room == target_room:
+        log_event("plan", f"Already in {target_room}!")
+        return True
+
+    # Plan route
+    legs = _topo_map.plan_route(from_room, target_room)
+    if not legs:
+        log_event("plan", f"No topo route from {from_room} to "
+                          f"{target_room}, using reactive nav")
+        return nav.navigate_reactive(nav_target)
+
+    route_str = _topo_map.route_summary(legs)
+    log_event("plan", f"Route: {route_str}")
+
+    # Execute each leg
+    for i, leg in enumerate(legs):
+        if stop_event.is_set():
+            log_event("plan", "Topo nav stopped")
+            return False
+
+        instruction = _topo_map.leg_instruction(leg)
+        log_event("plan", f"Leg {i+1}/{len(legs)}: "
+                          f"{leg.from_room} → {leg.to_room} "
+                          f"via [{leg.transition}]")
+        log_event("plan", f"  Hint: {instruction.get('exit_hint', '')}")
+
+        success, new_room, scene = nav.navigate_leg(
+            instruction,
+            room_check_fn=_topo_room_check,
+        )
+
+        if success:
+            arrived_room = new_room or leg.to_room
+            _topo_map.current_room = arrived_room
+            _topo_map.current_confidence = 0.8
+            log_event("plan", f"Leg {i+1} complete: now in {arrived_room}")
+
+            # Entry verification: panoramic scan to confirm room
+            nav._move_gimbal(0, 0)
+            time.sleep(0.5)
+            jpeg = nav.tracker.get_jpeg()
+            if jpeg:
+                verify = nav._llm_call(
+                    f"I just entered a new room. Describe what you see. "
+                    f"Mention the floor type and key objects.",
+                    jpeg)
+                if verify:
+                    vscene = verify.get("scene", str(verify))
+                    vroom, vconf = _topo_room_check(vscene)
+                    if vroom:
+                        _topo_map.current_room = vroom
+                        _topo_map.current_confidence = vconf
+                        log_event("plan", f"Entry verified: {vroom} "
+                                          f"({vconf})")
+                        if vroom != leg.to_room:
+                            log_event("plan",
+                                f"Wrong room! Expected {leg.to_room}, "
+                                f"got {vroom}")
+                            # Don't abort — the route planner can replan
+        else:
+            log_event("plan", f"Leg {i+1} failed: could not cross "
+                              f"{leg.transition}")
+            # Try reactive nav as fallback for this leg
+            log_event("plan", f"Falling back to reactive nav for "
+                              f"'{leg.to_room}'")
+            reached = nav.navigate_reactive(leg.to_room)
+            if reached:
+                _topo_map.current_room = leg.to_room
+                _topo_map.current_confidence = 0.6
+                log_event("plan", f"Reactive fallback reached {leg.to_room}")
+            else:
+                log_event("plan", f"Could not reach {leg.to_room}")
+                return False
+
+    # Save updated topo map state
+    _topo_map.save()
+    log_event("plan", f"Topo nav complete: arrived at {target_room}")
+    return True
+
+
+# ── Orchestrated Navigation (legacy) ─────────────────────────────────
 
 def _orchestrated_navigate(nav_target, prior_history=None):
     """Orchestrator-led navigation: plan route → step through with navigator.
@@ -3287,6 +3437,19 @@ def main():
                   f", exploration={'ON' if _exploration_grid else 'OFF'}"
                   f", room_map={_room_map.object_count()} objects)")
 
+        # Topological map for room-graph navigation
+        global _topo_map
+        from topo_nav import TopoMap
+        _topo_map = TopoMap()
+        # Sync current room from room_context
+        rc_data = room_context.load_rooms()
+        if rc_data.get("current_room"):
+            _topo_map.current_room = rc_data["current_room"]
+            _topo_map.current_confidence = rc_data.get("current_confidence", 0.5)
+        log_event("system", f"TopoMap active ({len(_topo_map.rooms())} rooms, "
+                  f"{len(_topo_map.transitions())} transitions, "
+                  f"current={_topo_map.current_room})")
+
         # Vector room scanner (LLM-estimated distances + sizes).
         try:
             from room_scanner import VectorRoomScanner
@@ -3460,10 +3623,9 @@ def main():
                               f"Navigator: '{nav_target}' not visible, "
                               f"exploring")
 
-                # Reactive navigation — look → decide → drive → repeat
-                log_event("plan",
-                          f"Navigator: reactive nav to '{nav_target}'")
-                reached = _navigator.navigate_reactive(nav_target)
+                # Topological navigation: plan route through room graph,
+                # then navigate each leg (transition) reactively
+                reached = _topo_navigate(nav_target, stop_event)
 
                 plan_active.clear()
                 stop_event.clear()
