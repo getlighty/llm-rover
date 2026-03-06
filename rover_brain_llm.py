@@ -115,7 +115,7 @@ AVAILABLE_PROVIDERS = {
 
 # ── xAI Realtime voice state (module-level for hot-swap) ──
 _xai_voice = None       # XAIRealtimeVoice instance (or None)
-_xai_refs = {}          # filled by main(): ser, cam, spk, mic_dev, etc.
+_shared_refs = {}          # filled by main(): ser, cam, spk, mic_dev, etc.
 
 
 def _follow_recovery(cam, ser, log_fn):
@@ -153,8 +153,8 @@ def _follow_label_override(yolo_label, correct_label):
 
 def _xai_tool_dispatch(fn_name, args):
     """Route xAI Realtime tool calls to rover hardware."""
-    ser = _xai_refs.get("ser")
-    cam = _xai_refs.get("cam")
+    ser = _shared_refs.get("ser")
+    cam = _shared_refs.get("cam")
     try:
         if fn_name == "send_rover_commands":
             cmds = []
@@ -242,7 +242,7 @@ def _xai_tool_dispatch(fn_name, args):
             duration = float(args.get("duration", 10))
             if not target:
                 return json.dumps({"error": "No target specified"})
-            imu_ref = _xai_refs.get("imu")
+            imu_ref = _shared_refs.get("imu")
             result = track(target, ser, cam, imu_ref, duration=duration,
                            log_fn=lambda msg: log_event("track", msg))
             return json.dumps(result)
@@ -253,14 +253,14 @@ def _xai_tool_dispatch(fn_name, args):
             duration = float(args.get("duration", 60))
             cam._follow_mode = True
             try:
-                result = follow(target, ser, cam, _xai_refs.get("imu"),
+                result = follow(target, ser, cam, _shared_refs.get("imu"),
                                 duration=duration,
                                 stop_event=stop_event,
                                 log_fn=lambda msg: log_event("follow", msg),
                                 voice=_xai_voice, floor_nav=_floor_nav,
                                 recovery_fn=_follow_recovery,
                                 speak_fn=lambda t: _speak_async(t,
-                                    _xai_refs.get("spk"), _xai_refs.get("mic_card")),
+                                    _shared_refs.get("spk"), _shared_refs.get("mic_card")),
                                 llm_fn=_follow_llm_fn,
                                 label_override_fn=_follow_label_override)
             finally:
@@ -294,7 +294,7 @@ def _start_xai_realtime():
     if not xai_api_key:
         log_event("error", "XAI_API_KEY not set in .env")
         return None
-    if not _xai_refs:
+    if not _shared_refs:
         log_event("error", "xAI Realtime: hardware refs not ready (main not started?)")
         return None
     try:
@@ -303,8 +303,8 @@ def _start_xai_realtime():
         from prompts import build_voice_system_prompt
         voice = XAIRealtimeVoice(
             api_key=xai_api_key,
-            mic_device=_xai_refs.get("mic_dev") or "plughw:0,0",
-            playback_device=_xai_refs.get("spk"),
+            mic_device=_shared_refs.get("mic_dev") or "plughw:0,0",
+            playback_device=_shared_refs.get("spk"),
             instructions=build_voice_system_prompt(gimbal_pan_enabled=gimbal_pan_enabled),
             tools=to_openai(),
             tool_dispatch_fn=_xai_tool_dispatch,
@@ -3357,7 +3357,7 @@ def main():
     spk = audio.find_speaker()
 
     # Populate refs for xAI Realtime (allows hot-swap from web UI)
-    _xai_refs.update(ser=ser, cam=cam, spk=spk, mic_dev=mic_dev)
+    _shared_refs.update(ser=ser, cam=cam, spk=spk, mic_dev=mic_dev)
 
     # Initialize Navigator (LLM-centric nav with YOLO fast fallback)
     global _navigator, _room_scanner
@@ -3541,7 +3541,7 @@ def main():
         log_event("error", f"IMU init failed: {e}")
         _imu = None
 
-    _xai_refs["imu"] = _imu
+    _shared_refs["imu"] = _imu
 
     # ── Voltage watchdog thread ──
     threading.Thread(target=_voltage_watchdog, daemon=True,
@@ -3731,7 +3731,7 @@ def main():
             _speak("Following.", spk, mic_card)
             from follow_target import follow
             try:
-                result = follow(_ftarget, ser, cam, _xai_refs.get("imu"),
+                result = follow(_ftarget, ser, cam, _shared_refs.get("imu"),
                                 duration=300,
                                 stop_event=stop_event,
                                 log_fn=lambda msg: log_event("follow", msg),
