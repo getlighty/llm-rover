@@ -3668,8 +3668,8 @@ def main():
                     continue
                 continue
 
-        # Ask LLM whether a sweep is needed before navigation.
-        # Show it the current camera frame + task and let it decide.
+        # Decide whether to sweep before navigation.
+        # Skip if YOLO already sees something relevant (door, target object).
         _scan_target_found = None
         _scan_target_pan = None
         nav_target = _extract_target(text)
@@ -3677,59 +3677,21 @@ def main():
         _scan_find = all_targets[-1] if all_targets else nav_target
 
         if _room_scanner and _navigator:
-            jpeg = cam.get_jpeg() if hasattr(cam, 'get_jpeg') else None
-            need_sweep = True  # default: sweep
-            if jpeg:
-                try:
-                    import base64 as _b64
-                    b64 = _b64.b64encode(jpeg).decode()
-                    model = orchestrator.OLLAMA_MODEL
-                    # Quick LLM call: do you need to look around?
-                    if model.startswith("claude-"):
-                        import requests as _req
-                        r = _req.post("https://api.anthropic.com/v1/messages",
-                            headers={"x-api-key": os.environ.get("ANTHROPIC_API_KEY", ""),
-                                     "anthropic-version": "2023-06-01",
-                                     "content-type": "application/json"},
-                            json={"model": model, "max_tokens": 100,
-                                  "messages": [{"role": "user", "content": [
-                                      {"type": "image", "source": {"type": "base64",
-                                       "media_type": "image/jpeg", "data": b64}},
-                                      {"type": "text", "text":
-                                       f"Task: '{text}'. Can you already see the target "
-                                       f"or the path to it in this image? "
-                                       f"Reply ONLY JSON: "
-                                       f'{{\"need_sweep\": true/false, '
-                                       f'\"reason\": \"brief\"}}'
-                                      }]}]},
-                            timeout=10)
-                        r.raise_for_status()
-                        raw = r.json()["content"][0]["text"]
-                    else:
-                        import requests as _req
-                        r = _req.post(orchestrator.OLLAMA_URL,
-                            json={"model": model, "stream": False,
-                                  "messages": [{"role": "user",
-                                   "content": f"Task: '{text}'. Can you already see "
-                                   f"the target or the path to it in this image? "
-                                   f"Reply ONLY JSON: "
-                                   f'{{\"need_sweep\": true/false, '
-                                   f'\"reason\": \"brief\"}}',
-                                   "images": [b64]}]},
-                            timeout=10)
-                        r.raise_for_status()
-                        raw = r.json().get("message", {}).get("content", "")
-                    # Parse response
-                    import re as _re
-                    m = _re.search(r'\{[^}]+\}', raw)
-                    if m:
-                        decision = json.loads(m.group())
-                        need_sweep = decision.get("need_sweep", True)
-                        reason = decision.get("reason", "")
-                        log_event("room", f"Sweep decision: "
-                                  f"{'YES' if need_sweep else 'SKIP'} — {reason}")
-                except Exception as e:
-                    log_event("room", f"Sweep decision failed ({e}), defaulting to sweep")
+            # Check current YOLO detections — if we see a door or the target, skip sweep
+            need_sweep = True
+            dets, _det_summary, _det_age = cam.get_detections()
+            if dets and _det_age < 2.0:
+                _nav_relevant = {"door", "door_frame", "doorway", "arch",
+                                 "stairs", "hallway", "exit"}
+                det_names = {d["name"].lower() for d in dets}
+                # Target visible in YOLO?
+                if _scan_find and any(_scan_find.lower() in n for n in det_names):
+                    need_sweep = False
+                    log_event("room", f"YOLO sees '{_scan_find}' — skipping sweep")
+                # Door/exit visible?
+                elif det_names & _nav_relevant:
+                    need_sweep = False
+                    log_event("room", f"YOLO sees {det_names & _nav_relevant} — skipping sweep")
 
             if need_sweep:
                 try:
