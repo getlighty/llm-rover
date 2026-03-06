@@ -97,11 +97,25 @@ class VectorRoomScanner:
             # Early exit: target spotted during sweep
             if find_target and target_found_pan is None:
                 target_lower = find_target.lower()
-                scene_lower = scene.lower()
-                elem_names = " ".join(
+                # Check scene description and element names
+                haystack = scene.lower() + " " + " ".join(
                     str(e.get("name", "")).lower() for e in elems)
-                if (target_lower in scene_lower or
-                        target_lower in elem_names):
+                # Direct match
+                found = target_lower in haystack
+                # Also check common synonyms
+                if not found:
+                    synonyms = {
+                        "fridge": ["refrigerator", "fridge"],
+                        "refrigerator": ["fridge", "refrigerator"],
+                        "tv": ["television", "monitor", "screen"],
+                        "couch": ["sofa", "couch"],
+                        "sofa": ["couch", "sofa"],
+                    }
+                    for syn in synonyms.get(target_lower, []):
+                        if syn in haystack:
+                            found = True
+                            break
+                if found:
                     target_found_pan = pan
                     self._log(f"Room scan: TARGET '{find_target}' spotted "
                               f"at pan={pan}° — stopping sweep")

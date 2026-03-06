@@ -2046,6 +2046,31 @@ def _extract_target(text):
         return m.group(1).strip(" .,!?")
     return ""
 
+
+def _extract_all_targets(text):
+    """Extract all targets from a multi-part command.
+
+    "go to the kitchen and find the fridge" → ["kitchen", "fridge"]
+    "find the exit and go to hallway" → ["exit", "hallway"]
+    """
+    lower = text.lower()
+    targets = []
+    # Split on "and then", "then", "and"
+    parts = re.split(r'\s+and\s+then\s+|\s+then\s+|\s+and\s+', lower)
+    for part in parts:
+        part = part.strip()
+        for prefix in ("find the ", "find a ", "find ", "go to the ", "go to ",
+                       "navigate to the ", "navigate to ", "look for the ",
+                       "look for a ", "look for ", "search for the ",
+                       "search for a ", "search for ", "get to the ",
+                       "get to "):
+            if part.startswith(prefix):
+                t = part[len(prefix):].strip(" .,!?")
+                if t:
+                    targets.append(t)
+                break
+    return targets
+
 # Track correction frequency: {("wrong","correct"): count}
 _correction_counts = {}
 _CORRECTION_PERSIST_THRESHOLD = 3  # same correction must be seen N times to persist
@@ -3581,16 +3606,20 @@ def main():
             _last_task_target = _extract_target(text)
 
         # Task-level room scan: build vector map + best room guess before acting.
-        # Pass extracted target so scan can stop early if it spots it.
+        # Pass all targets so scan can stop early if it spots any of them.
         _scan_target_found = None
         _scan_target_pan = None
         nav_target = _extract_target(text)
+        all_targets = _extract_all_targets(text)
+        # Use the last target as the scan find_target (it's usually the
+        # most specific — e.g. "fridge" in "go to kitchen and find fridge")
+        _scan_find = all_targets[-1] if all_targets else nav_target
         if _room_scanner:
             scan_skip = {"stop", "halt", "cancel", "never mind", "nevermind", "abort"}
             if text.strip().lower() not in scan_skip:
                 try:
                     scan_state = _run_task_room_scan(
-                        text, find_target=nav_target)
+                        text, find_target=_scan_find)
                     if scan_state:
                         guess = scan_state.get("room_guess", {})
                         g_name = guess.get("name") or "unknown"
