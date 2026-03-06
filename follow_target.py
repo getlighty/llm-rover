@@ -50,6 +50,10 @@ LOST_TIMEOUT = 3.0        # seconds without detection → callout + spin
 INITIAL_TILT = 30         # tilt up to see target (rover is low to the ground)
 MIN_BW = 0.03             # ignore tiny detections (noise)
 
+# ── Bump detection via accelerometer ──────────────────────────────────
+BUMP_ACCEL_THRESHOLD = 1.2  # accel magnitude spike indicating a bump/collision
+BUMP_COOLDOWN_S = 2.0       # ignore bumps for this long after realignment
+
 # ── Histogram identity tracking ──────────────────────────────────────
 HIST_BINS = 16            # HSV histogram bins per channel
 HIST_SIMILARITY_WEIGHT = 0.3
@@ -174,6 +178,46 @@ def _set_driving(voice, driving):
         pass
 
 
+def _check_bump(imu, ser, log):
+    """Check for bump/collision via accelerometer.
+
+    Reads accel magnitude from IMU poller if available, otherwise
+    tries to read T:1001 directly from serial.
+
+    Returns True if bump detected, False otherwise.
+    """
+    mag = None
+
+    # Try IMU poller first
+    if imu is not None:
+        try:
+            result = imu.check_tilt()
+            if isinstance(result, tuple):
+                status, m = result
+                mag = m
+            elif result == "stop":
+                mag = 99.0  # force bump
+        except Exception:
+            pass
+
+    # Fallback: read accel from serial T:1001 stream
+    if mag is None and ser is not None:
+        try:
+            fb = ser.read_imu() if hasattr(ser, 'read_imu') else None
+            if fb and isinstance(fb, dict):
+                ax = fb.get("ax", 0)
+                ay = fb.get("ay", 0)
+                az = fb.get("az", 0)
+                mag = (ax**2 + ay**2 + az**2) ** 0.5
+        except Exception:
+            pass
+
+    if mag is not None and mag >= BUMP_ACCEL_THRESHOLD:
+        log(f"BUMP detected: accel={mag:.2f}")
+        return True
+    return False
+
+
 def _check_collision(imu, floor_nav, dets, log, target_labels=None):
     """Check for collision via IMU tilt and floor_nav obstacle detection.
     Excludes detections matching target_labels from obstacle check
@@ -182,7 +226,10 @@ def _check_collision(imu, floor_nav, dets, log, target_labels=None):
     if imu is not None:
         try:
             tilt_result = imu.check_tilt()
-            if tilt_result == "stop":
+            if isinstance(tilt_result, tuple) and tilt_result[0] == "stop":
+                log("Collision: IMU accel spike")
+                return "tilt"
+            elif tilt_result == "stop":
                 log("Collision: IMU accel spike")
                 return "tilt"
         except Exception:
@@ -257,9 +304,15 @@ def follow(target, ser, cam, imu, duration=60.0, target_bw=TARGET_BW,
     locked = False
     verified = False
 
+    # Auto-enable YOLO if detector available
+    if hasattr(cam, '_yolo_enabled'):
+        cam._yolo_enabled = True
+        log("YOLO auto-enabled for follow mode")
+
     # Centre gimbal, tilt up to see target
     ser.send({"T": 133, "X": 0, "Y": INITIAL_TILT, "SPD": 200, "ACC": 10})
     time.sleep(0.3)
+    last_bump_time = 0.0  # cooldown tracking
     log(f"Following {target} for {duration}s, target_bw={target_bw}")
 
     try:
@@ -427,6 +480,40 @@ def follow(target, ser, cam, imu, duration=60.0, target_bw=TARGET_BW,
             right = speed - steer
 
             ser.send({"T": 1, "L": round(left, 3), "R": round(right, 3)})
+
+            # ── Bump detection: body hit something while driving ──
+            if (speed != 0.0 and
+                    time.time() - last_bump_time > BUMP_COOLDOWN_S and
+                    _check_bump(imu, ser, log)):
+                last_bump_time = time.time()
+                # Stop wheels immediately
+                ser.send({"T": 1, "L": 0, "R": 0})
+                _set_driving(voice, False)
+
+                # Body realignment: spin body to match gimbal pan,
+                # keeping the camera pointed at the target
+                if abs(pan) > 10:
+                    log(f"Bump! Realigning body {pan:.0f}° to match camera")
+                    # Spin body by current pan angle
+                    body_turn_time = abs(pan) / 200.0  # ~200°/s at turn speed
+                    if pan > 0:
+                        ser.send({"T": 1, "L": 0.30, "R": -0.30})
+                    else:
+                        ser.send({"T": 1, "L": -0.30, "R": 0.30})
+                    time.sleep(body_turn_time)
+                    ser.send({"T": 1, "L": 0, "R": 0})
+                    # Reset gimbal pan to 0 (body now faces where camera was)
+                    pan = 0.0
+                    ser.send({"T": 133, "X": 0, "Y": round(tilt, 1),
+                              "SPD": 300, "ACC": 20})
+                    time.sleep(0.3)
+                    log("Body realigned — resuming follow")
+                else:
+                    log("Bump! Body already aligned, backing up slightly")
+                    ser.send({"T": 1, "L": 0.08, "R": 0.08})
+                    time.sleep(0.5)
+                    ser.send({"T": 1, "L": 0, "R": 0})
+                continue
 
             # Log every ~1s
             frame_num = int(elapsed * LOOP_HZ)

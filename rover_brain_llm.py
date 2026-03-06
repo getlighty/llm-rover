@@ -3525,7 +3525,7 @@ def main():
         imu_poller = imu_mod.IMUPoller(ser, log_fn=log_event)
         if imu_poller.read_once():
             imu_poller.set_heading_offset()
-            log_event("system", f"IMU active: heading={imu_poller._heading_offset:.1f}°, "
+            log_event("system", f"IMU active: "
                       f"accel={imu_poller.state.accel_magnitude:.3f}, "
                       f"voltage={imu_poller.state.voltage:.1f}V")
         else:
@@ -3719,6 +3719,9 @@ def main():
                 else:
                     _ftarget = w0
             log_event("follow", f"YOLO follow mode: {text} (target={_ftarget})")
+            if not yolo_enabled:
+                _set_yolo_enabled(True)
+                log_event("follow", "Auto-enabled YOLO for follow mode")
             _speak("Following.", spk, mic_card)
             from follow_target import follow
             result = follow(_ftarget, ser, cam, _xai_refs.get("imu"),
