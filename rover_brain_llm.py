@@ -1789,7 +1789,7 @@ def classify_interrupt(text):
             return "feedback_negative"
     first_word = re.sub(r'[^\w]', '', text.lower().split()[0]) if text.strip() else ""
     action_starters = {"go", "find", "navigate", "drive", "turn", "look",
-                       "move", "come", "search", "back", "reverse"}
+                       "move", "come", "search", "back", "reverse", "follow"}
     if first_word in action_starters:
         return "override"
     return "inject"
