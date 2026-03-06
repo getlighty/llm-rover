@@ -3669,49 +3669,42 @@ def main():
                 continue
 
         # Decide whether to sweep before navigation.
-        # Skip if YOLO already sees something relevant (door, target object).
-        _scan_target_found = None
-        _scan_target_pan = None
+        # Skip if topo map already has a route (we know where we are and
+        # how to get there — the leg navigator will handle the rest).
         nav_target = _extract_target(text)
         all_targets = _extract_all_targets(text)
-        _scan_find = all_targets[-1] if all_targets else nav_target
 
-        if _room_scanner and _navigator:
-            # Check current YOLO detections — if we see a door or the target, skip sweep
-            need_sweep = True
-            dets, _det_summary, _det_age = cam.get_detections()
-            if dets and _det_age < 2.0:
-                _nav_relevant = {"door", "door_frame", "doorway", "arch",
-                                 "stairs", "hallway", "exit"}
-                det_names = {d["name"].lower() for d in dets}
-                # Target visible in YOLO?
-                if _scan_find and any(_scan_find.lower() in n for n in det_names):
-                    need_sweep = False
-                    log_event("room", f"YOLO sees '{_scan_find}' — skipping sweep")
-                # Door/exit visible?
-                elif det_names & _nav_relevant:
-                    need_sweep = False
-                    log_event("room", f"YOLO sees {det_names & _nav_relevant} — skipping sweep")
+        _has_topo_route = False
+        if _topo_map and _topo_map.current_room:
+            # Check if the target resolves to a known room with a route
+            target_lower = nav_target.lower().strip() if nav_target else ""
+            for room in _topo_map.rooms():
+                if (room.id in target_lower or
+                        room.label.lower() in target_lower or
+                        target_lower in room.id or
+                        target_lower in room.label.lower()):
+                    legs = _topo_map.plan_route(_topo_map.current_room, room.id)
+                    if legs:
+                        _has_topo_route = True
+                        log_event("room", f"Topo route exists "
+                                  f"({_topo_map.current_room}→{room.id}) "
+                                  f"— skipping sweep")
+                    break
 
-            if need_sweep:
-                try:
-                    scan_state = _run_task_room_scan(
-                        text, find_target=_scan_find)
-                    if scan_state:
-                        guess = scan_state.get("room_guess", {})
-                        g_name = guess.get("name") or "unknown"
-                        g_conf = float(guess.get("confidence", 0.0))
-                        log_event("room",
-                                  f"Best room guess for task '{text}': "
-                                  f"{g_name} ({g_conf:.2f})")
-                        if scan_state.get("target_found"):
-                            _scan_target_found = scan_state["target_found"]
-                            _scan_target_pan = scan_state.get("target_pan", 0)
-                            log_event("room",
-                                f"Target '{_scan_target_found}' spotted "
-                                f"at pan={_scan_target_pan}° during scan!")
-                except Exception as e:
-                    log_event("error", f"Room vector scan failed: {e}")
+        if not _has_topo_route and _room_scanner:
+            _scan_find = all_targets[-1] if all_targets else nav_target
+            try:
+                scan_state = _run_task_room_scan(
+                    text, find_target=_scan_find)
+                if scan_state:
+                    guess = scan_state.get("room_guess", {})
+                    g_name = guess.get("name") or "unknown"
+                    g_conf = float(guess.get("confidence", 0.0))
+                    log_event("room",
+                              f"Best room guess for task '{text}': "
+                              f"{g_name} ({g_conf:.2f})")
+            except Exception as e:
+                log_event("error", f"Room vector scan failed: {e}")
 
         # ── Navigator shortcut for movement commands ──
         if _navigator:
@@ -3744,25 +3737,6 @@ def main():
                     log_event("plan",
                               f"Navigator: '{nav_target}' not visible, "
                               f"exploring")
-
-                # If target was spotted during room scan, orient and go directly
-                if _scan_target_found and _scan_target_pan is not None:
-                    log_event("plan",
-                        f"Target '{_scan_target_found}' visible at "
-                        f"pan={_scan_target_pan}° — driving directly")
-                    # Turn body to face where we saw it
-                    _navigator._spin_body(int(_scan_target_pan))
-                    _navigator._move_gimbal(0, 0)
-                    import time as _t; _t.sleep(0.3)
-                    # Navigate reactively toward it
-                    reached = _navigator.navigate_reactive(nav_target)
-                    plan_active.clear()
-                    stop_event.clear()
-                    log_event("plan",
-                        f"Navigator: "
-                        f"{'reached' if reached else 'could not reach'}"
-                        f" '{nav_target}'")
-                    continue
 
                 # Topological navigation: plan route through room graph,
                 # then navigate each leg (transition) reactively
