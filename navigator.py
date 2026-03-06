@@ -2080,144 +2080,140 @@ class Navigator:
     # ── Stuck Recovery ───────────────────────────────────────────────────
 
     def _area_escape(self):
-        """Emergency escape when stuck in the same area for many waypoints.
-        Backs up significantly, turns to find a different path,
-        then does a quick gimbal sweep to relocate the target."""
-        self._log("AREA ESCAPE: reversing 0.5m and turning 120°")
+        """3-point maneuver to escape a stuck area, then relocate target.
+
+        Like a driver doing a 3-point turn:
+          1. Reverse ~0.4m to create space
+          2. Turn ~90° to face a new direction
+          3. Drive forward ~0.5m into open space
+        Then: gimbal sweep + LLM call to reacquire the target doorway.
+        """
+        target = getattr(self, '_nav_target', 'exit')
+        self._log(f"3-POINT ESCAPE: reverse → turn → drive → relocate '{target}'")
         self._stop_wheels()
         self._move_gimbal(0, 0)
         time.sleep(0.2)
 
-        # Reverse 0.5m
-        self.rover.send({"T": 1, "L": 0.12, "R": 0.12})
-        time.sleep(3.0)
+        # 1. Reverse ~0.4m
+        self._log("  1/3: reversing 0.4m")
+        self.rover.send({"T": 1, "L": 0.10, "R": 0.10})
+        time.sleep(2.5)
         self._stop_wheels()
         time.sleep(0.3)
 
-        # Turn 120° (alternating direction each escape)
-        escape_dir = 120 if (getattr(self, '_escape_dir', 1) > 0) else -120
+        # 2. Turn ~90° (alternating direction)
+        escape_dir = 90 if (getattr(self, '_escape_dir', 1) > 0) else -90
         self._escape_dir = -getattr(self, '_escape_dir', 1)
+        self._log(f"  2/3: turning {escape_dir}°")
         self._spin_body(escape_dir)
         self._move_gimbal(0, 0)
         time.sleep(0.3)
+
+        # 3. Drive forward ~0.5m into hopefully open space
+        self._log("  3/3: driving 0.5m forward")
+        self._blind_drive(0.5, 0)
+        self._stop_wheels()
+        time.sleep(0.3)
+
         self._subtask_stack.clear()
 
-        # Quick gimbal sweep to relocate target doorway/exit
-        # Check 5 directions, ask LLM which has the exit
-        self._log("Post-escape scan: relocating target")
-        best_pan = 0
-        for pan in [-90, -45, 0, 45, 90]:
-            if self._aborted():
-                break
-            self._move_gimbal(pan, 0)
-            time.sleep(GIMBAL_SETTLE_S)
-        # Ask LLM which direction looks like an exit
-        self._move_gimbal(0, 0)
-        time.sleep(GIMBAL_SETTLE_S)
-        jpeg = self._get_annotated_jpeg()
-        if jpeg:
-            target = getattr(self, '_nav_target', 'exit')
-            result = self._llm_call(
-                f"I just escaped from being stuck. I need to find: "
-                f"'{target}'. Looking at this forward view, which "
-                f"direction should I go? Look for doorways, open space, "
-                f"bright light, or hallway entrances.\n"
-                f"Reply JSON: {{\"best_direction\": <degrees, "
-                f"neg=left, pos=right, 0=ahead>, "
-                f"\"reason\": \"what you see\"}}", jpeg)
-            if result and "best_direction" in result:
-                best_pan = int(result["best_direction"])
-                best_pan = max(-180, min(180, best_pan))
-                self._log(f"Post-escape: face {best_pan}° — "
-                          f"{result.get('reason', '?')[:60]}")
-                if abs(best_pan) > 15:
-                    self._spin_body(best_pan)
-                    self._move_gimbal(0, 0)
-
-    def _recover_stuck(self, target, encoder_stuck=False):
-        """Back off, then gimbal-scan for clear path.
-        Only looks down to diagnose if encoder_stuck=True (wheels physically stalled).
-        Leaves gimbal pointing at the clear direction so the next
-        waypoint's _align_body() rotates the body to match."""
-
-        # 1. Only look down when wheels physically can't move
-        if encoder_stuck:
-            self._log("Recovering from stuck — looking down to diagnose...")
-            self._move_gimbal(0, -30)
-            time.sleep(GIMBAL_SETTLE_S)
-            down_jpeg = self._get_annotated_jpeg()
-            if down_jpeg:
-                diag = self._llm_call(
-                    "I'm STUCK and looking down at my wheels/chassis. "
-                    "What do you see on the ground near me that could be "
-                    "causing me to be stuck? Look for: cables, thresholds, "
-                    "rug edges, objects wedged under wheels, lips/ledges, "
-                    "or anything else blocking movement. "
-                    "Reply JSON: {\"stuck_cause\": \"what you see\", "
-                    "\"suggestion\": \"how to get free\"}",
-                    down_jpeg)
-                if diag:
-                    cause = diag.get("stuck_cause", "unknown")
-                    suggestion = diag.get("suggestion", "")
-                    self._log(f"Stuck diagnosis: {cause}")
-                    if suggestion:
-                        self._log(f"Suggestion: {suggestion}")
-        else:
-            self._log("Recovering — backing up and scanning...")
-
-        # 2. Reverse to create clearance (further than before)
-        self._move_gimbal(0, 0)
-        self._log("Backing off 0.3m...")
-        self.rover.send({"T": 1, "L": 0.10, "R": 0.10})
-        time.sleep(2.0)
-        self._stop_wheels()
-        time.sleep(0.2)
-
-        # 3. Gimbal scan — ask LLM which direction leads toward the target
-        #    Don't just pick "clear" path — pick the one closest to the goal
-        scan_pans = [0, -60, 60, -120, 120]
+        # Relocate: gimbal sweep to find the target again
+        self._log(f"Relocating '{target}'...")
         self._move_gimbal(0, 0)
         time.sleep(GIMBAL_SETTLE_S)
 
-        best_pan = 0
-        best_jpeg = None
-        scan_descriptions = []
-        for pan in scan_pans:
+        # Scan 5 directions with gimbal, then ask LLM which way
+        for pan in [-120, -60, 0, 60, 120]:
             if self._aborted():
                 return
             self._move_gimbal(pan, 0)
-            time.sleep(GIMBAL_SETTLE_S)
-            jpeg = self.tracker.get_jpeg()
-            if jpeg:
-                scan_descriptions.append(f"pan={pan}°")
+            time.sleep(0.3)
 
-        # Ask LLM which direction leads to the target
         self._move_gimbal(0, 0)
         time.sleep(GIMBAL_SETTLE_S)
-        jpeg = self.tracker.get_jpeg()
-        if jpeg and target:
-            result = self._llm_call(
-                f"I'm stuck and need to find a way toward '{target}'. "
-                f"I just scanned around me. Looking at this forward view, "
-                f"which direction should I go? Consider: doorways, open space "
-                f"leading toward the goal, hallway exits. "
-                f"Reply JSON: {{\"best_direction\": <degrees, negative=left, positive=right>, "
-                f"\"reason\": \"why\"}}", jpeg)
-            if result and "best_direction" in result:
-                best_pan = int(result["best_direction"])
-                best_pan = max(-180, min(180, best_pan))
-                self._log(f"LLM recovery: turn {best_pan}° — {result.get('reason', '?')}")
-            else:
-                # Fallback: go opposite to where we were stuck
-                wanted = self._last_drive_angle + self.pose.cam_pan
-                best_pan = 90 if wanted <= 0 else -90
-                self._log(f"Recovery fallback: turn {best_pan}° (opposite to stuck heading)")
-        else:
-            wanted = self._last_drive_angle + self.pose.cam_pan
-            best_pan = 90 if wanted <= 0 else -90
-            self._log(f"Recovery fallback: turn {best_pan}°")
+        jpeg = self._get_annotated_jpeg()
+        if not jpeg:
+            return
 
-        self._move_gimbal(best_pan, 0)
+        result = self._llm_call(
+            f"I just did a 3-point turn to escape being stuck. "
+            f"I need to find: '{target}'. "
+            f"Look at this image — where should I go now? "
+            f"Look for doorways, exits, bright openings, or the target.\n"
+            f"Reply JSON: {{\"best_direction\": <degrees, "
+            f"negative=left, positive=right, 0=straight ahead>, "
+            f"\"reason\": \"what you see\"}}", jpeg)
+
+        if result and "best_direction" in result:
+            best = int(result["best_direction"])
+            best = max(-180, min(180, best))
+            reason = result.get('reason', '')[:60]
+            self._log(f"Reacquired: turn {best}° — {reason}")
+            if abs(best) > 10:
+                self._spin_body(best)
+                self._move_gimbal(0, 0)
+        else:
+            self._log("Could not relocate target — continuing forward")
+
+    def _recover_stuck(self, target, encoder_stuck=False):
+        """Mini 3-point maneuver to clear an obstacle, then reacquire target.
+
+        1. Reverse ~0.25m
+        2. Turn away from blocked direction
+        3. Gimbal scan to find the target again and face it
+        """
+        blocked_angle = getattr(self, '_last_drive_angle', 0)
+
+        if encoder_stuck:
+            self._log("Recovering from physical stuck — reversing")
+        else:
+            self._log(f"Recovering — obstacle at {blocked_angle}° angle")
+
+        # 1. Reverse to create space
+        self._move_gimbal(0, 0)
+        self.rover.send({"T": 1, "L": 0.10, "R": 0.10})
+        time.sleep(1.5)
+        self._stop_wheels()
+        time.sleep(0.2)
+
+        # 2. Turn away from blocked direction (~60° opposite side)
+        turn = 60 if blocked_angle <= 0 else -60
+        self._log(f"Turning {turn}° away from obstacle")
+        self._spin_body(turn)
+        self._move_gimbal(0, 0)
+        time.sleep(0.2)
+
+        # 3. Gimbal scan to reacquire target
+        target_name = target or getattr(self, '_nav_target', 'exit')
+        for pan in [-90, -45, 0, 45, 90]:
+            if self._aborted():
+                return
+            self._move_gimbal(pan, 0)
+            time.sleep(0.25)
+
+        self._move_gimbal(0, 0)
+        time.sleep(GIMBAL_SETTLE_S)
+        jpeg = self._get_annotated_jpeg()
+        if jpeg and target_name:
+            result = self._llm_call(
+                f"I just backed up and turned to avoid an obstacle. "
+                f"I need to get to: '{target_name}'. "
+                f"Which direction has the best path toward it? "
+                f"Look for doorways, open space, bright light.\n"
+                f"Reply JSON: {{\"best_direction\": <degrees, "
+                f"neg=left, pos=right>, \"reason\": \"why\"}}",
+                jpeg)
+            if result and "best_direction" in result:
+                best = int(result["best_direction"])
+                best = max(-180, min(180, best))
+                self._log(f"Reacquired: {best}° — "
+                          f"{result.get('reason', '')[:50]}")
+                if abs(best) > 10:
+                    # Turn body to face the target, not just gimbal
+                    self._spin_body(best)
+                    self._move_gimbal(0, 0)
+            else:
+                self._log("Could not reacquire — continuing")
 
     def _llm_verify_obstacle(self):
         """Quick LLM check: is there actually an obstacle ahead?
