@@ -25,6 +25,7 @@ import numpy as np
 import room_context
 import audio
 import imu as imu_mod
+from ollama_config import OLLAMA_CHAT_URL
 import orchestrator
 import prompts
 # import reflection  # removed — lessons learned via orchestrator.learn_from_feedback
@@ -99,6 +100,7 @@ AVAILABLE_PROVIDERS = {
         "anthropic/claude-sonnet-4-6",
         "anthropic/claude-sonnet-4-20250514",
         "anthropic/claude-haiku-4-5-20251001",
+        "llama.cpp/qwen3-vl:2b",
     ],
     "tts": ["groq", "elevenlabs"],
     "orch": [
@@ -110,6 +112,7 @@ AVAILABLE_PROVIDERS = {
         "qwen3.5:cloud",
         "claude-sonnet-4-20250514",
         "claude-haiku-4-5-20251001",
+        "llama.cpp/qwen3-vl:2b",
     ],
 }
 
@@ -386,7 +389,9 @@ def set_provider(kind, name):
         else:
             provider = name
             model = None
-        mod = importlib.import_module(f"provider_{provider}")
+        # Map provider names with dots/special chars to module names
+        provider_module = provider.replace(".", "")  # llama.cpp -> llamacpp
+        mod = importlib.import_module(f"provider_{provider_module}")
         importlib.reload(mod)
         if model:
             mod.LLM_MODEL = model
@@ -406,6 +411,34 @@ def set_provider(kind, name):
         _save_provider_prefs()
     else:
         raise ValueError(f"Unknown provider kind: {kind}")
+
+    # GPU offloading: pause YOLO+Depth TRT when local LLM needs GPU,
+    # re-enable when switching back to a cloud/ollama model.
+    if kind in ("llm", "orch"):
+        _is_local = name.startswith("llama.cpp/")
+        cam = _shared_refs.get("cam")
+        if cam and _is_local:
+            if getattr(cam, 'depth_estimator', None):
+                cam._depth_backup = cam.depth_estimator
+                cam.depth_estimator = None
+                log_event("system",
+                          "Depth TRT paused (GPU needed for local LLM)")
+            if getattr(cam, 'detector', None):
+                cam._detector_backup = cam.detector
+                cam.detector = None
+                log_event("system",
+                          "YOLO TRT paused (GPU needed for local LLM)")
+            import gc; gc.collect()
+        elif cam and not _is_local:
+            if getattr(cam, '_depth_backup', None) and not cam.depth_estimator:
+                cam.depth_estimator = cam._depth_backup
+                cam._depth_backup = None
+                log_event("system", "Depth TRT resumed")
+            if getattr(cam, '_detector_backup', None) and not cam.detector:
+                cam.detector = cam._detector_backup
+                cam._detector_backup = None
+                log_event("system", "YOLO TRT resumed")
+
     log_event("system", f"Switched {kind} to {name}")
 
 SERIAL_PORT = "/dev/ttyTHS1"
@@ -553,13 +586,11 @@ class Camera:
         self.detector = None
         self.depth_estimator = None  # set from main() if available
         self._det_results = []     # list of detection dicts
-        self._det_persistent = {}  # name → {det, ts} for additive scanning
         self._det_summary = ""     # one-line summary
         self._det_ts = 0.0         # timestamp of last detection
         self._det_jpeg = None      # JPEG with bounding box overlay
         self._det_frame_count = 0  # frame counter for running every 3rd
         self._depth_map = None     # latest depth map (float32 H x W)
-        self._DET_PERSIST_S = 0.8  # keep old detections for this long
 
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
@@ -570,6 +601,30 @@ class Camera:
         with self._lock:
             return self._depth_map
 
+    def _clear_detector_cache(self):
+        det = self.detector
+        if det is None:
+            return
+        try:
+            if hasattr(det, "clear_cache"):
+                det.clear_cache()
+            else:
+                det.last_detections = []
+        except Exception:
+            pass
+
+    def clear_yolo_cache(self, raw_jpeg=None):
+        """Immediately flush stale YOLO results and stale box overlays."""
+        self._clear_detector_cache()
+        with self._lock:
+            self._det_results = []
+            self._det_summary = ""
+            self._det_ts = 0.0
+            if raw_jpeg is not None:
+                self._det_jpeg = raw_jpeg
+            elif self._jpeg is not None:
+                self._det_jpeg = self._jpeg
+
     def _capture_loop(self):
         while self._running:
             ret, frame = self.cap.read()
@@ -579,23 +634,27 @@ class Camera:
             _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             raw_jpeg = buf.tobytes()
 
-            # Run YOLO + depth (every frame if following, else every 3rd)
+            # Run perception (YOLO and/or depth) every frame if following,
+            # else every 3rd frame to reduce GPU load.
             overlay_jpeg = None
-            if self.detector is not None and yolo_enabled:
+            run_yolo = self.detector is not None and yolo_enabled
+            run_depth = self.depth_estimator is not None
+            if run_yolo or run_depth:
                 self._det_frame_count += 1
                 _det_interval = 1 if getattr(self, '_follow_mode', False) else 3
                 if self._det_frame_count >= _det_interval:
                     self._det_frame_count = 0
                     try:
-                        dets = self.detector.detect(frame)
+                        dets = self.detector.detect(frame) if run_yolo else []
 
-                        # Run depth estimation and enrich detections
+                        # Run depth estimation even when YOLO is disabled.
                         depth_map = None
-                        if self.depth_estimator is not None:
+                        if run_depth:
                             try:
                                 depth_map = self.depth_estimator.estimate(frame)
-                                self.depth_estimator.enrich_detections(
-                                    dets, depth_map)
+                                if dets:
+                                    self.depth_estimator.enrich_detections(
+                                        dets, depth_map)
                             except Exception:
                                 pass
 
@@ -614,24 +673,11 @@ class Camera:
                                 except Exception:
                                     pass
 
-                        # Additive scanning: merge with persistent detections
-                        now = time.time()
-                        current_names = {d["name"] for d in dets}
-                        for d in dets:
-                            self._det_persistent[d["name"]] = {
-                                "det": d, "ts": now}
-                        # Add old detections not seen this frame (if fresh)
-                        for name, entry in list(self._det_persistent.items()):
-                            if (name not in current_names
-                                    and now - entry["ts"] < self._DET_PERSIST_S):
-                                dets.append(entry["det"])
-                            elif now - entry["ts"] >= self._DET_PERSIST_S * 2:
-                                del self._det_persistent[name]
-
-                        summary = self.detector.summary(dets)
+                        summary = self.detector.summary(dets) if run_yolo else ""
                         # Draw overlay on a copy
                         overlay = frame.copy()
-                        self.detector.draw(overlay, dets)
+                        if run_yolo:
+                            self.detector.draw(overlay, dets)
 
                         # Draw depth minimap in bottom-right corner
                         if depth_map is not None:
@@ -648,16 +694,36 @@ class Camera:
                                                [cv2.IMWRITE_JPEG_QUALITY, 70])
                         overlay_jpeg = obuf.tobytes()
                         with self._lock:
-                            self._det_results = dets
+                            self._det_results = dets if run_yolo else []
                             self._det_summary = summary
-                            self._det_ts = time.time()
-                            self._det_jpeg = overlay_jpeg
+                            self._det_ts = time.time() if run_yolo else 0.0
+                            self._det_jpeg = overlay_jpeg or raw_jpeg
                             self._depth_map = depth_map
                     except Exception:
                         pass  # don't crash capture loop on detection error
+            else:
+                with self._lock:
+                    self._det_results = []
+                    self._det_summary = ""
+                    self._det_ts = 0.0
+                    self._det_jpeg = raw_jpeg
+                    self._depth_map = None
+
+            if not run_yolo:
+                self._clear_detector_cache()
 
             with self._lock:
                 self._jpeg = raw_jpeg
+                if not run_yolo:
+                    self._det_results = []
+                    self._det_summary = ""
+                    self._det_ts = 0.0
+                    if overlay_jpeg is None:
+                        self._det_jpeg = raw_jpeg
+                if not run_depth:
+                    self._depth_map = None
+                if self._det_jpeg is None:
+                    self._det_jpeg = raw_jpeg
             time.sleep(0.03)  # ~30 fps
 
     def get_detections(self):
@@ -672,7 +738,7 @@ class Camera:
     def get_overlay_jpeg(self):
         """Return JPEG with bounding boxes, or raw if YOLO is off."""
         with self._lock:
-            if yolo_enabled and self._det_jpeg is not None:
+            if self._det_jpeg is not None:
                 return self._det_jpeg
             return self._jpeg
 
@@ -1870,7 +1936,7 @@ def voice_thread(mic_dev, mic_card):
             if kind == "override" and _last_task:
                 try:
                     import requests as _req
-                    r = _req.post("http://192.168.0.126:11434/api/chat",
+                    r = _req.post(OLLAMA_CHAT_URL,
                         json={"model": "qwen3.5:9b",
                               "messages": [
                                   {"role": "system",
@@ -2957,11 +3023,18 @@ def _set_tts_enabled(val):
     tts_enabled = val
     log_event("system", f"TTS: {'ON' if tts_enabled else 'OFF'}")
 
-yolo_enabled = True  # YOLO detection on/off
+yolo_enabled = False  # YOLO detection on/off
 
 def _set_yolo_enabled(val):
     global yolo_enabled
     yolo_enabled = val
+    if not yolo_enabled:
+        cam = _shared_refs.get("cam")
+        if cam is not None:
+            try:
+                cam.clear_yolo_cache()
+            except Exception:
+                pass
     log_event("system", f"YOLO: {'ON' if yolo_enabled else 'OFF'}")
 
 killed = False  # When True, main loop ignores commands
@@ -3392,8 +3465,58 @@ def _topo_navigate(nav_target, stop_event):
         return reached
 
     if from_room == target_room:
-        log_event("plan", f"Already in {target_room}!")
-        return True
+        # Double-check with YOLO features before skipping navigation entirely.
+        # The persisted room may be stale (e.g. from a previous session).
+        live_conf = float(getattr(_topo_map, 'current_confidence', 0) or 0)
+        if live_conf < 0.8:
+            # Low confidence — verify with a quick room check
+            jpeg = nav.tracker.get_jpeg() if hasattr(nav, "tracker") else None
+            if jpeg:
+                dets, yolo_sum, age = nav._get_detections()
+                scene_text = ""
+                glance = nav._llm_call(
+                    "Briefly describe this room. What room is this? "
+                    'Reply ONLY JSON: {"scene":"..."}', jpeg)
+                if isinstance(glance, dict):
+                    scene_text = str(glance.get("scene", "")).strip()
+                if scene_text:
+                    live_room, live_conf2 = _topo_room_check(scene_text)
+                    if live_room and live_room != target_room:
+                        log_event("plan",
+                            f"Persisted room was {target_room} but live "
+                            f"check says {live_room} ({live_conf2:.2f}) "
+                            f"— NOT already there")
+                        from_room = live_room
+                        _topo_map.current_room = from_room
+                        _topo_map.current_confidence = live_conf2
+                    elif not live_room:
+                        log_event("plan",
+                            f"Can't verify we're in {target_room} "
+                            f"— navigating anyway to be safe")
+                        from_room = None
+                else:
+                    log_event("plan",
+                        f"LLM unavailable to verify {target_room} "
+                        f"— navigating anyway to be safe")
+                    from_room = None
+
+        if from_room == target_room:
+            log_event("plan", f"Already in {target_room}!")
+            return True
+
+    if not from_room:
+        log_event("plan", "Can't determine current room, "
+                          "using reactive nav")
+        reached = nav.navigate_reactive(nav_target)
+        if reached and target_room:
+            _semantic_reorganize_after_reach(
+                nav_target,
+                target_room,
+                from_room=None,
+                scene_text=getattr(nav, "_last_scene", ""),
+                yolo_summary=getattr(nav, "_last_yolo", ""),
+            )
+        return reached
 
     # Plan route
     legs = _topo_map.plan_route(from_room, target_room)
@@ -3846,15 +3969,73 @@ def main():
             _nav_pose.on_command(cmd)
         ser.send = _nav_send_hook
 
-        def _nav_vision_fn(prompt, jpeg_bytes):
+        def _nav_vision_fn(prompt, jpeg_bytes, aux_images=None):
             """Lightweight LLM vision call for Navigator — 30s timeout.
             Uses the orchestrator's current model (respects UI dropdown)."""
             import base64 as _b64
             import requests
             model = orchestrator.OLLAMA_MODEL
-            b64 = _b64.b64encode(jpeg_bytes).decode()
+            aux_images = list(aux_images or [])
+
+            def _compose_for_single_image(primary, extras):
+                if not extras:
+                    return primary
+                imgs = []
+                arr = np.frombuffer(primary, np.uint8)
+                base = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if base is not None:
+                    labeled = base.copy()
+                    cv2.rectangle(labeled, (0, 0), (labeled.shape[1], 30),
+                                  (0, 0, 0), -1)
+                    cv2.putText(labeled, "Image 1: camera", (10, 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (255, 255, 255), 1, cv2.LINE_AA)
+                    imgs.append(labeled)
+                for idx, (label, data) in enumerate(extras, start=2):
+                    arr = np.frombuffer(data, np.uint8)
+                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if img is None:
+                        continue
+                    labeled = img.copy()
+                    cv2.rectangle(labeled, (0, 0), (labeled.shape[1], 30),
+                                  (0, 0, 0), -1)
+                    cv2.putText(labeled, f"Image {idx}: {label}", (10, 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (255, 255, 255), 1, cv2.LINE_AA)
+                    imgs.append(labeled)
+                if not imgs:
+                    return primary
+                width = max(img.shape[1] for img in imgs)
+                padded = []
+                for img in imgs:
+                    if img.shape[1] != width:
+                        pad = width - img.shape[1]
+                        img = cv2.copyMakeBorder(
+                            img, 0, 0, 0, pad, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+                    padded.append(img)
+                combined = cv2.vconcat(padded)
+                ok, buf = cv2.imencode(".jpg", combined,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 80])
+                return buf.tobytes() if ok else primary
+
+            # Route llama.cpp models to local CLI
+            if model.startswith("llama.cpp/"):
+                from provider_llamacpp import _run_llamacpp
+                tag = model[len("llama.cpp/"):]
+                import provider_llamacpp
+                provider_llamacpp.LLM_MODEL = tag
+                single = _compose_for_single_image(jpeg_bytes, aux_images)
+                return _run_llamacpp(prompt, single, max_tokens=300)
+            images = [jpeg_bytes] + [data for _, data in aux_images]
+            b64_images = [_b64.b64encode(img).decode() for img in images]
             # Route claude models to Anthropic API
             if model.startswith("claude-"):
+                content = []
+                for b64 in b64_images:
+                    content.append({"type": "image", "source": {
+                        "type": "base64", "media_type": "image/jpeg",
+                        "data": b64}})
+                content.append({"type": "text", "text": prompt})
                 r = requests.post(
                     "https://api.anthropic.com/v1/messages",
                     headers={
@@ -3865,12 +4046,7 @@ def main():
                     json={
                         "model": model,
                         "system": "Reply ONLY with the requested JSON.",
-                        "messages": [{"role": "user", "content": [
-                            {"type": "image", "source": {
-                                "type": "base64", "media_type": "image/jpeg",
-                                "data": b64}},
-                            {"type": "text", "text": prompt},
-                        ]}],
+                        "messages": [{"role": "user", "content": content}],
                         "max_tokens": 300,
                         "temperature": 0.3,
                     },
@@ -3885,7 +4061,7 @@ def main():
                               {"role": "system",
                                "content": "Reply ONLY with the requested JSON."},
                               {"role": "user", "content": prompt,
-                               "images": [b64]},
+                               "images": b64_images},
                           ],
                           "stream": False, "think": False,
                           "options": {"temperature": 0.3, "num_predict": 300}},
@@ -3934,6 +4110,7 @@ def main():
             log_fn=log_event,
             room_map=_room_map,
             yolo_correction_fn=_apply_yolo_corrections,
+            floor_nav=_floor_nav,
         )
         # Expose room map + pose to camera for detection recording
         cam._room_map = _room_map
@@ -4079,157 +4256,142 @@ def main():
             _last_task = text
             _last_task_target = _extract_target(text)
 
-        # ── Direct commands: skip sweep, go straight to handler/LLM ──
-        # These are simple imperatives that don't need a room scan.
-        _direct_prefixes = (
-            "follow", "stop", "halt", "back up", "back off", "reverse",
-            "come here", "come back", "turn left", "turn right", "turn around",
-            "spin", "nod", "shake", "look ", "say ", "speak ",
-            "lights ", "light ", "be quiet", "shut up",
-            "what do you see", "what is ", "who is ", "describe",
-            "how are you", "hello", "hi ", "hey ", "good ",
-        )
-        _is_direct = any(text_lower.startswith(p) for p in _direct_prefixes)
-        if _is_direct:
-            # Follow mode — skip sweep, go straight to YOLO follow
-            if _clean_words(text) & {"follow", "following"}:
-                import string as _string
-                words = [w.strip(_string.punctuation) for w in text.strip().lower().split()]
-                words = [w for w in words if w]
-                _filler = {"the", "that", "this", "a", "an", "my"}
-                _rest = [w for w in words if w not in {"follow", "following"} | _filler]
-                _ftarget = "person"
-                if _rest:
-                    w0 = _rest[0]
-                    if w0 in ("me", "person", "human", "owner", "man", "woman"):
-                        _ftarget = "person"
-                    else:
-                        _ftarget = w0
-                plan_active.set()
-                stop_event.clear()
-                log_event("follow", f"YOLO follow: {text} (target={_ftarget})")
-                if not yolo_enabled:
-                    _set_yolo_enabled(True)
-                cam._follow_mode = True
-                _speak("Following.", spk, mic_card)
-                from follow_target import follow
-                try:
-                    result = follow(_ftarget, ser, cam, _shared_refs.get("imu"),
-                                    duration=300,
-                                    stop_event=stop_event,
-                                    log_fn=lambda msg: log_event("follow", msg),
-                                    voice=_xai_voice, floor_nav=None,
-                                    recovery_fn=_follow_recovery,
-                                    speak_fn=lambda t: _speak(t, spk, mic_card),
-                                    llm_fn=_follow_llm_fn,
-                                    label_override_fn=_follow_label_override)
-                finally:
-                    cam._follow_mode = False
-                log_event("follow", f"Done: {result.get('status')}")
-                plan_active.clear()
-                stop_event.clear()
-                continue
-            else:
-                # Everything else goes straight to LLM — no sweep
-                log_event("plan", f"Direct: {text}")
-                result = run_plan(text, ser, cam, spk, mic_card)
-                if result is None:
-                    continue
-                continue
-
-        # Decide whether to sweep before navigation.
-        # Skip if topo map already has a route (we know where we are and
-        # how to get there — the leg navigator will handle the rest).
-        nav_target = _extract_target(text)
-        all_targets = _extract_all_targets(text)
-        scan_target = all_targets[-1] if all_targets else nav_target
-
-        _has_topo_route = False
-        if _topo_map and _topo_map.current_room:
-            _validate_topo_current_room(text, find_target=scan_target)
-            if _topo_map.current_room:
-                # Check if the target resolves to a known room with a route
-                target_lower = nav_target.lower().strip() if nav_target else ""
-                for room in _topo_map.rooms():
-                    if (room.id in target_lower or
-                            room.label.lower() in target_lower or
-                            target_lower in room.id or
-                            target_lower in room.label.lower()):
-                        legs = _topo_map.plan_route(_topo_map.current_room, room.id)
-                        if legs:
-                            _has_topo_route = True
-                            log_event("room", f"Topo route exists "
-                                      f"({_topo_map.current_room}→{room.id}) "
-                                      f"— skipping sweep")
-                        break
-
-        recent_scan = _get_recent_room_scan_state()
-        same_task_scan = recent_scan and recent_scan.get("task") == text
-        if not _has_topo_route and _room_scanner and not same_task_scan:
+        # ── Follow mode — special YOLO follow handler ──
+        if _clean_words(text) & {"follow", "following"}:
+            import string as _string
+            words = [w.strip(_string.punctuation) for w in text.strip().lower().split()]
+            words = [w for w in words if w]
+            _filler = {"the", "that", "this", "a", "an", "my"}
+            _rest = [w for w in words if w not in {"follow", "following"} | _filler]
+            _ftarget = "person"
+            if _rest:
+                w0 = _rest[0]
+                if w0 in ("me", "person", "human", "owner", "man", "woman"):
+                    _ftarget = "person"
+                else:
+                    _ftarget = w0
+            plan_active.set()
+            stop_event.clear()
+            log_event("follow", f"YOLO follow: {text} (target={_ftarget})")
+            if not yolo_enabled:
+                _set_yolo_enabled(True)
+            cam._follow_mode = True
+            _speak("Following.", spk, mic_card)
+            from follow_target import follow
             try:
-                scan_state = _run_task_room_scan(
-                    text, find_target=scan_target)
-                if scan_state:
-                    _sync_topo_room_from_scan_state(
-                        scan_state, source="Pre-nav room scan")
-                    guess = scan_state.get("room_guess", {})
-                    g_name = guess.get("name") or "unknown"
-                    g_conf = float(guess.get("confidence", 0.0))
-                    log_event("room",
-                              f"Best room guess for task '{text}': "
-                              f"{g_name} ({g_conf:.2f})")
-            except Exception as e:
-                log_event("error", f"Room vector scan failed: {e}")
+                result = follow(_ftarget, ser, cam, _shared_refs.get("imu"),
+                                duration=300,
+                                stop_event=stop_event,
+                                log_fn=lambda msg: log_event("follow", msg),
+                                voice=_xai_voice, floor_nav=None,
+                                recovery_fn=_follow_recovery,
+                                speak_fn=lambda t: _speak(t, spk, mic_card),
+                                llm_fn=_follow_llm_fn,
+                                label_override_fn=_follow_label_override)
+            finally:
+                cam._follow_mode = False
+            log_event("follow", f"Done: {result.get('status')}")
+            plan_active.clear()
+            stop_event.clear()
+            continue
 
-        # ── Navigator shortcut for movement commands ──
-        if _navigator:
-            text_lower_strip = text.strip().lower()
-            # Strip wake word for prefix matching
-            for _wake in ("jasper ", "hey jasper ", "ok jasper "):
-                if text_lower_strip.startswith(_wake):
-                    text_lower_strip = text_lower_strip[len(_wake):]
-                    break
-            is_nav = any(text_lower_strip.startswith(p) for p in (
-                "go to ", "go out", "go through",
-                "navigate to ", "drive to ", "move to ",
-                "head toward", "get to ", "get out",
-                "exit ", "leave "))
-            is_search = nav_target and any(text_lower_strip.startswith(p) for p in (
+        # ── Navigation commands — room sweep + topo/reactive navigator ──
+        # Only explicit navigation verbs trigger the sweep + navigator.
+        # Everything else goes straight to the LLM which judges intent.
+        text_lower_strip = text.strip().lower()
+        for _wake in ("jasper ", "hey jasper ", "ok jasper "):
+            if text_lower_strip.startswith(_wake):
+                text_lower_strip = text_lower_strip[len(_wake):]
+                break
+
+        nav_target = _extract_target(text)
+        is_nav = _navigator and any(text_lower_strip.startswith(p) for p in (
+            "go to ", "go out", "go through",
+            "navigate to ", "drive to ", "move to ",
+            "head toward", "get to ", "get out",
+            "exit ", "leave "))
+        is_search = _navigator and nav_target and any(
+            text_lower_strip.startswith(p) for p in (
                 "find ", "look for ", "search for ", "where is "))
-            # If no explicit target extracted, use the full command as the goal
+
+        if is_nav or is_search:
+            all_targets = _extract_all_targets(text)
+            scan_target = all_targets[-1] if all_targets else nav_target
             if is_nav and not nav_target:
                 nav_target = text.strip()
-            if is_nav or is_search:
-                plan_active.set()
-                stop_event.clear()
 
-                # Search-only mode: just find, don't drive
-                search_only = is_search and not is_nav and "go " not in text_lower_strip
-                if search_only:
-                    log_event("plan",
-                              f"Navigator: searching for '{nav_target}'")
-                    direction = _navigator.search(nav_target)
-                    if direction is not None:
-                        plan_active.clear()
-                        log_event("plan",
-                                  f"Navigator: found '{nav_target}'")
-                        continue
-                    log_event("plan",
-                              f"Navigator: '{nav_target}' not visible, "
-                              f"exploring")
+            # Room scan + topo route check (only for navigation)
+            _has_topo_route = False
+            if _topo_map and _topo_map.current_room:
+                _validate_topo_current_room(text, find_target=scan_target)
+                if _topo_map.current_room:
+                    target_lower = nav_target.lower().strip() if nav_target else ""
+                    for room in _topo_map.rooms():
+                        if (room.id in target_lower or
+                                room.label.lower() in target_lower or
+                                target_lower in room.id or
+                                target_lower in room.label.lower()):
+                            legs = _topo_map.plan_route(
+                                _topo_map.current_room, room.id)
+                            if legs:
+                                _has_topo_route = True
+                                log_event("room",
+                                    f"Topo route exists "
+                                    f"({_topo_map.current_room}→{room.id})"
+                                    f" — skipping sweep")
+                            break
 
-                # Topological navigation: plan route through room graph,
-                # then navigate each leg (transition) reactively
-                reached = _topo_navigate(nav_target, stop_event)
+            recent_scan = _get_recent_room_scan_state()
+            same_task_scan = (recent_scan
+                              and recent_scan.get("task") == text)
+            if (not _has_topo_route and _room_scanner
+                    and not same_task_scan):
+                try:
+                    scan_state = _run_task_room_scan(
+                        text, find_target=scan_target)
+                    if scan_state:
+                        _sync_topo_room_from_scan_state(
+                            scan_state, source="Pre-nav room scan")
+                        guess = scan_state.get("room_guess", {})
+                        g_name = guess.get("name") or "unknown"
+                        g_conf = float(guess.get("confidence", 0.0))
+                        log_event("room",
+                            f"Best room guess for task '{text}': "
+                            f"{g_name} ({g_conf:.2f})")
+                except Exception as e:
+                    log_event("error", f"Room vector scan failed: {e}")
 
-                plan_active.clear()
-                stop_event.clear()
+            plan_active.set()
+            stop_event.clear()
+
+            # Search-only mode: just find, don't drive
+            search_only = (is_search and not is_nav
+                           and "go " not in text_lower_strip)
+            if search_only:
                 log_event("plan",
-                    f"Navigator: "
-                    f"{'reached' if reached else 'could not reach'}"
-                    f" '{nav_target}'")
-                continue
+                          f"Navigator: searching for '{nav_target}'")
+                direction = _navigator.search(nav_target)
+                if direction is not None:
+                    plan_active.clear()
+                    log_event("plan",
+                              f"Navigator: found '{nav_target}'")
+                    continue
+                log_event("plan",
+                          f"Navigator: '{nav_target}' not visible, "
+                          f"exploring")
 
+            # Topological navigation
+            reached = _topo_navigate(nav_target, stop_event)
+
+            plan_active.clear()
+            stop_event.clear()
+            log_event("plan",
+                f"Navigator: "
+                f"{'reached' if reached else 'could not reach'}"
+                f" '{nav_target}'")
+            continue
+
+        # ── Default: LLM judges intent and dispatches ──
         log_event("plan", f"Starting: {text}")
         result = run_plan(text, ser, cam, spk, mic_card)
 

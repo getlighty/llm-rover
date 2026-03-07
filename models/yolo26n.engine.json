@@ -1,0 +1,10 @@
+{
+  "family": "yolo26",
+  "variant": "yolo26n",
+  "engine": "/home/jasper/rover-control/models/yolo26n.engine",
+  "onnx": "/home/jasper/rover-control/models/yolo26n.onnx",
+  "checkpoint": "/home/jasper/rover-control/models/yolo26n.pt",
+  "precision": "fp16",
+  "imgsz": 640,
+  "builder_optimization_level": 0
+}

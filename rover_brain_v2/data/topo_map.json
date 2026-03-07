@@ -1,0 +1,284 @@
+{
+  "current_room": "hallway",
+  "current_confidence": 0.65,
+  "nodes": [
+    {
+      "id": "office",
+      "type": "room",
+      "label": "Office",
+      "features": [
+        "desk",
+        "monitor",
+        "office chair",
+        "wooden floor",
+        "yellow walls",
+        "cables",
+        "shelving"
+      ],
+      "floor_type": "wooden floor",
+      "nav_hints": "Exit is the doorway with bright hallway light. Go around the chair, not through it."
+    },
+    {
+      "id": "hallway",
+      "type": "room",
+      "label": "Hallway",
+      "features": [
+        "stone tiles",
+        "narrow corridor",
+        "plant pot",
+        "yellow walls",
+        "arched doorway",
+        "potted plants",
+        "metal shelving unit",
+        "plant pot visible in distance",
+        "desk leg to the left"
+      ],
+      "floor_type": "stone tiles"
+    },
+    {
+      "id": "kitchen",
+      "type": "room",
+      "label": "Kitchen",
+      "features": [
+        "stove",
+        "oven",
+        "refrigerator",
+        "sink",
+        "counter",
+        "cabinets"
+      ],
+      "floor_type": "tiles"
+    },
+    {
+      "id": "living_room",
+      "type": "room",
+      "label": "Living Room",
+      "features": [
+        "sofa",
+        "couch",
+        "tv",
+        "coffee table",
+        "parquet floor",
+        "rug",
+        "dog in basket",
+        "plastic bag",
+        "blue laundry basket",
+        "person with laptop"
+      ],
+      "floor_type": "parquet floor"
+    },
+    {
+      "id": "dining",
+      "type": "room",
+      "label": "Dining Room",
+      "features": [
+        "dining table",
+        "chairs",
+        "tableware"
+      ],
+      "floor_type": "tiles"
+    },
+    {
+      "id": "office_hall_door",
+      "type": "transition",
+      "label": "Office Hall Door",
+      "visual_cues": [
+        "wooden door frame",
+        "bright light beyond",
+        "stone tiles floor",
+        "open passage",
+        "potted plant to the left",
+        "arched doorway from living room side",
+        "parquet flooring leading into arch",
+        "stone tile floor begins immediately inside",
+        "yellow wall on right after entry",
+        "plant pot straight ahead through hallway"
+      ],
+      "nav_hints": "Move forward through the doorway where wood meets stone.",
+      "semantic_views": {
+        "office": {
+          "to_room": "hallway",
+          "doorway_landmarks": [
+            "wooden door frame",
+            "bright light beyond",
+            "wooden door",
+            "bright light source beyond threshold"
+          ],
+          "inside_features": [
+            "stone tiles floor",
+            "open passage",
+            "potted plant to the left",
+            "stone flooring",
+            "high illumination"
+          ],
+          "inside_room_guess": "hallway",
+          "navigational_hint": "Follow the bright light through the wooden door to find stone-tiled flooring typical of the kitchen.",
+          "last_scene": "wooden doorway with bright light and stone tiles ahead",
+          "confidence": 0.95,
+          "last_observed": "2026-03-07 07:41",
+          "observation_count": 3
+        },
+        "living_room": {
+          "to_room": "hallway",
+          "doorway_landmarks": [
+            "arched doorway from living room side",
+            "parquet flooring leading into arch"
+          ],
+          "inside_features": [
+            "stone tile floor begins immediately inside",
+            "yellow wall on right after entry",
+            "plant pot straight ahead through hallway"
+          ],
+          "inside_room_guess": "hallway",
+          "navigational_hint": "From living room, take the arched doorway with parquet floor; stone tiles begin just inside.",
+          "last_scene": "The rover is on a wooden parquet floor, facing an arched doorway. Through the arch, there is a hallway with stone tiles, yellow walls, and a plant pot visible in the distance. A desk leg is to the left.",
+          "confidence": 0.85,
+          "last_observed": "2026-03-06 21:55",
+          "observation_count": 1
+        }
+      },
+      "observation_count": 3
+    },
+    {
+      "id": "hall_kitchen_arch",
+      "type": "transition",
+      "label": "Hallway-Kitchen Arch",
+      "visual_cues": [
+        "orange arched doorway",
+        "kitchen counter visible",
+        "tiled floor beyond"
+      ],
+      "azimuth_from": {
+        "hallway": 90
+      },
+      "width_m": 1.0,
+      "nav_hints": "Turn right in the hallway. Look for the orange arched doorway."
+    },
+    {
+      "id": "hall_living_arch",
+      "type": "transition",
+      "label": "Hallway-Living Room Arch",
+      "visual_cues": [
+        "arched doorway",
+        "parquet floor beyond",
+        "couch visible through opening"
+      ],
+      "azimuth_from": {
+        "hallway": -90
+      },
+      "width_m": 1.0,
+      "nav_hints": "Turn left in the hallway. Look for the arch with wooden floor beyond."
+    },
+    {
+      "id": "kitchen_dining_pass",
+      "type": "transition",
+      "label": "Kitchen-Dining Passage",
+      "visual_cues": [
+        "open passage",
+        "dining table visible"
+      ],
+      "azimuth_from": {
+        "kitchen": 0
+      },
+      "width_m": 1.2,
+      "nav_hints": "Straight through the kitchen."
+    },
+    {
+      "id": "living_dining_pass",
+      "type": "transition",
+      "label": "Living-Dining Passage",
+      "visual_cues": [
+        "open passage",
+        "dining table visible"
+      ],
+      "azimuth_from": {
+        "living_room": 90
+      },
+      "width_m": 1.2,
+      "nav_hints": "Through the opening on the right."
+    },
+    {
+      "id": "bathroom",
+      "type": "room",
+      "label": "Bathroom",
+      "features": [
+        "toilet",
+        "shower",
+        "bathtub",
+        "sink",
+        "tiles",
+        "mirror"
+      ],
+      "floor_type": "tiles"
+    },
+    {
+      "id": "hall_bathroom_door",
+      "type": "transition",
+      "label": "Hallway-Bathroom Door",
+      "visual_cues": [
+        "bathroom door",
+        "tiled floor beyond",
+        "toilet visible"
+      ],
+      "azimuth_from": {
+        "hallway": 0
+      },
+      "width_m": 0.7,
+      "nav_hints": "Look for the bathroom door in the hallway."
+    }
+  ],
+  "edges": [
+    {
+      "a": "office",
+      "b": "office_hall_door"
+    },
+    {
+      "a": "hallway",
+      "b": "hall_living_arch"
+    },
+    {
+      "a": "hallway",
+      "b": "hall_bathroom_door"
+    },
+    {
+      "a": "hallway",
+      "b": "hall_kitchen_arch"
+    },
+    {
+      "a": "hallway",
+      "b": "office_hall_door"
+    },
+    {
+      "a": "kitchen",
+      "b": "kitchen_dining_pass"
+    },
+    {
+      "a": "kitchen",
+      "b": "hall_kitchen_arch"
+    },
+    {
+      "a": "living_room",
+      "b": "living_dining_pass"
+    },
+    {
+      "a": "living_room",
+      "b": "hall_living_arch"
+    },
+    {
+      "a": "living_room",
+      "b": "office_hall_door"
+    },
+    {
+      "a": "dining",
+      "b": "kitchen_dining_pass"
+    },
+    {
+      "a": "dining",
+      "b": "living_dining_pass"
+    },
+    {
+      "a": "bathroom",
+      "b": "hall_bathroom_door"
+    }
+  ]
+}

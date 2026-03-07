@@ -191,17 +191,23 @@ class SearchEngine:
             print(f"[search] LLM error: {e}")
             return None
 
+    def _fresh_tracker_detections(self, max_age=1.0):
+        """Use only fresh tracker detections; never force a new YOLO pass."""
+        if not hasattr(self.tracker, "get_detections"):
+            return [], "", 999.0
+        try:
+            dets, summary, age = self.tracker.get_detections()
+        except Exception:
+            return [], "", 999.0
+        if age > max_age:
+            return [], "", age
+        return dets, summary, age
+
     def _yolo_check(self, target):
         """Run YOLO detector on current frame. Returns detection dict or None."""
         if not self.detector:
             return None
-        jpeg = self.tracker.get_jpeg()
-        if not jpeg:
-            return None
-        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
-        if frame is None:
-            return None
-        dets = self.detector.detect(frame)
+        dets, _, _ = self._fresh_tracker_detections()
         hit = self.detector.find(target, dets)
         if hit:
             print(f"[search] YOLO found '{hit['name']}' conf={hit['conf']:.0%} "
@@ -461,9 +467,10 @@ class SearchEngine:
                 self.spatial_map.update(objects, wp, tilt)
                 print(f"[search] Mapped at world_pan={wp}°: {objects}")
                 # Feed YOLO detections (with distances) into room map
-                if self.room_map and self.detector and self.detector.last_detections:
+                dets, _, age = self._fresh_tracker_detections()
+                if self.room_map and dets and age < 1.0:
                     self.room_map.record(
-                        self.detector.last_detections,
+                        dets,
                         self.pose.x if hasattr(self.pose, 'x') else 0,
                         self.pose.y if hasattr(self.pose, 'y') else 0,
                         self.pose.body_yaw, self.pose.cam_pan, self.pose.cam_tilt)

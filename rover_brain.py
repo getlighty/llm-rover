@@ -30,11 +30,11 @@ import argparse
 import signal
 import urllib.parse
 import warnings
+from ollama_config import OLLAMA_BASE_URL
 
 warnings.filterwarnings("ignore", message=".*SymbolDatabase.GetPrototype.*")
 
 # ---------- Configuration ----------
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "minimax-m2.5:cloud")
 
 # Load .env file if present

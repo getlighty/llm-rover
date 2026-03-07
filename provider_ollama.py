@@ -3,10 +3,11 @@
 import os, json, io, wave, base64, subprocess
 import numpy as np
 import requests
+from ollama_config import OLLAMA_CHAT_URL
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 LLM_MODEL = "qwen3.5:9b"
-LLM_URL = "http://localhost:11434/api/chat"
+LLM_URL = OLLAMA_CHAT_URL
 TTS_VOICE = "troy"
 NAME = "Ollama qwen3.5:9b + Groq STT/TTS"
 

@@ -21,6 +21,7 @@ import requests
 import os
 
 import lessons
+from ollama_config import OLLAMA_CHAT_URL
 import room_context
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -107,9 +108,9 @@ class NavigationPlan:
 
 # ── Ollama config ─────────────────────────────────────────────────────
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen3.5:9b"        # vision-capable (scene description)
-OLLAMA_TEXT_MODEL = "qwen3.5:9b"   # reasoning/guidance
+OLLAMA_URL = OLLAMA_CHAT_URL
+OLLAMA_MODEL = "qwen3.5:cloud"      # vision-capable (scene description)
+OLLAMA_TEXT_MODEL = "qwen3.5:cloud" # reasoning/guidance
 
 # ── Constants ─────────────────────────────────────────────────────────
 

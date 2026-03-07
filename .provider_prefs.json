@@ -1,1 +1,1 @@
-{"llm": "groq/meta-llama/llama-4-scout-17b-16e-instruct", "orch": "claude-haiku-4-5-20251001"}
+{"llm": "ollama/qwen3.5:cloud", "orch": "qwen3.5:cloud"}
