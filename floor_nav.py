@@ -1,14 +1,9 @@
 """
 Floor-aware continuous navigator.
 
-Drives forward while analyzing the bottom portion of the camera frame for
-obstacles (via existing YOLO detections).  The floor zone is divided into
-columns; consecutive clear columns form passages.  The rover steers toward
-the widest passage near its target direction — only stopping when no
-passage is wide enough for the 25 cm body.
-
-No new model required — piggybacks on LocalDetector (YOLO-World v2).
-No occupancy grid — works directly in camera pixel space.
+Drives forward while analyzing the lower camera view for traversable free
+space. Depth Anything is the primary clearance signal. YOLO detections are
+kept only as a fallback when depth is temporarily unavailable.
 
 Usage:
     nav = FloorNavigator(rover, detector, tracker)
@@ -25,7 +20,7 @@ import threading
 
 class FloorNavigator:
     """Continuous navigation with real-time obstacle avoidance.
-    Uses existing YOLO detections + floor region analysis."""
+    Uses live depth for floor clearance and YOLO only as a fallback."""
 
     # --- Geometry ---
     ROVER_WIDTH_M = 0.25        # physical body width
@@ -35,6 +30,7 @@ class FloorNavigator:
 
     # --- Floor zone ---
     FLOOR_HORIZON = 0.55        # floor region starts at 55% down the frame
+    FLOOR_BOTTOM = 0.88         # ignore the closest bottom strip (self-floor)
     NUM_COLUMNS = 16            # clearance map resolution
     MIN_GAP_COLS = 2            # minimum consecutive clear columns to fit through
 
@@ -43,6 +39,13 @@ class FloorNavigator:
     STEER_GAIN = 0.004          # wheel differential per pixel offset from target col
     MAX_STEER = 0.12            # max steering differential (m/s)
     OBSTACLE_CLOSE_BW = 0.50    # bbox width fraction — object is dangerously close
+    MIN_PROGRESS_S = 0.8        # timeout/block after this still counts as progress
+
+    # --- Depth-driven clearance ---
+    DEPTH_PASSABLE_CLEARANCE_M = 0.45
+    DEPTH_STOP_CLEARANCE_M = 0.28
+    DEPTH_MAX_CLEARANCE_M = 2.4
+    DEPTH_NEAR_PERCENTILE = 90
 
     # --- Arrival ---
     ARRIVE_BW = 0.40            # target object bbox width fraction = arrived
@@ -77,12 +80,13 @@ class FloorNavigator:
             stop_condition:  callable() -> bool — return True when done
 
         Returns:
-            True  if stop_condition was met
-            False if blocked or timed out
+            True  if stop_condition was met or the rover made forward progress
+            False if blocked immediately or timed out without progress
         """
         speed = speed if speed is not None else self.DRIVE_SPEED
         target_col = self._direction_to_col(target_direction)
         t0 = time.time()
+        motion_started = None
 
         while time.time() - t0 < timeout:
             if self._emergency and self._emergency.is_set():
@@ -93,35 +97,49 @@ class FloorNavigator:
                 self._stop()
                 return True
 
-            frame, detections = self._sense()
+            frame, detections, depth_map = self._sense()
             if frame is None:
                 time.sleep(0.05)
                 continue
 
             h, w = frame.shape[:2]
-            floor_obs = self._get_floor_obstacles(detections, w, h)
-
-            # Check for dangerously close obstacles
-            if self._anything_too_close(floor_obs):
-                self._stop()
-                print("[floor_nav] Obstacle too close — stopped")
-                return False
-
-            clearance = self._build_clearance_map(floor_obs, w)
+            clearance, _, using_depth = self._build_navigation_clearance(
+                depth_map, detections, w, h)
             gap_col = self._find_best_gap(
                 clearance, target_col, prefer_widest=prefer_widest)
 
             if gap_col is None:
-                self._stop()
-                print("[floor_nav] No passable gap — stopped")
-                return False
+                return self._stop_with_progress(
+                    motion_started,
+                    "[floor_nav] No passable gap — stopped",
+                    "[floor_nav] No passable gap; stopping after forward progress")
+
+            if using_depth:
+                corridor_clear = self._estimate_depth_corridor_clearance(
+                    depth_map, gap_col)
+                if (corridor_clear is not None
+                        and corridor_clear <= self.DEPTH_STOP_CLEARANCE_M):
+                    return self._stop_with_progress(
+                        motion_started,
+                        (f"[floor_nav] Depth stop at {corridor_clear:.2f}m"),
+                        (f"[floor_nav] Depth stop at {corridor_clear:.2f}m "
+                         "after forward progress"))
+            elif self._anything_too_close(self._get_floor_obstacles(
+                    detections, w, h)):
+                return self._stop_with_progress(
+                    motion_started,
+                    "[floor_nav] Obstacle too close — stopped",
+                    "[floor_nav] Obstacle too close after forward progress")
 
             L, R = self._col_to_steer(gap_col, speed)
             self.rover.send({"T": 1, "L": round(L, 3), "R": round(R, 3)})
+            motion_started = self._mark_motion(motion_started)
             time.sleep(0.1)
 
-        self._stop()
-        return False
+        return self._stop_with_progress(
+            motion_started,
+            "[floor_nav] Timeout without forward progress",
+            "[floor_nav] Timeout after forward progress")
 
     def drive_to_object(self, target_name, speed=None, timeout=15.0):
         """Drive toward a YOLO-detected object while avoiding obstacles.
@@ -146,7 +164,7 @@ class FloorNavigator:
                 self._stop()
                 return False
 
-            frame, detections = self._sense()
+            frame, detections, depth_map = self._sense()
             if frame is None:
                 time.sleep(0.05)
                 continue
@@ -182,21 +200,30 @@ class FloorNavigator:
             target_col = int(target["cx"] * self.NUM_COLUMNS)
             target_col = max(0, min(self.NUM_COLUMNS - 1, target_col))
 
-            # Floor obstacle analysis
-            floor_obs = self._get_floor_obstacles(detections, w, h)
-
-            if self._anything_too_close(floor_obs):
-                self._stop()
-                print("[floor_nav] Obstacle too close while approaching target")
-                return False
-
-            clearance = self._build_clearance_map(floor_obs, w)
+            clearance, _, using_depth = self._build_navigation_clearance(
+                depth_map, detections, w, h)
             gap_col = self._find_best_gap(clearance, target_col)
 
             if gap_col is None:
                 self._stop()
                 print("[floor_nav] Path to target blocked")
                 return False
+
+            if using_depth:
+                corridor_clear = self._estimate_depth_corridor_clearance(
+                    depth_map, gap_col)
+                if (corridor_clear is not None
+                        and corridor_clear <= self.DEPTH_STOP_CLEARANCE_M):
+                    self._stop()
+                    print("[floor_nav] Depth stop while approaching target "
+                          f"({corridor_clear:.2f}m)")
+                    return False
+            else:
+                floor_obs = self._get_floor_obstacles(detections, w, h)
+                if self._anything_too_close(floor_obs):
+                    self._stop()
+                    print("[floor_nav] Obstacle too close while approaching target")
+                    return False
 
             L, R = self._col_to_steer(gap_col, speed)
             self.rover.send({"T": 1, "L": round(L, 3), "R": round(R, 3)})
@@ -214,12 +241,13 @@ class FloorNavigator:
         gap in the clearance map if no vertical edges are found.
 
         Returns:
-            True  if drove through (floor zone becomes fully clear)
-            False if blocked or timed out
+            True  if drove through or made meaningful forward progress
+            False if blocked immediately or timed out without progress
         """
         t0 = time.time()
         clear_streak = 0
         THROUGH_FRAMES = 8  # consecutive all-clear frames = we're through
+        motion_started = None
 
         print("[floor_nav] Driving through opening")
 
@@ -228,7 +256,7 @@ class FloorNavigator:
                 self._stop()
                 return False
 
-            frame, detections = self._sense()
+            frame, detections, depth_map = self._sense()
             if frame is None:
                 time.sleep(0.05)
                 continue
@@ -238,14 +266,16 @@ class FloorNavigator:
             # Try to find door frame edges via Hough lines
             midpoint_col = self._find_opening_center(frame, w, h)
 
-            floor_obs = self._get_floor_obstacles(detections, w, h)
+            clearance, _, using_depth = self._build_navigation_clearance(
+                depth_map, detections, w, h)
 
-            if self._anything_too_close(floor_obs):
-                self._stop()
-                print("[floor_nav] Blocked in doorway")
-                return False
-
-            clearance = self._build_clearance_map(floor_obs, w)
+            if not using_depth:
+                floor_obs = self._get_floor_obstacles(detections, w, h)
+                if self._anything_too_close(floor_obs):
+                    return self._stop_with_progress(
+                        motion_started,
+                        "[floor_nav] Blocked in doorway",
+                        "[floor_nav] Blocked in doorway after forward progress")
 
             # Check if we're through (floor zone all clear)
             if all(clearance):
@@ -257,7 +287,7 @@ class FloorNavigator:
             else:
                 clear_streak = 0
 
-            if midpoint_col is not None:
+            if midpoint_col is not None and clearance[midpoint_col]:
                 # Steer toward the detected opening center
                 target_col = midpoint_col
             else:
@@ -265,18 +295,32 @@ class FloorNavigator:
                 gap_col = self._find_best_gap(
                     clearance, self.NUM_COLUMNS // 2, prefer_widest=True)
                 if gap_col is None:
-                    self._stop()
-                    print("[floor_nav] No gap found in doorway")
-                    return False
+                    return self._stop_with_progress(
+                        motion_started,
+                        "[floor_nav] No gap found in doorway",
+                        "[floor_nav] No doorway gap; stopping after forward progress")
                 target_col = gap_col
+
+            if using_depth:
+                corridor_clear = self._estimate_depth_corridor_clearance(
+                    depth_map, target_col)
+                if (corridor_clear is not None
+                        and corridor_clear <= self.DEPTH_STOP_CLEARANCE_M):
+                    return self._stop_with_progress(
+                        motion_started,
+                        f"[floor_nav] Depth stop toward doorway ({corridor_clear:.2f}m)",
+                        (f"[floor_nav] Depth stop toward doorway "
+                         f"({corridor_clear:.2f}m) after forward progress"))
 
             L, R = self._col_to_steer(target_col, speed)
             self.rover.send({"T": 1, "L": round(L, 3), "R": round(R, 3)})
+            motion_started = self._mark_motion(motion_started)
             time.sleep(0.1)
 
-        self._stop()
-        print("[floor_nav] Timeout in doorway")
-        return False
+        return self._stop_with_progress(
+            motion_started,
+            "[floor_nav] Timeout in doorway",
+            "[floor_nav] Doorway timeout after forward progress")
 
     def check_floor_clear(self, detections, frame_w, frame_h, direction_col=None,
                           prefer_widest=False):
@@ -297,12 +341,15 @@ class FloorNavigator:
         if direction_col is None:
             direction_col = self.NUM_COLUMNS // 2
 
-        floor_obs = self._get_floor_obstacles(detections, frame_w, frame_h)
+        depth_map = (self.tracker.get_depth_map()
+                     if hasattr(self.tracker, 'get_depth_map') else None)
+        clearance, _, using_depth = self._build_navigation_clearance(
+            depth_map, detections, frame_w, frame_h)
 
-        if self._anything_too_close(floor_obs):
-            return False, None
-
-        clearance = self._build_clearance_map(floor_obs, frame_w)
+        if not using_depth:
+            floor_obs = self._get_floor_obstacles(detections, frame_w, frame_h)
+            if self._anything_too_close(floor_obs):
+                return False, None
 
         # Check if the requested direction is in a passable gap
         gap_col = self._find_best_gap(
@@ -330,16 +377,33 @@ class FloorNavigator:
     # ------------------------------------------------------------------
 
     def _sense(self):
-        """Grab a frame + run detection.  Returns (frame, detections) or (None, [])."""
+        """Grab a frame + sensors. Returns (frame, detections, depth_map)."""
         jpeg = self.tracker.get_jpeg()
         if not jpeg:
-            return None, []
+            return None, [], None
         frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8),
                              cv2.IMREAD_COLOR)
         if frame is None:
-            return None, []
-        detections = self.detector.detect(frame)
-        return frame, detections
+            return None, [], None
+
+        depth_map = None
+        if hasattr(self.tracker, "get_depth_map"):
+            try:
+                depth_map = self.tracker.get_depth_map()
+            except Exception:
+                depth_map = None
+
+        detections = []
+        if hasattr(self.tracker, "get_detections"):
+            try:
+                tracked, _, age = self.tracker.get_detections()
+                if age < 0.5:
+                    detections = tracked
+            except Exception:
+                detections = []
+        if not detections and self.detector is not None:
+            detections = self.detector.detect(frame)
+        return frame, detections, depth_map
 
     # ------------------------------------------------------------------
     # Internal: floor obstacle analysis
@@ -435,6 +499,103 @@ class FloorNavigator:
 
         return clearance
 
+    def _build_navigation_clearance(self, depth_map, detections, frame_w,
+                                    frame_h):
+        """Build a passability map.
+
+        Depth Anything is authoritative when available; YOLO is only a
+        fallback when no usable depth map is present.
+        """
+        depth_cols = self._estimate_depth_column_clearances(depth_map)
+        if depth_cols is not None:
+            clearance = [
+                dist >= self.DEPTH_PASSABLE_CLEARANCE_M for dist in depth_cols
+            ]
+            return clearance, depth_cols, True
+
+        floor_obs = self._get_floor_obstacles(detections, frame_w, frame_h)
+        return self._build_clearance_map(floor_obs, frame_w), None, False
+
+    def _estimate_depth_column_clearances(self, depth_map):
+        """Estimate per-column clearance distance from the depth map."""
+        if depth_map is None or getattr(depth_map, "size", 0) == 0:
+            return None
+
+        h, w = depth_map.shape[:2]
+        y0 = int(h * self.FLOOR_HORIZON)
+        y1 = int(h * self.FLOOR_BOTTOM)
+        if y1 <= y0:
+            return None
+
+        region = depth_map[y0:y1, :]
+        if region.size == 0:
+            return None
+
+        d_min = float(depth_map.min())
+        d_max = float(depth_map.max())
+        if not np.isfinite(d_min) or not np.isfinite(d_max):
+            return None
+
+        col_w = w / self.NUM_COLUMNS
+        clearances = []
+        for c in range(self.NUM_COLUMNS):
+            x0 = int(c * col_w)
+            x1 = w if c == self.NUM_COLUMNS - 1 else int((c + 1) * col_w)
+            col = region[:, x0:x1]
+            clearances.append(self._depth_patch_to_clearance(col, d_min, d_max))
+
+        return clearances
+
+    def _estimate_depth_corridor_clearance(self, depth_map, target_col):
+        """Estimate depth clearance in the corridor for a chosen steer column."""
+        if depth_map is None or getattr(depth_map, "size", 0) == 0:
+            return None
+
+        h, w = depth_map.shape[:2]
+        center = (target_col + 0.5) / self.NUM_COLUMNS
+        half_width = max(0.06, 0.8 / self.NUM_COLUMNS)
+        x0 = int(w * max(0.05, center - half_width))
+        x1 = int(w * min(0.95, center + half_width))
+        y0 = int(h * 0.40)
+        y1 = int(h * self.FLOOR_BOTTOM)
+        if y1 <= y0:
+            return None
+        corridor = depth_map[y0:y1, x0:x1]
+        if corridor.size == 0:
+            return None
+
+        d_min = float(depth_map.min())
+        d_max = float(depth_map.max())
+        if not np.isfinite(d_min) or not np.isfinite(d_max):
+            return None
+        return self._depth_patch_to_clearance(corridor, d_min, d_max)
+
+    def _depth_patch_to_clearance(self, patch, d_min, d_max):
+        """Convert a depth patch into an approximate clear distance in meters."""
+        if patch is None or getattr(patch, "size", 0) == 0:
+            return None
+
+        if d_max - d_min < 0.01:
+            mid = (d_min + d_max) / 2.0
+            return 0.15 if mid > 0.5 else 1.0
+
+        near = float(np.percentile(patch, self.DEPTH_NEAR_PERCENTILE))
+        if not np.isfinite(near):
+            return None
+        relative_far = 1.0 - (near - d_min) / (d_max - d_min + 1e-6)
+        dist_m = 0.3 + relative_far * (self.DEPTH_MAX_CLEARANCE_M - 0.3)
+
+        top = patch[:max(1, patch.shape[0] // 3), :]
+        bottom = patch[-max(1, patch.shape[0] // 3):, :]
+        if top.size and bottom.size:
+            top_mean = float(np.mean(top))
+            bottom_mean = float(np.mean(bottom))
+            if (bottom_mean > top_mean * 1.35
+                    and bottom_mean > d_min + (d_max - d_min) * 0.55):
+                dist_m -= 0.25
+
+        return max(0.15, dist_m)
+
     def _find_best_gap(self, clearance, target_col, prefer_widest=False):
         """Find a passable gap to drive through.
 
@@ -474,6 +635,23 @@ class FloorNavigator:
 
         best = min(passable, key=score)
         return int((best[0] + best[1]) / 2)
+
+    def _mark_motion(self, motion_started):
+        if motion_started is None:
+            return time.time()
+        return motion_started
+
+    def _made_progress(self, motion_started):
+        return (motion_started is not None
+                and (time.time() - motion_started) >= self.MIN_PROGRESS_S)
+
+    def _stop_with_progress(self, motion_started, failure_msg, progress_msg):
+        self._stop()
+        if self._made_progress(motion_started):
+            print(progress_msg)
+            return True
+        print(failure_msg)
+        return False
 
     # ------------------------------------------------------------------
     # Internal: steering
@@ -569,4 +747,4 @@ class FloorNavigator:
 
         midpoint_px = (left_x + right_x) / 2.0
         col_w = frame_w / self.NUM_COLUMNS
-        return int(midpoint_px / col_w)
+        return max(0, min(self.NUM_COLUMNS - 1, int(midpoint_px / col_w)))

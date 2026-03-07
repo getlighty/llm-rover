@@ -1,0 +1,41 @@
+- 2026-03-07 06:43 chair is raised
+- 2026-03-07 07:05 blue laundry basket
+- 2026-03-07 07:06 person in plaid pants
+- 2026-03-07 07:06 task done
+- 2026-03-07 07:07 Person reclined in chair, no further action needed.
+- 2026-03-07 07:16 User requested crab-like movement.
+- 2026-03-07 07:16 Foot placed on table next to rubber bands.
+- 2026-03-07 07:16 Foot near bag of rubber bands, adjusting camera angle.
+- 2026-03-07 07:16 Foot near crumpled plastic bag, possible interaction detected.
+- 2026-03-07 07:18 User mentioned watermelon and a nearby restaurant/shop.
+- 2026-03-07 07:18 Person's feet now on floor, posture adjusted.
+- 2026-03-07 07:18 Phone visible on table, user mentioned 'téléphone'.
+- 2026-03-07 07:19 Camera angle shifted upward, showing ceiling and upper furniture.
+- 2026-03-07 07:19 User mentioned 'third GDP', adjusting camera angle accordingly.
+- 2026-03-07 07:19 Room unchanged, continuing search for third GDP.
+- 2026-03-07 07:19 Camera reveals table leg and additional floor space on the right.
+- 2026-03-07 07:19 Room layout unchanged, attempting slight forward movement for better perspective.
+- 2026-03-07 07:19 Camera angle shifted upward, now focusing on the left side of the room.
+- 2026-03-07 07:19 Camera angle shifted downward, scanning wooden floor for potential GDP location.
+- 2026-03-07 07:20 Room unchanged, initiating a cautious left turn to inspect the cluttered corner.
+- 2026-03-07 07:28 Office chair visible
+- 2026-03-07 07:29 Human legs in view, staying still
+- 2026-03-07 07:29 Person focused on handheld item, possibly phone or book
+- 2026-03-07 07:29 Task complete: dog located and settled
+- 2026-03-07 07:30 Scene calm, no further action needed
+- 2026-03-07 07:30 User clarified — no weapon present, only household items
+- 2026-03-07 07:30 Person interacting with basket — check if dog remains undisturbed
+- 2026-03-07 07:31 Dog location uncertain after person moved — continue cautious scan
+- 2026-03-07 07:31 Scene stable, dog not visible but environment calm
+- 2026-03-07 07:31 Stain noted; dog remains hidden but environment appears safe
+- 2026-03-07 07:31 Blue light noted; dog remains hidden but environment appears safe
+- 2026-03-07 07:31 Dog not visible after multiple shifts; assume hiding, not distressed
+- 2026-03-07 07:32 Dog remains hidden; environment stable despite obstruction
+- 2026-03-07 07:36 person on office chair
+- 2026-03-07 07:37 person on office chair
+- 2026-03-07 07:37 man spinning on office chair
+- 2026-03-07 07:37 man spinning on office chair
+- 2026-03-07 07:37 man spun office chair
+- 2026-03-07 07:45 Moving towards the next room
+- 2026-03-07 08:09 person on floor
+- 2026-03-07 08:15 moving forward

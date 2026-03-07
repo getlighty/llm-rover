@@ -13,11 +13,11 @@ import time
 import json
 import threading
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 
+from depth_guidance import DepthCorridorExtractor
 import room_context
 
 # ── Config Persistence ───────────────────────────────────────────────────
@@ -55,7 +55,10 @@ if "gimbal_pan_offset" in _cfg:
 # Clear snapshot dir on import (= service restart)
 import shutil
 if os.path.exists(NAV_SNAPSHOTS_DIR):
-    shutil.rmtree(NAV_SNAPSHOTS_DIR)
+    try:
+        shutil.rmtree(NAV_SNAPSHOTS_DIR)
+    except Exception as e:
+        print(f"[nav] Snapshot cleanup skipped: {e}")
 os.makedirs(NAV_SNAPSHOTS_DIR, exist_ok=True)
 print(f"[nav] Snapshot dir: {NAV_SNAPSHOTS_DIR}")
 
@@ -81,11 +84,6 @@ MAX_AREA_ESCAPES = 5
 AREA_STUCK_RADIUS = 0.45    # meters — tolerate smaller progress before calling it area-stuck
 AREA_STUCK_WAYPOINTS = 10   # give exploration more time before declaring area-stuck
 LLM_429_BACKOFF_S = 5.0     # seconds to wait after a 429 rate limit
-DEFAULT_LLM_RTT_S = 2.5
-LLM_RTT_EMA_ALPHA = 0.25
-LLM_PREFETCH_MARGIN_S = 0.6
-LLM_PREFETCH_MIN_LEAD_S = 0.8
-LLM_PREFETCH_MAX_LEAD_S = 6.0
 MAX_SUBTASK_DEPTH = 3
 SUBTASK_WAYPOINT_BUDGET = 10  # pop subtask if no progress after this many waypoints
 
@@ -99,6 +97,13 @@ MEDIUM_OBSTACLE_CAP_M = 0.8
 FORCED_TURN_LIMIT = 2
 MIN_COMMIT_DRIVE_M = 0.25
 MAX_DRIVE_AVOIDANCES = 5
+CAMERA_HFOV_DEG = 65.0
+ROVER_PATH_HALF_WIDTH_NORM = 0.22
+AVOID_PATH_MARGIN_NORM = 0.05
+AVOID_DEFAULT_ANGLE_DEG = 14.0
+AVOID_MAX_ANGLE_DEG = 28.0
+AVOID_MIN_STEER = 0.07
+AVOID_MAX_STEER = 0.14
 AREA_ESCAPE_REVERSE_S = 3.0
 AREA_ESCAPE_TURN_DEG = 100
 RECOVER_REVERSE_S = 2.1
@@ -120,6 +125,15 @@ ENCODER_RAMPUP_S = 0.6      # ignore encoder stuck during motor ramp-up
 FLOOR_ESCAPE_SPEED = 0.12
 FLOOR_ESCAPE_TIMEOUT_S = 5.0
 DOORWAY_ESCAPE_TIMEOUT_S = 6.5
+DEPTH_SELF_FLOOR_CUTOFF = 0.88
+DEPTH_LLM_BLOCKED_M = 0.45
+DEPTH_LLM_PASSABLE_M = 0.75
+LLM_STUCK_DETECTION_ENABLED = False
+DEPTH_GUIDANCE_SEARCH_WINDOW_DEG = 18.0
+FLUID_CONTINUE_CLEARANCE_M = 0.85
+FLUID_TURN_TO_DRIVE_DEG = 18.0
+FLUID_MIN_DRIVE_M = 0.55
+FLUID_MAX_AUTO_DRIVE_M = 0.9
 
 # YOLO classes to IGNORE for obstacle avoidance.
 # These are either above rover height, background furniture seen from ground
@@ -234,6 +248,11 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def _depth_usable_bottom(h, cutoff=DEPTH_SELF_FLOOR_CUTOFF):
+    """Bottom row limit for depth logic to ignore self-floor glow."""
+    return max(1, min(h, int(round(h * cutoff))))
+
+
 # ── Navigator ────────────────────────────────────────────────────────────
 
 class Navigator:
@@ -264,11 +283,16 @@ class Navigator:
         self._nav_target = ""  # current navigation target
         self._last_drive_angle = 0  # last drive direction (degrees, neg=left)
         self._target_world_bearing = None  # world bearing where target was last seen
-        self._mid_drive_future = None  # LLM prefetch submitted during drive
         self._plan = None  # current NavigationPlan (for journey logging)
         self._last_transition_peek = None
-        self._llm_last_rtt_s = None
-        self._llm_rtt_ema_s = DEFAULT_LLM_RTT_S
+        self._depth_corridor_extractor = DepthCorridorExtractor(
+            num_columns=21,
+            corridor_width=7,
+            floor_top=0.40,
+            floor_bottom=DEPTH_SELF_FLOOR_CUTOFF,
+            depth_max_clearance_m=MAX_CLEAR_DIST,
+            passable_clearance_m=DEPTH_LLM_BLOCKED_M,
+        )
 
     def _log(self, msg):
         """Print to stdout and send to web UI log stream."""
@@ -276,19 +300,129 @@ class Navigator:
         if self._log_fn:
             self._log_fn("nav", msg)
 
-    def _record_llm_rtt(self, elapsed_s):
-        self._llm_last_rtt_s = max(0.0, float(elapsed_s))
-        prev = self._llm_rtt_ema_s
-        alpha = LLM_RTT_EMA_ALPHA
-        self._llm_rtt_ema_s = ((1.0 - alpha) * prev) + (alpha * self._llm_last_rtt_s)
+    def _base_drive_wheels(self, drive_angle):
+        angle_steer = _clamp(float(drive_angle) / 90.0 * 0.10, -0.10, 0.10)
+        return round(DRIVE_SPEED + angle_steer, 3), round(DRIVE_SPEED - angle_steer, 3)
 
-    def _prefetch_lead_time(self):
-        base = self._llm_rtt_ema_s if self._llm_rtt_ema_s else DEFAULT_LLM_RTT_S
-        return _clamp(
-            base + LLM_PREFETCH_MARGIN_S,
-            LLM_PREFETCH_MIN_LEAD_S,
-            LLM_PREFETCH_MAX_LEAD_S,
-        )
+    def _fresh_tracker_detections(self, max_age=1.0):
+        """Return only fresh tracker detections; never trigger ad-hoc YOLO."""
+        dets, summary, age = self._get_detections()
+        if age > max_age:
+            return [], "", age
+        return dets, summary, age
+
+    def _depth_target_corridor(self, depth_map, drive_angle=0):
+        """Pick the best depth corridor near the intended drive direction."""
+        if depth_map is None or self._depth_corridor_extractor is None:
+            return None
+        try:
+            return self._depth_corridor_extractor.analyze_depth_map_toward(
+                depth_map,
+                preferred_heading_deg=float(_clamp(drive_angle, -30, 30)),
+                search_half_window_deg=DEPTH_GUIDANCE_SEARCH_WINDOW_DEG,
+            )
+        except Exception:
+            return None
+
+    def _fluid_drive_distance(self, clear_dist, requested_dist=None):
+        """Bias toward fewer, longer drive segments when depth is clearly open."""
+        dist = 0.0
+        if isinstance(requested_dist, (int, float)) and requested_dist > 0:
+            dist = float(requested_dist)
+        if clear_dist is None or clear_dist < FLUID_CONTINUE_CLEARANCE_M:
+            return dist
+        target = min(MAX_CLEAR_DIST, clear_dist * DRIVE_FRACTION,
+                     FLUID_MAX_AUTO_DRIVE_M)
+        target = max(target, FLUID_MIN_DRIVE_M)
+        return max(dist, target)
+
+    def _prefer_fluid_motion(self, result, depth_map=None, clear_dist=None):
+        """Convert timid stop-go plans into continuous guided motion when safe."""
+        if not isinstance(result, dict):
+            return result
+
+        result = dict(result)
+        action = str(result.get("action", "")).strip().lower()
+        schema = None
+        angle_key = None
+        dist_key = None
+        turn_deg = None
+
+        if action == "turn":
+            schema = "simple"
+            angle_key = "angle"
+            dist_key = "distance"
+            raw_turn = result.get("turn_degrees", 0)
+            turn_deg = float(raw_turn) if isinstance(raw_turn, (int, float)) else 0.0
+        elif action in ("drive", "drive_forward"):
+            schema = "simple" if action == "drive" else "waypoint"
+            angle_key = "angle" if action == "drive" else "drive_angle"
+            dist_key = "distance" if action == "drive" else "drive_distance"
+        elif action in ("turn_left", "turn_right"):
+            schema = "waypoint"
+            angle_key = "drive_angle"
+            dist_key = "drive_distance"
+            raw_turn = result.get("turn_degrees", 0)
+            base_turn = float(raw_turn) if isinstance(raw_turn, (int, float)) else 0.0
+            turn_deg = -abs(base_turn) if action == "turn_left" else abs(base_turn)
+        else:
+            return result
+
+        if clear_dist is None:
+            clear_dist = None
+        elif not isinstance(clear_dist, (int, float)):
+            clear_dist = None
+        else:
+            clear_dist = float(clear_dist)
+
+        requested_angle = result.get(angle_key, 0.0)
+        if not isinstance(requested_angle, (int, float)):
+            requested_angle = 0.0
+        requested_angle = float(_clamp(requested_angle, -30, 30))
+
+        # Small visual corrections should be handled in-drive, not as stop-turn-stop.
+        if (turn_deg is not None and depth_map is not None
+                and clear_dist is not None
+                and clear_dist >= FLUID_CONTINUE_CLEARANCE_M
+                and abs(turn_deg) <= FLUID_TURN_TO_DRIVE_DEG):
+            guidance = self._depth_target_corridor(depth_map, turn_deg)
+            if guidance is not None:
+                drive_angle = float(_clamp(guidance.recommended_heading_deg, -30, 30))
+                drive_dist = self._fluid_drive_distance(clear_dist, result.get(dist_key))
+                if schema == "simple":
+                    result["action"] = "drive"
+                    result["angle"] = int(round(drive_angle))
+                    result["distance"] = round(max(drive_dist, MIN_COMMIT_DRIVE_M), 2)
+                else:
+                    result["action"] = "drive_forward"
+                    result["drive_angle"] = int(round(drive_angle))
+                    result["drive_distance"] = round(max(drive_dist, MIN_COMMIT_DRIVE_M), 2)
+                result["_fluid_motion_note"] = (
+                    f"turn->drive {turn_deg:+.0f}deg in open depth"
+                )
+                return result
+
+        if action in ("drive", "drive_forward") and depth_map is not None:
+            guidance = self._depth_target_corridor(depth_map, requested_angle)
+            if guidance is not None:
+                refined_angle = float(_clamp(guidance.recommended_heading_deg, -30, 30))
+                if schema == "simple":
+                    result["angle"] = int(round(refined_angle))
+                else:
+                    result["drive_angle"] = int(round(refined_angle))
+
+        if action in ("drive", "drive_forward") and clear_dist is not None:
+            drive_dist = self._fluid_drive_distance(clear_dist, result.get(dist_key))
+            if drive_dist > 0:
+                boosted = round(max(drive_dist, MIN_COMMIT_DRIVE_M), 2)
+                current = result.get(dist_key)
+                if not isinstance(current, (int, float)) or boosted > float(current) + 0.05:
+                    result[dist_key] = boosted
+                    result["_fluid_motion_note"] = (
+                        f"extended drive to {boosted:.2f}m on open depth"
+                    )
+
+        return result
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -318,8 +452,6 @@ class Navigator:
         max_wp = step_budget if step_budget else MAX_WAYPOINTS
         prev_drive_jpeg = None  # frame before last drive (for stuck detection)
         image_stuck_count = 0   # consecutive image-unchanged drives
-        prefetch_future = None  # background LLM call
-        llm_pool = ThreadPoolExecutor(max_workers=1)
         self._consecutive_429s = 0
 
         # Position-based stuck detection
@@ -338,7 +470,6 @@ class Navigator:
         for wp in range(max_wp):
             if self._aborted():
                 self._store_step_result(False, "aborted", wp)
-                llm_pool.shutdown(wait=False)
                 return False
 
             self._wp_used = wp + 1
@@ -364,11 +495,9 @@ class Navigator:
                         self._store_step_result(False,
                             f"area_stuck ({displacement:.1f}m in "
                             f"{AREA_STUCK_WAYPOINTS}wp)", wp + 1)
-                        llm_pool.shutdown(wait=False)
                         return False
                     # Big escape: back out, turn hard, and re-enter open space.
                     self._area_escape()
-                    prefetch_future = None
                     total_rotation = 0
                     consecutive_turns = 0
                 else:
@@ -380,13 +509,6 @@ class Navigator:
             # 1. Align body to gimbal heading
             self._align_body()
             time.sleep(GIMBAL_SETTLE_S)
-
-            # 2. If no prefetch is pending, fire one now so LLM runs
-            #    while we gather sensors below (saves 2-3s idle time)
-            if prefetch_future is None:
-                _ct, _tr = consecutive_turns, total_rotation
-                prefetch_future = llm_pool.submit(
-                    self._prefetch_assessment, target, _ct, _tr)
 
             # 3. Gather sensor data (camera now facing body's forward)
             self._maybe_snapshot()
@@ -438,20 +560,16 @@ class Navigator:
                     self._log(f"YOLO sees '{target}' "
                           f"(bw={target_det['bw']:.2f}), approaching")
                     self._subtask_stack.clear()
-                    # Cancel any prefetch — switching to P-control
-                    prefetch_future = None
                     result = self._drive_to_target(target)
                     if result == "arrived":
                         self._log(f"Arrived at '{target}'")
                         self._store_step_result(True, "arrived", wp + 1)
-                        llm_pool.shutdown(wait=False)
                         return True
                     if result == "stuck":
                         stuck_count += 1
                         if stuck_count >= MAX_STUCK_EVENTS:
                             self._say("I keep getting stuck")
                             self._store_step_result(False, "stuck", wp + 1)
-                            llm_pool.shutdown(wait=False)
                             return False
                         self._recover_stuck(target, encoder_stuck=True)
                     continue
@@ -465,7 +583,6 @@ class Navigator:
                 (depth_map is not None and self._depth_wall_check(depth_map))
                 or self._image_wall_check(jpeg))
             if wall_detected:
-                prefetch_future = None  # stale after wall recovery
                 last_angle = getattr(self, '_last_drive_angle', 0)
                 turn_deg = -90 if last_angle > 0 else 90
                 self._log(f"Wall detected — backing up + turning "
@@ -479,24 +596,14 @@ class Navigator:
                 consecutive_turns = 0
                 continue
 
-            # 5. LLM assessment — use prefetch if available
-            assessment = None
-            if prefetch_future is not None:
-                try:
-                    assessment = prefetch_future.result(timeout=10)
-                    if assessment:
-                        self._log(f"Using prefetched LLM result")
-                except Exception:
-                    assessment = None
-                prefetch_future = None
-
-            if assessment is None:
-                self._log(f"→ LLM input: YOLO={yolo_summary}, "
-                      f"clear={dist_str}, turns={consecutive_turns}, "
-                      f"rot={total_rotation:+.0f}°")
-                assessment = self._llm_assess_waypoint(
-                    target, self._current_subtask(), jpeg, yolo_summary,
-                    clear_dist, consecutive_turns, total_rotation)
+            self._log(f"→ LLM input: YOLO={yolo_summary}, "
+                  f"clear={dist_str}, turns={consecutive_turns}, "
+                  f"rot={total_rotation:+.0f}°")
+            assessment = self._llm_assess_waypoint(
+                target, self._current_subtask(), jpeg, yolo_summary,
+                clear_dist, consecutive_turns, total_rotation)
+            assessment = self._prefer_fluid_motion(
+                assessment, depth_map=depth_map, clear_dist=clear_dist)
 
             if assessment is None:
                 # LLM failed — keep exploring through the best available space.
@@ -506,12 +613,7 @@ class Navigator:
                     COURAGE_FALLBACK_DRIVE_M, stuck_count)
                 if result == "stuck_abort":
                     self._store_step_result(False, "stuck", wp + 1)
-                    llm_pool.shutdown(wait=False)
                     return False
-                # Prefetch for next iteration
-                _ct, _tr = consecutive_turns, total_rotation
-                prefetch_future = llm_pool.submit(
-                    self._prefetch_assessment, target, _ct, _tr)
                 continue
 
             scene = assessment.get("scene", "?")
@@ -536,6 +638,8 @@ class Navigator:
                 extras.append(f"because='{assessment['subtask_reason']}'")
             if assessment.get("subtask_achieved"):
                 extras.append("subtask_achieved=YES")
+            if assessment.get("_fluid_motion_note"):
+                extras.append(assessment["_fluid_motion_note"])
             extra_str = f" [{', '.join(extras)}]" if extras else ""
             self._log(f"LLM: '{scene}' → {action}{extra_str}")
 
@@ -570,17 +674,14 @@ class Navigator:
                 # LLM declares arrival (for non-YOLO targets like doorways)
                 self._log(f"LLM declares arrived at '{target}'")
                 self._store_step_result(True, "arrived", wp + 1)
-                llm_pool.shutdown(wait=False)
                 return True
 
             elif action == "approach_target":
                 consecutive_turns = 0
-                prefetch_future = None  # P-control takes over
                 result = self._drive_to_target(target)
                 if result == "arrived":
                     self._log(f"Arrived at '{target}'")
                     self._store_step_result(True, "arrived", wp + 1)
-                    llm_pool.shutdown(wait=False)
                     return True
                 if result == "lost":
                     # YOLO can't find the target — don't re-ask LLM,
@@ -591,28 +692,16 @@ class Navigator:
                         f"P-control lost target, blind drive {TARGET_LOST_DRIVE_M:.2f}m"
                               f" at {angle:+.0f}° instead")
                     pre_drive_jpeg = self.tracker.get_jpeg()
-                    _ct, _tr = consecutive_turns, total_rotation
                     result2, stuck_count = self._execute_blind_drive(
-                        TARGET_LOST_DRIVE_M, stuck_count, angle,
-                        prefetch_pool=llm_pool,
-                        prefetch_fn=self._prefetch_assessment,
-                        prefetch_args=(target, _ct, _tr))
+                        TARGET_LOST_DRIVE_M, stuck_count, angle)
                     if result2 == "stuck_abort":
                         self._store_step_result(False, "stuck", wp + 1)
-                        llm_pool.shutdown(wait=False)
                         return False
-                    # Pick up mid-drive prefetch
-                    if self._mid_drive_future is not None:
-                        prefetch_future = self._mid_drive_future
-                        self._mid_drive_future = None
-                    else:
-                        prefetch_future = None
                 elif result == "stuck":
                     stuck_count += 1
                     if stuck_count >= MAX_STUCK_EVENTS:
                         self._say("I keep getting stuck")
                         self._store_step_result(False, "stuck", wp + 1)
-                        llm_pool.shutdown(wait=False)
                         return False
                     self._recover_stuck(target, encoder_stuck=True)
 
@@ -630,9 +719,6 @@ class Navigator:
                 self._move_gimbal(new_pan, 0)
                 self._log(f"Gimbal turned to {new_pan:.0f}° "
                       f"(total rotation: {total_rotation:+.0f}°)")
-                # No prefetch after turns — body alignment at next waypoint
-                # changes the view, making any prefetched frame stale.
-                prefetch_future = None
 
             elif action in ("drive_forward", "subtask"):
                 consecutive_turns = 0
@@ -648,11 +734,13 @@ class Navigator:
                 # Cap drive distance when depth shows obstacle ahead
                 if depth_map is not None:
                     h, w = depth_map.shape[:2]
+                    usable_bottom = _depth_usable_bottom(h)
                     far_strip = depth_map[int(h*0.2):int(h*0.4),
                                           int(w*0.3):int(w*0.7)]
-                    near_strip = depth_map[int(h*0.6):h,
+                    near_strip = depth_map[int(h*0.6):usable_bottom,
                                            int(w*0.3):int(w*0.7)]
-                    if (float(np.mean(far_strip))
+                    if (near_strip.size > 0 and far_strip.size > 0
+                            and float(np.mean(far_strip))
                             > float(np.mean(near_strip)) * 1.3):
                         drive_dist = min(drive_dist, MEDIUM_OBSTACLE_CAP_M)
                         self._log(f"Capped drive to {MEDIUM_OBSTACLE_CAP_M:.1f}m "
@@ -661,23 +749,11 @@ class Navigator:
                 drive_angle = _clamp(drive_angle, -30, 30)
                 # Grab frame before driving for stuck detection
                 pre_drive_jpeg = self.tracker.get_jpeg()
-                # Drive with mid-drive prefetch timed from measured LLM RTT.
-                _ct, _tr = consecutive_turns, total_rotation
                 result, stuck_count = self._execute_blind_drive(
-                    drive_dist, stuck_count, drive_angle,
-                    prefetch_pool=llm_pool,
-                    prefetch_fn=self._prefetch_assessment,
-                    prefetch_args=(target, _ct, _tr))
+                    drive_dist, stuck_count, drive_angle)
                 if result == "stuck_abort":
                     self._store_step_result(False, "stuck", wp + 1)
-                    llm_pool.shutdown(wait=False)
                     return False
-                # Pick up mid-drive prefetch if it was submitted
-                if self._mid_drive_future is not None:
-                    prefetch_future = self._mid_drive_future
-                    self._mid_drive_future = None
-                else:
-                    prefetch_future = None
                 # Image-based stuck: did the scene change after driving?
                 post_drive_jpeg = self.tracker.get_jpeg()
                 if (pre_drive_jpeg and post_drive_jpeg
@@ -689,7 +765,6 @@ class Navigator:
                               " — backing up and scanning")
                         self._recover_stuck(target)
                         image_stuck_count = 0
-                        prefetch_future = None
                     else:
                         self._log("Image unchanged after drive (1/2)")
                 else:
@@ -697,24 +772,12 @@ class Navigator:
 
             else:
                 consecutive_turns = 0
-                _ct, _tr = consecutive_turns, total_rotation
                 result, stuck_count = self._execute_blind_drive(
-                    COURAGE_FALLBACK_DRIVE_M, stuck_count,
-                    prefetch_pool=llm_pool,
-                    prefetch_fn=self._prefetch_assessment,
-                    prefetch_args=(target, _ct, _tr))
+                    COURAGE_FALLBACK_DRIVE_M, stuck_count)
                 if result == "stuck_abort":
                     self._store_step_result(False, "stuck", wp + 1)
-                    llm_pool.shutdown(wait=False)
                     return False
-                # Pick up mid-drive prefetch
-                if self._mid_drive_future is not None:
-                    prefetch_future = self._mid_drive_future
-                    self._mid_drive_future = None
-                else:
-                    prefetch_future = None
 
-        llm_pool.shutdown(wait=False)
         # Auto-learn from failure: save what went wrong
         scene = getattr(self, '_last_scene', '')
         last_yolo = getattr(self, '_last_yolo', '')
@@ -729,37 +792,13 @@ class Navigator:
         self._store_step_result(False, "budget", max_wp)
         return False
 
-    def _prefetch_assessment(self, target, consecutive_turns, total_rotation):
-        """Background LLM call — grab fresh frame + sensors, run assessment.
-        Called from ThreadPoolExecutor so it runs while the rover moves."""
-        try:
-            jpeg = self.tracker.get_jpeg()
-            if not jpeg:
-                return None
-            dets, yolo, _ = self._get_detections()
-            depth = (self.tracker.get_depth_map()
-                     if hasattr(self.tracker, 'get_depth_map') else None)
-            clear = self._estimate_clear_distance(depth, dets)
-            return self._llm_assess_waypoint(
-                target, self._current_subtask(), jpeg, yolo, clear,
-                consecutive_turns, total_rotation)
-        except Exception as e:
-            self._log(f"Prefetch LLM error: {e}")
-            return None
-
-    def _execute_blind_drive(self, distance, stuck_count, drive_angle=0,
-                             prefetch_pool=None, prefetch_fn=None,
-                             prefetch_args=None):
+    def _execute_blind_drive(self, distance, stuck_count, drive_angle=0):
         """Helper: blind drive + handle stuck.
         Returns tuple: ("ok"|"stuck_abort", updated_stuck_count)."""
         self._last_drive_angle = drive_angle
-        self._mid_drive_future = None
         angle_str = f" at {drive_angle:+.0f}°" if abs(drive_angle) > 3 else ""
         self._log(f"Driving forward {distance:.1f}m{angle_str}")
-        result = self._blind_drive(distance, drive_angle,
-                                   prefetch_pool=prefetch_pool,
-                                   prefetch_fn=prefetch_fn,
-                                   prefetch_args=prefetch_args)
+        result = self._blind_drive(distance, drive_angle)
 
         # Update exploration grid after drive
         if self.exploration and result in ("ok", "obstacle"):
@@ -866,12 +905,9 @@ class Navigator:
         last_scene = ""
         obstacle_info = ""  # feedback from last drive
         last_peek_step = -99
-        prefetch_future = None
-        llm_pool = ThreadPoolExecutor(max_workers=1)
 
         for step in range(max_steps):
             if self._aborted():
-                llm_pool.shutdown(wait=False)
                 return False, None, last_scene
 
             # Area stuck check after a larger exploration window.
@@ -892,10 +928,8 @@ class Navigator:
                     area_escapes += 1
                     self._log(f"Area escape #{area_escapes}")
                     if area_escapes >= MAX_AREA_ESCAPES:
-                        llm_pool.shutdown(wait=False)
                         return False, None, last_scene
                     self._area_escape()
-                    prefetch_future = None
                     consecutive_turns = 0
                 checkpoint_x, checkpoint_y = cx, cy
                 checkpoint_step = step
@@ -916,7 +950,6 @@ class Navigator:
                         self._log("IMAGE STUCK in leg — escaping")
                         if not self._try_floor_nav_escape(doorway_mode=True):
                             self._area_escape()
-                        prefetch_future = None
                         _img_same_count = 0
                         _prev_jpeg = None
                         consecutive_turns = 0
@@ -926,7 +959,7 @@ class Navigator:
             _prev_jpeg = jpeg
 
             # YOLO + depth
-            dets, yolo_summary, _ = self._get_detections()
+            dets, yolo_summary, det_age = self._get_detections()
             depth_map = (self.tracker.get_depth_map()
                          if hasattr(self.tracker, 'get_depth_map') else None)
             clear_dist = self._estimate_clear_distance(
@@ -946,7 +979,6 @@ class Navigator:
                     obstacle_info = (
                         "Backed out from chair/desk clutter. "
                         "Reassess the doorway from here.\n")
-                    prefetch_future = None
                     consecutive_turns = 0
                     _img_same_count = 0
                     _prev_jpeg = None
@@ -955,7 +987,6 @@ class Navigator:
                     obstacle_info = (
                         "FloorNavigator moved toward a doorway/open gap. "
                         "Reassess from the new position.\n")
-                    prefetch_future = None
                     consecutive_turns = 0
                     _img_same_count = 0
                     _prev_jpeg = None
@@ -963,59 +994,42 @@ class Navigator:
                 area_escapes += 1
                 self._log(f"Legacy escape #{area_escapes}")
                 if area_escapes >= MAX_AREA_ESCAPES:
-                    llm_pool.shutdown(wait=False)
                     return False, None, last_scene
                 self._recover_stuck(self._nav_target)
-                prefetch_future = None
+                obstacle_info = ""  # clear stale warning after recovery
                 consecutive_turns = 0
                 _img_same_count = 0
                 _prev_jpeg = None
                 continue
 
             room_ctx = self._room_map_context(6)
-            result = None
-            if prefetch_future is not None:
-                try:
-                    result = prefetch_future.result(timeout=10)
-                    if result:
-                        self._log("Using prefetched leg assessment")
-                except Exception:
-                    result = None
-                prefetch_future = None
-
-            if result is None:
-                result = self._llm_assess_leg(
-                    instruction, step, max_steps, jpeg, yolo_summary,
-                    clear_dist, obstacle_info=obstacle_info, room_ctx=room_ctx)
+            result = self._llm_assess_leg(
+                instruction, step, max_steps, jpeg, yolo_summary,
+                clear_dist, depth_map=depth_map,
+                obstacle_info=obstacle_info, room_ctx=room_ctx)
+            result = self._normalize_llm_result(result, depth_map=depth_map)
+            result = self._prefer_fluid_motion(
+                result, depth_map=depth_map, clear_dist=clear_dist)
             obstacle_info = ""  # clear after use
 
             if result is None:
                 self._log(
                     f"Leg step {step+1}: LLM unavailable, blind {COURAGE_FALLBACK_DRIVE_M:.2f}m")
-                prefetch_fn = (self._prefetch_leg_assessment
-                               if step + 1 < max_steps else None)
-                prefetch_args = ((instruction, step + 1, max_steps)
-                                 if prefetch_fn else None)
-                self._blind_drive(
-                    COURAGE_FALLBACK_DRIVE_M, 0,
-                    prefetch_pool=llm_pool,
-                    prefetch_fn=prefetch_fn,
-                    prefetch_args=prefetch_args)
-                if self._mid_drive_future is not None:
-                    prefetch_future = self._mid_drive_future
-                    self._mid_drive_future = None
+                self._blind_drive(COURAGE_FALLBACK_DRIVE_M, 0)
                 continue
 
             action = result.get("action", "drive")
             scene = result.get("scene", "")
             reason = result.get("reason", "")
             target_vis = result.get("target_visible", False)
-            llm_stuck = result.get("stuck", False) or action == "stuck"
             last_scene = scene
+            ignored_stuck = result.get("_llm_stuck_ignored", False)
+            fluid_note = result.get("_fluid_motion_note")
             self._log(f"Leg step {step+1}: {scene[:70]} → {action} "
-                      f"(target={'Y' if target_vis else 'N'}, "
-                      f"stuck={'Y' if llm_stuck else 'N'}) "
-                      f"({reason[:50]})")
+                      f"(target={'Y' if target_vis else 'N'}) "
+                      f"({reason[:50]})"
+                      + (" [ignored LLM stuck]" if ignored_stuck else "")
+                      + (f" [{fluid_note}]" if fluid_note else ""))
 
             if target_vis and (step - last_peek_step) >= 2:
                 peek = self._peek_transition_view(instruction, jpeg=jpeg)
@@ -1029,8 +1043,10 @@ class Navigator:
                         + (f" via {peek_feats}" if peek_feats else "")
                     )
 
-            # LLM says we're stuck — trigger recovery immediately
-            if llm_stuck:
+            # LLM stuck detection temporarily disabled; onboard recovery
+            # still handles encoder/image/depth-based stalls.
+            if LLM_STUCK_DETECTION_ENABLED and (
+                    result.get("stuck", False) or action == "stuck"):
                 self._log("LLM detected stuck")
                 under_furniture, uf_evidence = self._detect_under_furniture(
                     scene, reason, dets, clear_dist)
@@ -1040,7 +1056,6 @@ class Navigator:
                     obstacle_info = (
                         "Backed out from under furniture into a clearer spot. "
                         "Reassess the doorway from here.\n")
-                    prefetch_future = None
                     consecutive_turns = 0
                     _img_same_count = 0
                     _prev_jpeg = None
@@ -1049,7 +1064,6 @@ class Navigator:
                     obstacle_info = (
                         "FloorNavigator followed the widest opening. "
                         "Reassess the doorway from here.\n")
-                    prefetch_future = None
                     consecutive_turns = 0
                     _img_same_count = 0
                     _prev_jpeg = None
@@ -1057,10 +1071,9 @@ class Navigator:
                 area_escapes += 1
                 self._log(f"Legacy escape #{area_escapes}")
                 if area_escapes >= MAX_AREA_ESCAPES:
-                    llm_pool.shutdown(wait=False)
                     return False, None, last_scene
                 self._recover_stuck(self._nav_target)
-                prefetch_future = None
+                obstacle_info = ""  # clear stale warning so next LLM sees fresh scene
                 consecutive_turns = 0
                 _img_same_count = 0
                 _prev_jpeg = None
@@ -1077,10 +1090,9 @@ class Navigator:
                     self._yolo_correction_fn(yolo_corr)
 
             # Room map update
-            if (self.room_map and self.detector and
-                    self.detector.last_detections):
+            if self.room_map and det_age < 1.0 and dets:
                 self.room_map.record(
-                    self.detector.last_detections,
+                    dets,
                     self.pose.x if hasattr(self.pose, 'x') else 0,
                     self.pose.y if hasattr(self.pose, 'y') else 0,
                     self.pose.body_yaw, self.pose.cam_pan,
@@ -1094,14 +1106,11 @@ class Navigator:
                     room_id, room_conf = room_check_fn(scene)
                     if room_id == target_room:
                         self._log(f"Room verified: {room_id} ({room_conf})")
-                        llm_pool.shutdown(wait=False)
                         return True, room_id, scene
                     elif room_conf > 0.6:
                         self._log(f"Wrong room: {room_id} ({room_conf}), "
                                   f"expected {target_room}")
-                        llm_pool.shutdown(wait=False)
                         return False, room_id, scene
-                llm_pool.shutdown(wait=False)
                 return True, target_room, scene
 
             elif action == "turn":
@@ -1111,13 +1120,11 @@ class Navigator:
                         f"{FORCED_TURN_LIMIT} turns in leg — forcing drive {FORCED_EXPLORE_DRIVE_M:.1f}m")
                     consecutive_turns = 0
                     self._blind_drive(FORCED_EXPLORE_DRIVE_M, 0)
-                    prefetch_future = None
                 else:
                     degrees = int(result.get("turn_degrees", 0))
                     if abs(degrees) > 5:
                         self._spin_body(degrees)
                         self._move_gimbal(0, 0)
-                        prefetch_future = None
 
             elif action == "drive":
                 consecutive_turns = 0
@@ -1127,20 +1134,7 @@ class Navigator:
                 if clear_dist is not None:
                     dist = min(dist, clear_dist * DRIVE_FRACTION)
                     dist = max(MIN_COMMIT_DRIVE_M, dist)
-                prefetch_fn = (self._prefetch_leg_assessment
-                               if step + 1 < max_steps else None)
-                prefetch_args = ((instruction, step + 1, max_steps)
-                                 if prefetch_fn else None)
-                drive_result = self._blind_drive(
-                    dist, angle,
-                    prefetch_pool=llm_pool,
-                    prefetch_fn=prefetch_fn,
-                    prefetch_args=prefetch_args)
-                if self._mid_drive_future is not None:
-                    prefetch_future = self._mid_drive_future
-                    self._mid_drive_future = None
-                else:
-                    prefetch_future = None
+                drive_result = self._blind_drive(dist, angle)
                 if drive_result in ("obstacle", "stuck"):
                     obstacle_info = (
                         f"WARNING: Last drive was BLOCKED by obstacle "
@@ -1149,19 +1143,19 @@ class Navigator:
                     encoder_stuck = (drive_result == "stuck")
                     if encoder_stuck:
                         self._recover_stuck(self._nav_target, encoder_stuck=True)
-                        prefetch_future = None
+                        obstacle_info = ""  # clear stale warning after recovery
                     elif self._llm_verify_obstacle():
                         if self._try_floor_nav_escape(doorway_mode=True):
                             obstacle_info = (
                                 "FloorNavigator advanced toward a doorway "
                                 "or widest gap. Reassess before driving again.\n")
-                            prefetch_future = None
                             _img_same_count = 0
                             _prev_jpeg = None
                             continue
                         self._recover_stuck(self._nav_target)
-                        prefetch_future = None
+                        obstacle_info = ""  # clear stale warning after recovery
                     else:
+                        obstacle_info = ""  # YOLO ghost — don't warn LLM
                         self._log("YOLO ghost — continuing")
 
             # After each drive, check room change via scene description
@@ -1170,11 +1164,9 @@ class Navigator:
                 if room_id == target_room and room_conf > 0.7:
                     self._log(f"Room changed to {room_id} ({room_conf}) "
                               f"— leg complete!")
-                    llm_pool.shutdown(wait=False)
                     return True, room_id, scene
 
         self._log(f"Leg exhausted ({max_steps} steps)")
-        llm_pool.shutdown(wait=False)
         return False, None, last_scene
 
     def navigate_reactive(self, goal, max_steps=40):
@@ -1204,13 +1196,10 @@ class Navigator:
         _prev_jpeg = None         # for image variance stuck detection
         _img_same_count = 0       # consecutive similar images
         obstacle_info = ""
-        prefetch_future = None
-        llm_pool = ThreadPoolExecutor(max_workers=1)
 
         for step in range(max_steps):
             if self._aborted():
                 self._log("Reactive nav aborted")
-                llm_pool.shutdown(wait=False)
                 return False
 
             # Area stuck check after a larger exploration window.
@@ -1224,7 +1213,6 @@ class Navigator:
                     if self._try_floor_nav_escape(doorway_mode=False):
                         checkpoint_x, checkpoint_y = cx, cy
                         checkpoint_step = step
-                        prefetch_future = None
                         consecutive_turns = 0
                         _img_same_count = 0
                         _prev_jpeg = None
@@ -1234,10 +1222,8 @@ class Navigator:
                     if area_escapes >= MAX_AREA_ESCAPES:
                         self._log(f"Giving up — stuck {MAX_AREA_ESCAPES} times")
                         self._say("I can't find a way out")
-                        llm_pool.shutdown(wait=False)
                         return False
                     self._area_escape()
-                    prefetch_future = None
                 checkpoint_x, checkpoint_y = cx, cy
                 checkpoint_step = step
 
@@ -1254,7 +1240,7 @@ class Navigator:
                 continue
 
             # Get YOLO + depth info
-            dets, yolo_summary, _ = self._get_detections()
+            dets, yolo_summary, det_age = self._get_detections()
             depth_map = (self.tracker.get_depth_map()
                          if hasattr(self.tracker, 'get_depth_map') else None)
             clear_dist = self._estimate_clear_distance(
@@ -1271,7 +1257,6 @@ class Navigator:
                     obstacle_info = (
                         "Backed out from chair/desk clutter. "
                         "Reassess from the new position.\n")
-                    prefetch_future = None
                     consecutive_turns = 0
                     _img_same_count = 0
                     _prev_jpeg = None
@@ -1280,7 +1265,6 @@ class Navigator:
                     obstacle_info = (
                         "FloorNavigator moved toward the widest clear space. "
                         "Reassess from the new position.\n")
-                    prefetch_future = None
                     consecutive_turns = 0
                     _img_same_count = 0
                     _prev_jpeg = None
@@ -1290,56 +1274,41 @@ class Navigator:
                 if area_escapes >= MAX_AREA_ESCAPES:
                     self._log(f"Giving up — stuck {MAX_AREA_ESCAPES} times")
                     self._say("I can't find a way out")
-                    llm_pool.shutdown(wait=False)
                     return False
                 self._recover_stuck(goal)
-                prefetch_future = None
+                obstacle_info = ""  # clear stale warning after recovery
                 continue
 
-            result = None
-            if prefetch_future is not None:
-                try:
-                    result = prefetch_future.result(timeout=10)
-                    if result:
-                        self._log("Using prefetched reactive assessment")
-                except Exception:
-                    result = None
-                prefetch_future = None
-
-            if result is None:
-                result = self._llm_assess_reactive(
-                    goal, step, max_steps, jpeg, yolo_summary, clear_dist,
-                    obstacle_info=obstacle_info, room_ctx=room_ctx)
+            result = self._llm_assess_reactive(
+                goal, step, max_steps, jpeg, yolo_summary, clear_dist,
+                depth_map=depth_map,
+                obstacle_info=obstacle_info, room_ctx=room_ctx)
+            result = self._normalize_llm_result(result, depth_map=depth_map)
+            result = self._prefer_fluid_motion(
+                result, depth_map=depth_map, clear_dist=clear_dist)
             if result is None:
                 # LLM unavailable — keep pressing through visible free space.
                 self._log(
                     f"Step {step+1}: LLM unavailable, blind {COURAGE_FALLBACK_DRIVE_M:.2f}m")
-                prefetch_fn = (self._prefetch_reactive_assessment
-                               if step + 1 < max_steps else None)
-                prefetch_args = ((goal, step + 1, max_steps)
-                                 if prefetch_fn else None)
-                self._blind_drive(
-                    COURAGE_FALLBACK_DRIVE_M, 0,
-                    prefetch_pool=llm_pool,
-                    prefetch_fn=prefetch_fn,
-                    prefetch_args=prefetch_args)
-                if self._mid_drive_future is not None:
-                    prefetch_future = self._mid_drive_future
-                    self._mid_drive_future = None
+                self._blind_drive(COURAGE_FALLBACK_DRIVE_M, 0)
                 continue
 
             action = result.get("action", "drive")
             scene = result.get("scene", "")
             reason = result.get("reason", "")
             target_vis = result.get("target_visible", False)
-            llm_stuck = result.get("stuck", False) or action == "stuck"
+            ignored_stuck = result.get("_llm_stuck_ignored", False)
+            fluid_note = result.get("_fluid_motion_note")
             self._log(f"Step {step+1}: {scene[:70]} → {action} "
-                      f"(target={'Y' if target_vis else 'N'}, "
-                      f"stuck={'Y' if llm_stuck else 'N'}) "
-                      f"({reason[:50]})")
+                      f"(target={'Y' if target_vis else 'N'}) "
+                      f"({reason[:50]})"
+                      + (" [ignored LLM stuck]" if ignored_stuck else "")
+                      + (f" [{fluid_note}]" if fluid_note else ""))
 
-            # LLM says we're stuck — trigger recovery immediately
-            if llm_stuck:
+            # LLM stuck detection temporarily disabled; onboard recovery
+            # still handles encoder/image/depth-based stalls.
+            if LLM_STUCK_DETECTION_ENABLED and (
+                    result.get("stuck", False) or action == "stuck"):
                 self._log("LLM detected stuck")
                 under_furniture, uf_evidence = self._detect_under_furniture(
                     scene, reason, dets, clear_dist)
@@ -1348,7 +1317,6 @@ class Navigator:
                     obstacle_info = (
                         "Backed out from under furniture into a clearer spot. "
                         "Reassess from the new position.\n")
-                    prefetch_future = None
                     consecutive_turns = 0
                     _img_same_count = 0
                     _prev_jpeg = None
@@ -1357,7 +1325,6 @@ class Navigator:
                     obstacle_info = (
                         "FloorNavigator took the widest passable gap. "
                         "Reassess from the new position.\n")
-                    prefetch_future = None
                     consecutive_turns = 0
                     _img_same_count = 0
                     _prev_jpeg = None
@@ -1367,10 +1334,9 @@ class Navigator:
                 if area_escapes >= MAX_AREA_ESCAPES:
                     self._log(f"Giving up — stuck {MAX_AREA_ESCAPES} times")
                     self._say("I can't find a way out")
-                    llm_pool.shutdown(wait=False)
                     return False
                 self._recover_stuck(goal)
-                prefetch_future = None
+                obstacle_info = ""  # clear stale warning so next LLM sees fresh scene
                 continue
 
             # Process YOLO corrections from LLM
@@ -1392,7 +1358,6 @@ class Navigator:
                                   f"{_img_same_count} steps — escaping")
                         if not self._try_floor_nav_escape(doorway_mode=False):
                             self._area_escape()
-                        prefetch_future = None
                         _img_same_count = 0
                         _prev_jpeg = None
                         consecutive_turns = 0
@@ -1402,10 +1367,9 @@ class Navigator:
             _prev_jpeg = jpeg
 
             # Feed into room map
-            if (self.room_map and self.detector and
-                    self.detector.last_detections):
+            if self.room_map and det_age < 1.0 and dets:
                 self.room_map.record(
-                    self.detector.last_detections,
+                    dets,
                     self.pose.x if hasattr(self.pose, 'x') else 0,
                     self.pose.y if hasattr(self.pose, 'y') else 0,
                     self.pose.body_yaw, self.pose.cam_pan,
@@ -1414,7 +1378,6 @@ class Navigator:
             if action == "arrived":
                 self._log(f"Arrived at '{goal}'!")
                 self._say(f"Reached {goal}")
-                llm_pool.shutdown(wait=False)
                 return True
 
             elif action == "turn":
@@ -1425,13 +1388,11 @@ class Navigator:
                         f"{FORCED_TURN_LIMIT} consecutive turns — forcing drive {FORCED_EXPLORE_DRIVE_M:.1f}m")
                     consecutive_turns = 0
                     self._blind_drive(FORCED_EXPLORE_DRIVE_M, 0)
-                    prefetch_future = None
                 else:
                     degrees = int(result.get("turn_degrees", 0))
                     if abs(degrees) > 5:
                         self._spin_body(degrees)
                         self._move_gimbal(0, 0)
-                        prefetch_future = None
 
             elif action == "drive":
                 consecutive_turns = 0
@@ -1442,20 +1403,7 @@ class Navigator:
                 if clear_dist is not None:
                     dist = min(dist, clear_dist * DRIVE_FRACTION)
                     dist = max(MIN_COMMIT_DRIVE_M, dist)
-                prefetch_fn = (self._prefetch_reactive_assessment
-                               if step + 1 < max_steps else None)
-                prefetch_args = ((goal, step + 1, max_steps)
-                                 if prefetch_fn else None)
-                drive_result = self._blind_drive(
-                    dist, angle,
-                    prefetch_pool=llm_pool,
-                    prefetch_fn=prefetch_fn,
-                    prefetch_args=prefetch_args)
-                if self._mid_drive_future is not None:
-                    prefetch_future = self._mid_drive_future
-                    self._mid_drive_future = None
-                else:
-                    prefetch_future = None
+                drive_result = self._blind_drive(dist, angle)
                 if drive_result in ("obstacle", "stuck"):
                     obstacle_info = (
                         f"WARNING: Last drive BLOCKED at angle {angle}°. "
@@ -1463,24 +1411,23 @@ class Navigator:
                     encoder_stuck = (drive_result == "stuck")
                     if encoder_stuck:
                         self._recover_stuck(goal, encoder_stuck=True)
-                        prefetch_future = None
+                        obstacle_info = ""  # clear stale warning after recovery
                     elif self._llm_verify_obstacle():
                         if self._try_floor_nav_escape(doorway_mode=False):
                             obstacle_info = (
                                 "FloorNavigator moved toward the widest gap. "
                                 "Reassess before the next drive.\n")
-                            prefetch_future = None
                             _img_same_count = 0
                             _prev_jpeg = None
                             continue
                         self._recover_stuck(goal)
-                        prefetch_future = None
+                        obstacle_info = ""  # clear stale warning after recovery
                     else:
+                        obstacle_info = ""  # YOLO ghost — don't warn LLM
                         self._log("YOLO ghost — continuing")
 
         self._log(f"Max steps ({max_steps}) reached")
         self._say("Couldn't reach it")
-        llm_pool.shutdown(wait=False)
         return False
 
     def _store_step_result(self, success, reason, waypoints_used):
@@ -1502,6 +1449,115 @@ class Navigator:
 
     # ── Depth Estimation ─────────────────────────────────────────────────
 
+    def _depth_patch_clear_distance(self, patch, d_min, d_max):
+        """Convert a depth patch into an approximate clear distance in meters."""
+        if patch is None or patch.size == 0:
+            return None
+
+        if d_max - d_min < 0.01:
+            mid = (d_min + d_max) / 2.0
+            if mid > 0.5:
+                return 0.15
+            return 1.0
+
+        near = float(np.percentile(patch, 95))
+        if not np.isfinite(near):
+            return None
+
+        top_strip = patch[:max(1, patch.shape[0] // 3), :]
+        bot_strip = patch[-max(1, patch.shape[0] // 3):, :]
+        gradient_penalty = 0.0
+        if top_strip.size and bot_strip.size:
+            top_mean = float(np.mean(top_strip))
+            bot_mean = float(np.mean(bot_strip))
+            if (bot_mean > top_mean * 1.4
+                    and bot_mean > d_min + (d_max - d_min) * 0.5):
+                gradient_penalty = 0.3
+
+        relative_far = 1.0 - (near - d_min) / (d_max - d_min + 1e-6)
+        dist_m = 0.3 + relative_far * (MAX_CLEAR_DIST - 0.3)
+        dist_m -= gradient_penalty
+        return max(0.15, dist_m)
+
+    def _estimate_depth_sector_clearance(self, depth_map, center_norm,
+                                         half_width_norm=0.12):
+        """Estimate clearance for a lateral sector of the live depth map."""
+        if depth_map is None:
+            return None
+        h, w = depth_map.shape[:2]
+        y0 = int(h * 0.40)
+        y1 = _depth_usable_bottom(h)
+        if y1 <= y0:
+            return None
+        x0 = int(w * max(0.02, center_norm - half_width_norm))
+        x1 = int(w * min(0.98, center_norm + half_width_norm))
+        patch = depth_map[y0:y1, x0:x1]
+        if patch.size == 0:
+            return None
+        d_min = float(depth_map.min())
+        d_max = float(depth_map.max())
+        if not np.isfinite(d_min) or not np.isfinite(d_max):
+            return None
+        return self._depth_patch_clear_distance(patch, d_min, d_max)
+
+    def _depth_llm_context(self, clear_dist=None, depth_map=None):
+        """Compact structured depth summary for LLM navigation prompts."""
+        if depth_map is None and hasattr(self.tracker, 'get_depth_map'):
+            try:
+                depth_map = self.tracker.get_depth_map()
+            except Exception:
+                depth_map = None
+
+        if clear_dist is None and depth_map is None:
+            return ""
+
+        lines = []
+        if clear_dist is not None:
+            lines.append(f"DepthAnything: clear ahead {clear_dist:.1f}m.")
+
+        if depth_map is not None:
+            sectors = [
+                ("left", self._estimate_depth_sector_clearance(depth_map, 0.22)),
+                ("center", self._estimate_depth_sector_clearance(depth_map, 0.50)),
+                ("right", self._estimate_depth_sector_clearance(depth_map, 0.78)),
+            ]
+            valid = [(name, dist) for name, dist in sectors if dist is not None]
+            if valid:
+                lines.append(
+                    "Depth sectors: "
+                    + ", ".join(f"{name}={dist:.1f}m" for name, dist in valid)
+                    + "."
+                )
+                best_name, best_dist = max(valid, key=lambda item: item[1])
+                passable = [
+                    name for name, dist in valid
+                    if dist >= DEPTH_LLM_PASSABLE_M
+                ]
+                blocked = [
+                    name for name, dist in valid
+                    if dist <= DEPTH_LLM_BLOCKED_M
+                ]
+                if passable:
+                    lines.append(f"Most open side: {best_name}. Passable: {', '.join(passable)}.")
+                else:
+                    lines.append(f"Most open side: {best_name}, but all sectors are tight.")
+                if blocked:
+                    lines.append(f"Blocked/near: {', '.join(blocked)}.")
+
+            h, w = depth_map.shape[:2]
+            usable_bottom = _depth_usable_bottom(h)
+            far_strip = depth_map[int(h*0.2):int(h*0.4), int(w*0.3):int(w*0.7)]
+            near_strip = depth_map[int(h*0.6):usable_bottom, int(w*0.3):int(w*0.7)]
+            far_mean = float(np.mean(far_strip)) if far_strip.size else 0.0
+            near_mean = float(np.mean(near_strip)) if near_strip.size else 0.0
+            if near_mean > 0.0 and far_mean > near_mean * 1.3:
+                lines.append("Depth warning: surface/wall ahead at medium distance.")
+
+        lines.append(
+            "DepthAnything free-space is more reliable than YOLO labels for gap choice and stop distance."
+        )
+        return "\n".join(lines) + "\n"
+
     def _estimate_depth_clear_distance(self, depth_map, drive_angle=0):
         """Estimate clear forward distance from the depth corridor alone."""
         if depth_map is None:
@@ -1512,41 +1568,22 @@ class Navigator:
         angle_shift = _clamp(drive_angle / 90.0 * 0.5, -0.25, 0.25)
         corridor_center = 0.5 + angle_shift
         h, w = depth_map.shape[:2]
+        y1 = _depth_usable_bottom(h)
         # Corridor adjusted for drive angle
         cx0 = int(w * max(0.05, corridor_center - 0.15))
         cx1 = int(w * min(0.95, corridor_center + 0.15))
-        y0, y1 = int(h * 0.40), h
+        y0 = int(h * 0.40)
+        if y1 <= y0:
+            return None
         corridor = depth_map[y0:y1, cx0:cx1]
         if corridor.size == 0:
             return None
 
-        # Depth Anything: higher = closer. 95th pctl = nearest obstacle.
-        near = float(np.percentile(corridor, 95))
         d_min = float(depth_map.min())
         d_max = float(depth_map.max())
-
-        if d_max - d_min < 0.01:
-            mid = (d_min + d_max) / 2.0
-            if mid > 0.5:
-                return 0.15  # wall right in front
-            return 1.0
-
-        # Check depth gradient: if the bottom rows are much closer than
-        # top rows, we're approaching something fast
-        top_strip = corridor[:corridor.shape[0] // 3, :]
-        bot_strip = corridor[2 * corridor.shape[0] // 3:, :]
-        top_mean = float(np.mean(top_strip))
-        bot_mean = float(np.mean(bot_strip))
-        # If bottom much closer than top → floor/object approaching
-        gradient_penalty = 0.0
-        if bot_mean > top_mean * 1.4 and bot_mean > d_min + (d_max - d_min) * 0.5:
-            gradient_penalty = 0.3  # something close at ground level
-
-        # Invert: high depth = close = small distance
-        relative_far = 1.0 - (near - d_min) / (d_max - d_min + 1e-6)
-        dist_m = 0.3 + relative_far * (MAX_CLEAR_DIST - 0.3)
-        dist_m -= gradient_penalty
-        return max(0.15, dist_m)
+        if not np.isfinite(d_min) or not np.isfinite(d_max):
+            return None
+        return self._depth_patch_clear_distance(corridor, d_min, d_max)
 
     def _estimate_clear_distance(self, depth_map, detections,
                                  drive_angle=0):
@@ -1561,7 +1598,7 @@ class Navigator:
 
         nearest_metric = None
         if detections:
-            half_w = 0.22  # rover is 26cm, ~22% of 65° FOV at 0.5m
+            half_w = ROVER_PATH_HALF_WIDTH_NORM
             lo = corridor_center - half_w
             hi = corridor_center + half_w
             corridor_dets = [
@@ -1631,7 +1668,10 @@ class Navigator:
         x0 = int(w * max(0.05, center - 0.25))
         x1 = int(w * min(0.95, center + 0.25))
         y0 = int(h * 0.45)
-        corridor = depth_map[y0:h, x0:x1]
+        y1 = _depth_usable_bottom(h)
+        if y1 <= y0:
+            return None
+        corridor = depth_map[y0:y1, x0:x1]
         if corridor.size == 0:
             return None
 
@@ -1719,8 +1759,11 @@ class Navigator:
         Returns "left", "right", or "straight"."""
         h, w = depth_map.shape[:2]
         y0 = int(h * 0.40)
-        left = depth_map[y0:h, :w // 2]
-        right = depth_map[y0:h, w // 2:]
+        y1 = _depth_usable_bottom(h)
+        if y1 <= y0:
+            return "straight"
+        left = depth_map[y0:y1, :w // 2]
+        right = depth_map[y0:y1, w // 2:]
         left_mean = float(np.mean(left)) if left.size else 999
         right_mean = float(np.mean(right)) if right.size else 999
         # Lower mean = farther = more open space (steer toward lower)
@@ -1729,6 +1772,95 @@ class Navigator:
         elif right_mean < left_mean * 0.85:
             return "right"
         return "straight"
+
+    def _default_avoidance_angle(self, steer_dir, clear_ahead_m=None):
+        """Return a conservative curve angle when only side preference is known."""
+        if steer_dir not in ("left", "right"):
+            return 0.0
+        sign = -1.0 if steer_dir == "left" else 1.0
+        proximity = 0.0
+        if clear_ahead_m is not None:
+            proximity = _clamp((0.70 - float(clear_ahead_m)) / 0.45, 0.0, 1.0)
+        angle = AVOID_DEFAULT_ANGLE_DEG + (AVOID_MAX_ANGLE_DEG - AVOID_DEFAULT_ANGLE_DEG) * proximity
+        return sign * _clamp(angle, AVOID_DEFAULT_ANGLE_DEG, AVOID_MAX_ANGLE_DEG)
+
+    def _compute_avoidance_curve(self, det, path_center, depth_map=None):
+        """Estimate the curve needed to clear a specific obstacle footprint.
+
+        Returns `(side, avoid_angle_deg, reason)` where `avoid_angle_deg` is a
+        signed angle relative to the current drive heading.
+        """
+        real_cx = _fisheye_cx(det["cx"])
+        real_bw = _fisheye_bw(det["bw"], det["cx"])
+        obj_left = real_cx - real_bw / 2.0
+        obj_right = real_cx + real_bw / 2.0
+        required_half = ROVER_PATH_HALF_WIDTH_NORM + AVOID_PATH_MARGIN_NORM
+        frame_lo, frame_hi = 0.08, 0.92
+
+        candidates = []
+        left_center = obj_left - required_half
+        right_center = obj_right + required_half
+        if frame_lo <= left_center <= frame_hi:
+            candidates.append(("left", left_center))
+        if frame_lo <= right_center <= frame_hi:
+            candidates.append(("right", right_center))
+        if not candidates:
+            return "straight", 0.0, ""
+
+        default_side = "right" if real_cx <= path_center else "left"
+        depth_side = None
+        if depth_map is not None:
+            depth_side = self._depth_steer_direction(depth_map)
+
+        def score(candidate):
+            side, center = candidate
+            shift = abs(center - path_center)
+            edge_room = (center - frame_lo) if side == "left" else (frame_hi - center)
+            bias = 0.0
+            if side == default_side:
+                bias += 0.18
+            if depth_side == side:
+                bias += 0.12
+            return edge_room + bias - (0.6 * shift)
+
+        side, target_center = max(candidates, key=score)
+        shift = target_center - path_center
+
+        proximity = 0.0
+        dist_m = det.get("dist_m")
+        if isinstance(dist_m, (int, float)):
+            proximity = _clamp((0.60 - float(dist_m)) / 0.45, 0.0, 1.0)
+        else:
+            proximity = max(
+                _clamp((real_bw - 0.16) / 0.24, 0.0, 1.0),
+                _clamp((float(det.get("depth_closeness", 0.0)) - 0.55) / 0.35, 0.0, 1.0),
+            )
+
+        edge_angle = shift * CAMERA_HFOV_DEG
+        cushion = 4.0 + 8.0 * proximity
+        if abs(shift) < 1e-3:
+            shift = -1.0 if side == "left" else 1.0
+        avoid_angle = edge_angle + math.copysign(cushion, shift)
+        avoid_angle = _clamp(avoid_angle, -AVOID_MAX_ANGLE_DEG, AVOID_MAX_ANGLE_DEG)
+        if abs(avoid_angle) < AVOID_DEFAULT_ANGLE_DEG:
+            avoid_angle = math.copysign(AVOID_DEFAULT_ANGLE_DEG, avoid_angle)
+
+        reason = det["name"]
+        if isinstance(dist_m, (int, float)):
+            reason += f" @ {dist_m:.2f}m"
+        return side, avoid_angle, reason
+
+    def _curve_wheel_command(self, base_angle_deg, avoid_angle_deg):
+        """Convert a desired avoidance curve into wheel speeds."""
+        target_angle = _clamp(
+            base_angle_deg + avoid_angle_deg,
+            -AVOID_MAX_ANGLE_DEG,
+            AVOID_MAX_ANGLE_DEG,
+        )
+        mag = _clamp(abs(avoid_angle_deg) / max(AVOID_MAX_ANGLE_DEG, 1.0), 0.0, 1.0)
+        diff_mag = AVOID_MIN_STEER + (AVOID_MAX_STEER - AVOID_MIN_STEER) * mag
+        diff = math.copysign(diff_mag, target_angle if abs(target_angle) > 1e-3 else avoid_angle_deg)
+        return round(DRIVE_SPEED + diff, 3), round(DRIVE_SPEED - diff, 3), target_angle
 
     # ── Blind Drive ──────────────────────────────────────────────────────
 
@@ -1774,8 +1906,8 @@ class Navigator:
                 shift = new_cx - old_cx  # positive = anchor moved right = we turned left
                 if abs(shift) < 0.05:
                     continue  # negligible shift
-                # Convert frame shift to degrees (~65° FOV)
-                correction_deg = -shift * 65.0
+                # Convert frame shift to degrees using the camera FOV.
+                correction_deg = -shift * CAMERA_HFOV_DEG
                 if abs(correction_deg) > 5:
                     self._log(f"Anchor '{anchor['name']}' shifted "
                           f"{shift:+.2f} in frame → correcting {correction_deg:+.0f}°")
@@ -1793,16 +1925,127 @@ class Navigator:
             time.sleep(min(tick, max(0.0, deadline - time.time())))
         return True
 
+    def _depth_image_instructions(self):
+        return (
+            "IMAGE GUIDE:\n"
+            "- Image 1 is the normal camera view.\n"
+            "- Image 2 is a separate DepthAnything map aligned to Image 1.\n"
+            "- In Image 2, bright/warm/yellow-white means CLOSER.\n"
+            "- Dark/purple-black means FARTHER / more open.\n"
+            "- Use Image 2 for free-space, gaps, blockage, and stop distance.\n"
+            "- Pick the intended doorway/path direction, then mentally center the view on that corridor.\n"
+            "- If the corridor is visible in-frame, prefer driving toward its center instead of stop-turn-stop corrections.\n"
+            "- Only return a turn first when the corridor is largely off-screen or the forward route is ambiguous.\n"
+            "- For any drive action, set the angle to the CENTER of the corridor you want followed.\n"
+            "- Do NOT use Image 2 to identify object categories.\n"
+            "- The masked dark band at the very bottom is ignored self-floor.\n\n"
+        )
+
+    def _get_depth_reference_jpeg(self):
+        """Build a separate labeled JPEG for the current DepthAnything map."""
+        if not hasattr(self.tracker, 'get_depth_map'):
+            return None
+        try:
+            depth_map = self.tracker.get_depth_map()
+        except Exception:
+            depth_map = None
+        if depth_map is None or getattr(depth_map, "size", 0) == 0:
+            return None
+
+        try:
+            if hasattr(self.tracker, 'depth_estimator') and self.tracker.depth_estimator:
+                depth_vis = self.tracker.depth_estimator.colorize(depth_map)
+            else:
+                d = depth_map.copy()
+                usable_bottom = _depth_usable_bottom(d.shape[0])
+                visible = d[:usable_bottom, :] if usable_bottom > 0 else d
+                dmin = float(visible.min())
+                dmax = float(visible.max())
+                if dmax - dmin > 1e-6:
+                    d = (d - dmin) / (dmax - dmin) * 255.0
+                else:
+                    d = np.zeros_like(d)
+                if usable_bottom < d.shape[0]:
+                    d[usable_bottom:, :] = 0.0
+                depth_vis = cv2.applyColorMap(d.astype(np.uint8), cv2.COLORMAP_INFERNO)
+
+            vis = depth_vis.copy()
+            h, w = vis.shape[:2]
+            cv2.rectangle(vis, (0, 0), (w, 34), (0, 0, 0), -1)
+            cv2.putText(vis, "DepthAnything: bright=close, dark=far",
+                        (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (255, 255, 255), 1, cv2.LINE_AA)
+            usable_bottom = _depth_usable_bottom(h)
+            if usable_bottom < h:
+                cv2.rectangle(vis, (0, usable_bottom), (w, h), (0, 0, 0), -1)
+                cv2.putText(vis, "ignored self-floor", (10, max(usable_bottom - 8, 18)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (255, 255, 255), 1, cv2.LINE_AA)
+
+            ok, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                return None
+            return buf.tobytes()
+        except Exception:
+            return None
+
+    def _normalize_llm_result(self, result, depth_map=None):
+        """Ignore legacy LLM stuck signals when that mode is disabled."""
+        if not isinstance(result, dict):
+            return result
+        if LLM_STUCK_DETECTION_ENABLED:
+            return result
+
+        result = dict(result)
+        result["stuck"] = False
+        action = str(result.get("action", "")).strip().lower()
+        if action == "stuck":
+            steer_dir = self._depth_steer_direction(depth_map)
+            turn_deg = result.get("turn_degrees")
+            if not isinstance(turn_deg, (int, float)) or abs(turn_deg) < 5:
+                if steer_dir == "left":
+                    turn_deg = -25
+                elif steer_dir == "right":
+                    turn_deg = 25
+                else:
+                    turn_deg = 25
+            result["action"] = "turn"
+            result["turn_degrees"] = int(turn_deg)
+            result["_llm_stuck_ignored"] = True
+        return result
+
+    def _floor_nav_gap_available(self, detections=None):
+        """Whether FloorNavigator can already see a passable forward gap."""
+        if self.floor_nav is None:
+            return False
+        try:
+            frame_w = getattr(self.floor_nav, "FRAME_W", 640)
+            frame_h = getattr(self.floor_nav, "FRAME_H", 480)
+            clear, best_col = self.floor_nav.check_floor_clear(
+                detections or [],
+                frame_w,
+                frame_h,
+                prefer_widest=True,
+            )
+            return bool(clear or best_col is not None)
+        except Exception:
+            return False
+
     def _detect_under_furniture(self, scene_text="", reason_text="",
                                 detections=None, clear_dist=None):
         """Detect a desk/chair-leg trap from scene text and nearby clutter."""
         text = f"{scene_text} {reason_text}".lower()
         score = 0
         evidence = []
+        has_under_phrase = False
 
         for phrase in UNDER_FURNITURE_TEXT_HINTS:
             if phrase in text:
-                score += 2 if phrase.startswith("under ") else 1
+                if phrase.startswith("under "):
+                    score += 2
+                    has_under_phrase = True
+                else:
+                    score += 1
                 evidence.append(phrase)
 
         close_furniture = 0
@@ -1842,8 +2085,21 @@ class Navigator:
             score += 1
             evidence.append(f"clear={clear_dist:.2f}m")
 
+        gap_available = self._floor_nav_gap_available(detections)
+        if gap_available:
+            evidence.append("gap_available")
+            summary = ", ".join(dict.fromkeys(evidence))
+            return False, summary
+
+        objective_clutter = (
+            close_furniture >= 2
+            or (has_chair and has_legs)
+            or (has_table and has_legs)
+            or (clear_dist is not None
+                and clear_dist <= UNDER_FURNITURE_CLOSE_CLEAR_M)
+        )
         summary = ", ".join(dict.fromkeys(evidence))
-        return score >= 3, summary
+        return score >= 4 and objective_clutter, summary
 
     def _under_furniture_escape(self, target="", doorway_mode=False,
                                 evidence=""):
@@ -1936,16 +2192,11 @@ class Navigator:
 
         return True
 
-    def _blind_drive(self, distance_m, drive_angle=0,
-                     prefetch_pool=None, prefetch_fn=None,
-                     prefetch_args=None):
+    def _blind_drive(self, distance_m, drive_angle=0):
         """Drive forward with depth + YOLO reactive avoidance.
         drive_angle: degrees offset (-30 to +30, negative=left, positive=right).
         Steers around obstacles when possible, stops only when blocked.
         Uses encoder feedback to measure actual distance (timer fallback).
-        Submits a mid-drive LLM prefetch when the measured time remaining is
-        close to the observed LLM round-trip time, so the next assessment is
-        ready when the drive finishes.
         Returns: "ok", "obstacle", or "stuck".
         Sets self._last_drive_avoidances (int) with count of steer events."""
         drive_time = distance_m / DRIVE_SPEED  # timer fallback
@@ -1954,16 +2205,14 @@ class Navigator:
         enc_stuck_count = 0
         steering = False  # True when actively avoiding an obstacle
         avoidance_count = 0  # how many times we had to steer around something
+        current_avoid_angle = 0.0
+        active_drive_angle = float(_clamp(drive_angle, -30, 30))
 
         # Encoder-based distance tracking
         enc_distance = 0.0      # meters traveled (from encoders)
         enc_last_time = None     # last encoder read timestamp
         enc_has_data = False     # got at least one valid encoder reading
         clear_history = deque(maxlen=4)
-
-        # Mid-drive prefetch: fire when the remaining drive time is within the
-        # observed LLM RTT plus a small safety margin.
-        prefetch_submitted = False
 
         # Capture visual anchors before driving (for post-avoidance correction)
         visual_anchors = self._pick_visual_anchors()
@@ -1973,14 +2222,10 @@ class Navigator:
         # Keep camera level while driving — tilting down blocks forward vision
         self._move_gimbal(self.pose.cam_pan, 0)
 
-        # Convert drive_angle to wheel differential
-        angle_steer = _clamp(drive_angle / 90.0 * 0.10, -0.10, 0.10)
-        base_L = DRIVE_SPEED + angle_steer
-        base_R = DRIVE_SPEED - angle_steer
-        self.rover.send({"T": 1, "L": round(base_L, 3),
-                         "R": round(base_R, 3)})
-        if abs(drive_angle) > 3:
-            self._log(f"Driving at {drive_angle:+.0f}° angle")
+        base_L, base_R = self._base_drive_wheels(active_drive_angle)
+        self.rover.send({"T": 1, "L": base_L, "R": base_R})
+        if abs(active_drive_angle) > 3:
+            self._log(f"Driving at {active_drive_angle:+.0f}° angle")
 
         try:
             while time.time() - t_start < drive_time:
@@ -1994,6 +2239,8 @@ class Navigator:
 
                 obstacle_detected = False
                 steer_dir = "straight"
+                avoid_angle = 0.0
+                avoid_reason = ""
                 progress = enc_distance if enc_has_data else (
                     (time.time() - t_start) * DRIVE_SPEED)
                 remaining_dist = max(0.0, distance_m - progress)
@@ -2003,6 +2250,20 @@ class Navigator:
                 depth_map = (self.tracker.get_depth_map()
                              if hasattr(self.tracker, 'get_depth_map')
                              else None)
+                depth_corridor = None
+                if depth_map is not None:
+                    depth_corridor = self._depth_target_corridor(
+                        depth_map, drive_angle)
+                    if depth_corridor is not None and not steering:
+                        guided_drive_angle = float(_clamp(
+                            depth_corridor.recommended_heading_deg, -30, 30))
+                        if abs(guided_drive_angle - active_drive_angle) >= 2.0:
+                            active_drive_angle = guided_drive_angle
+                            base_L, base_R = self._base_drive_wheels(
+                                active_drive_angle)
+                            self.rover.send({"T": 1, "L": base_L, "R": base_R})
+
+                path_drive_angle = active_drive_angle + current_avoid_angle
                 # Wall check: featureless surface filling the frame
                 cur_jpeg = self.tracker.get_jpeg()
                 if cur_jpeg and self._image_wall_check(cur_jpeg):
@@ -2018,10 +2279,12 @@ class Navigator:
                         self._log("Blind drive: wall ahead (depth), stopping")
                         return "obstacle"
                     obstacle = self._depth_obstacle_check(depth_map,
-                                                            drive_angle)
+                                                          path_drive_angle)
                     if obstacle:
                         obstacle_detected = True
                         steer_dir = self._depth_steer_direction(depth_map)
+                        avoid_angle = self._default_avoidance_angle(steer_dir)
+                        avoid_reason = obstacle
 
                 # YOLO obstacle check — cross-validate with depth map
                 # If depth says corridor is clear, YOLO ghost → ignore
@@ -2030,7 +2293,7 @@ class Navigator:
                 dets, _, age = self._get_detections()
                 if age < 1.0 and dets:
                     # Shift corridor check based on current drive angle
-                    angle_shift = _clamp(drive_angle / 90.0 * 0.3,
+                    angle_shift = _clamp(path_drive_angle / 90.0 * 0.3,
                                          -0.15, 0.15)
                     path_center = 0.5 + angle_shift
                     for d in dets:
@@ -2043,9 +2306,9 @@ class Navigator:
                         # Object edges in corrected coordinates
                         obj_left = real_cx - real_bw / 2
                         obj_right = real_cx + real_bw / 2
-                        # Rover corridor: ~26cm wide → ~22% of FOV at 0.5m
-                        rover_left = path_center - 0.22
-                        rover_right = path_center + 0.22
+                        # Rover corridor projected into image-space.
+                        rover_left = path_center - ROVER_PATH_HALF_WIDTH_NORM
+                        rover_right = path_center + ROVER_PATH_HALF_WIDTH_NORM
                         overlaps_path = (obj_right > rover_left
                                          and obj_left < rover_right)
 
@@ -2068,14 +2331,21 @@ class Navigator:
                             if depth_clear and not has_real_dist:
                                 continue
                             obstacle_detected = True
-                            if real_cx < path_center:
-                                steer_dir = "right"
-                            else:
-                                steer_dir = "left"
+                            steer_dir, avoid_angle, avoid_reason = (
+                                self._compute_avoidance_curve(
+                                    d, path_center, depth_map=depth_map))
+                            if steer_dir == "straight":
+                                if real_cx < path_center:
+                                    steer_dir = "right"
+                                else:
+                                    steer_dir = "left"
+                                avoid_angle = self._default_avoidance_angle(
+                                    steer_dir, d.get("dist_m"))
+                                avoid_reason = d["name"]
                             break
 
                 clear_ahead = self._estimate_clear_distance(
-                    depth_map, dets if age < 1.0 else [], drive_angle)
+                    depth_map, dets if age < 1.0 else [], path_drive_angle)
                 if clear_ahead is not None:
                     clear_history.append((time.time(), clear_ahead))
                     imminent_reason = self._predict_imminent_blockage(
@@ -2084,33 +2354,39 @@ class Navigator:
                         obstacle_detected = True
                         if depth_map is not None:
                             steer_dir = self._depth_steer_direction(depth_map)
+                        avoid_angle = self._default_avoidance_angle(
+                            steer_dir, clear_ahead)
+                        avoid_reason = imminent_reason
                         self._log(f"Imminent blockage: {imminent_reason}")
 
                 # Apply steering or resume straight
                 if obstacle_detected:
-                    AVOID_STEER = 0.13  # sharp avoidance — near-pivot turn
-                    if steer_dir == "left":
-                        self.rover.send({"T": 1,
-                                         "L": DRIVE_SPEED - AVOID_STEER,
-                                         "R": DRIVE_SPEED + AVOID_STEER})
-                    elif steer_dir == "right":
-                        self.rover.send({"T": 1,
-                                         "L": DRIVE_SPEED + AVOID_STEER,
-                                         "R": DRIVE_SPEED - AVOID_STEER})
-                    else:
+                    if steer_dir not in ("left", "right"):
                         # Obstacle dead center, no clear side → stop
                         self._stop_wheels()
                         self._log("Blind drive: obstacle dead center, "
                               "stopping for LLM replan")
                         return "obstacle"
+                    if abs(avoid_angle) < 1e-3:
+                        avoid_angle = self._default_avoidance_angle(
+                            steer_dir, clear_ahead)
+                    cmd_L, cmd_R, target_curve = self._curve_wheel_command(
+                        active_drive_angle, avoid_angle)
+                    current_avoid_angle = target_curve - active_drive_angle
+                    self.rover.send({"T": 1, "L": cmd_L, "R": cmd_R})
                     if not steering:
                         avoidance_count += 1
-                        self._log(f"Avoiding obstacle: steer {steer_dir}")
+                        reason_suffix = (
+                            f" around {avoid_reason}" if avoid_reason else "")
+                        self._log(
+                            f"Avoiding obstacle: curve {steer_dir} to {target_curve:+.0f}°"
+                            f"{reason_suffix}")
                     steering = True
                 elif steering:
                     # Was steering, obstacle cleared → resume drive angle
                     self.rover.send({"T": 1, "L": round(base_L, 3),
                                      "R": round(base_R, 3)})
+                    current_avoid_angle = 0.0
                     steering = False
 
                 # Periodic snapshot during drive
@@ -2129,26 +2405,6 @@ class Navigator:
                                 enc_distance += enc_spd * dt
                                 enc_has_data = True
                         enc_last_time = now
-
-                # Mid-drive prefetch: submit while still moving, timed so the
-                # LLM answer lands close to the planned stop instead of long
-                # before or after it.
-                progress = enc_distance if enc_has_data else (
-                    (time.time() - t_start) * DRIVE_SPEED)
-                if (not prefetch_submitted and prefetch_pool is not None
-                        and prefetch_fn is not None):
-                    remaining_dist = max(0.0, distance_m - progress)
-                    remaining_time = remaining_dist / max(DRIVE_SPEED, 0.01)
-                    lead_time = self._prefetch_lead_time()
-                    if remaining_time <= lead_time:
-                        submit_args = tuple(prefetch_args or ())
-                        self._mid_drive_future = prefetch_pool.submit(
-                            prefetch_fn, *submit_args)
-                        self._log(
-                            f"Prefetch next LLM call at T-{remaining_time:.1f}s "
-                            f"(lead={lead_time:.1f}s, "
-                            f"rtt_avg={self._llm_rtt_ema_s:.1f}s)")
-                        prefetch_submitted = True
 
             self._stop_wheels()
             if enc_has_data:
@@ -2264,7 +2520,7 @@ class Navigator:
         return f"ROOM_MAP: {json.dumps(data)}\n"
 
     def _llm_assess_leg(self, instruction, step, max_steps, jpeg,
-                        yolo_summary, clear_dist, obstacle_info="",
+                        yolo_summary, clear_dist, depth_map=None, obstacle_info="",
                         room_ctx=None):
         cues = instruction.get("visual_cues", [])
         exit_hint = instruction.get("exit_hint", "find the exit")
@@ -2284,8 +2540,7 @@ class Navigator:
                             f"your entry heading "
                             f"({'right' if azimuth > 0 else 'left'}). ")
 
-        depth_info = (f"Depth: {clear_dist:.1f}m clear ahead.\n"
-                      if clear_dist else "")
+        depth_info = self._depth_llm_context(clear_dist, depth_map)
         room_ctx = room_ctx if room_ctx is not None else self._room_map_context(6)
 
         room_verify = ""
@@ -2355,12 +2610,16 @@ class Navigator:
             f"{mission}\n\n"
             f"ALWAYS CHECK:\n"
             f"1. Can you see the target ({cues_str})? Report in 'target_visible'.\n"
-            f"2. Am I stuck? (same view as before, blocked by obstacle, "
-            f"driving into wall/furniture, not making progress). "
-            f"Report in 'stuck'.\n\n"
+            f"2. Do NOT decide whether I am 'stuck' — onboard sensors handle that.\n\n"
             f"{obstacle_info}"
             f"YOLO: {yolo_summary}\n"
             f"{depth_info}"
+            f"Use the live DepthAnything summary for free-space decisions. "
+            f"Treat YOLO as object labels only.\n"
+            f"If the correct doorway/path is visible in frame, prefer driving "
+            f"toward its center with angle set to that corridor. Only choose "
+            f"'turn' first when the doorway/path is mostly off-screen or the "
+            f"route is ambiguous.\n"
             f"{room_ctx}\n"
             f"Look at this image. What do you see?\n"
             f"Actions:\n"
@@ -2373,13 +2632,11 @@ class Navigator:
             f"degrees=-180..+180\n"
             f"- 'crossed': I have passed through the doorway and am "
             f"now in the next room.\n"
-            f"- 'stuck': I appear stuck (same view, blocked, no progress). "
-            f"Will trigger recovery maneuver.\n\n"
+            f"Do NOT return action='stuck'. Choose 'drive' or 'turn' instead.\n\n"
             f"Reply ONLY JSON:\n"
             f'{{"scene": "what you see", '
             f'"target_visible": true/false, '
-            f'"stuck": true/false, '
-            f'"action": "drive"|"turn"|"crossed"|"stuck", '
+            f'"action": "drive"|"turn"|"crossed", '
             f'"angle": <drive angle>, "distance": <meters>, '
             f'"turn_degrees": <degrees>, '
             f'"confidence": <0-1 how sure about crossing>, '
@@ -2388,27 +2645,9 @@ class Navigator:
         )
         return self._llm_call(prompt, jpeg)
 
-    def _prefetch_leg_assessment(self, instruction, step, max_steps):
-        try:
-            jpeg = self._get_annotated_jpeg()
-            if not jpeg:
-                return None
-            dets, yolo_summary, _ = self._get_detections()
-            depth_map = (self.tracker.get_depth_map()
-                         if hasattr(self.tracker, 'get_depth_map') else None)
-            clear_dist = self._estimate_clear_distance(
-                depth_map, dets) if depth_map is not None else None
-            return self._llm_assess_leg(
-                instruction, step, max_steps, jpeg, yolo_summary,
-                clear_dist, room_ctx=self._room_map_context(6))
-        except Exception as e:
-            self._log(f"Leg prefetch error: {e}")
-            return None
-
     def _llm_assess_reactive(self, goal, step, max_steps, jpeg, yolo_summary,
-                             clear_dist, obstacle_info="", room_ctx=None):
-        depth_info = (f"Depth: {clear_dist:.1f}m clear ahead.\n"
-                      if clear_dist else "")
+                             clear_dist, depth_map=None, obstacle_info="", room_ctx=None):
+        depth_info = self._depth_llm_context(clear_dist, depth_map)
         room_ctx = room_ctx if room_ctx is not None else self._room_map_context(8)
         prompt = (
             f"I'm a small ground rover (26cm wide, 22mm ground clearance) "
@@ -2417,12 +2656,15 @@ class Navigator:
             f"{obstacle_info}"
             f"YOLO detections: {yolo_summary}\n"
             f"{depth_info}"
+            f"Use the live DepthAnything summary for free-space decisions. "
+            f"Treat YOLO as object labels only.\n"
+            f"If the intended path is visible in frame, prefer 'drive' with "
+            f"angle set to the center of that corridor. Use 'turn' first only "
+            f"when the corridor is largely off-screen or you need a new view.\n"
             f"{room_ctx}"
             f"ALWAYS CHECK:\n"
             f"1. Can you see the goal ('{goal}')? Report in 'target_visible'.\n"
-            f"2. Am I stuck? (same view as before, blocked by obstacle, "
-            f"driving into wall/furniture, not making progress). "
-            f"Report in 'stuck'.\n\n"
+            f"2. Do NOT decide whether I am 'stuck' — onboard sensors handle that.\n\n"
             f"Look at this image. Pick the BEST action:\n"
             f"- 'drive': drive toward goal. Set angle (-30 to +30) and "
             f"distance (0.4-2.4m). Use LONG (0.8-2.4m) when path is "
@@ -2431,16 +2673,14 @@ class Navigator:
             f"- 'turn': rotate to face a better direction. "
             f"Set degrees (-180 to +180).\n"
             f"- 'arrived': I'm at or inside the goal.\n"
-            f"- 'stuck': I appear stuck (same view, blocked, no progress). "
-            f"Will trigger recovery maneuver.\n\n"
+            f"Do NOT return action='stuck'. Choose 'drive' or 'turn' instead.\n\n"
             f"YOLO labels are often WRONG. If any YOLO label is incorrect, "
             f"add 'yolo_corrections' to fix them. Use '_false' for "
             f"hallucinated objects, or the correct name.\n"
             f"Reply ONLY JSON:\n"
             f'{{"scene": "brief description", '
             f'"target_visible": true/false, '
-            f'"stuck": true/false, '
-            f'"action": "drive"|"turn"|"arrived"|"stuck", '
+            f'"action": "drive"|"turn"|"arrived", '
             f'"angle": <drive angle degrees>, '
             f'"distance": <meters>, '
             f'"turn_degrees": <degrees if turning>, '
@@ -2449,27 +2689,11 @@ class Navigator:
         )
         return self._llm_call(prompt, jpeg)
 
-    def _prefetch_reactive_assessment(self, goal, step, max_steps):
-        try:
-            jpeg = self._get_annotated_jpeg()
-            if not jpeg:
-                return None
-            dets, yolo_summary, _ = self._get_detections()
-            depth_map = (self.tracker.get_depth_map()
-                         if hasattr(self.tracker, 'get_depth_map') else None)
-            clear_dist = self._estimate_clear_distance(
-                depth_map, dets) if depth_map is not None else None
-            return self._llm_assess_reactive(
-                goal, step, max_steps, jpeg, yolo_summary,
-                clear_dist, room_ctx=self._room_map_context(8))
-        except Exception as e:
-            self._log(f"Reactive prefetch error: {e}")
-            return None
-
     def _llm_assess_waypoint(self, target, subtask, jpeg, yolo_summary,
                               clear_dist, consecutive_turns=0,
                               total_rotation=0):
         """LLM assessment at each stop.  Returns action dict or None."""
+        dets, _, det_age = self._get_detections()
         subtask_ctx = ""
         if subtask and subtask != target:
             subtask_ctx = (
@@ -2497,23 +2721,9 @@ class Navigator:
                 f"or use a subtask to navigate around the obstruction.\n")
 
         mem = self._memory_summary()
-        depth_info = (f"Estimated clear distance ahead: {clear_dist:.1f}m\n"
-                      if clear_dist else "")
-        # Detect surface/wall at medium distance via far vs near depth strips
         depth_map = (self.tracker.get_depth_map()
                      if hasattr(self.tracker, 'get_depth_map') else None)
-        if depth_map is not None:
-            h, w = depth_map.shape[:2]
-            far_strip = depth_map[int(h*0.2):int(h*0.4), int(w*0.3):int(w*0.7)]
-            near_strip = depth_map[int(h*0.6):h, int(w*0.3):int(w*0.7)]
-            far_mean = float(np.mean(far_strip))
-            near_mean = float(np.mean(near_strip))
-            if far_mean > near_mean * 1.3:
-                depth_info += ("WARNING: Surface/wall visible ahead at medium "
-                               "distance. Do NOT drive forward — turn to find "
-                               "a clear path.\n")
-                self._log(f"Depth: wall/surface ahead "
-                      f"(far={far_mean:.2f} > near={near_mean:.2f}×1.3)")
+        depth_info = self._depth_llm_context(clear_dist, depth_map)
         plan_ctx = getattr(self, '_plan_context', "")
         has_plan = bool(plan_ctx)
         if plan_ctx:
@@ -2601,6 +2811,12 @@ class Navigator:
             f"{obstacle_warning}"
             f"YOLO: {yolo_summary}\n"
             f"{depth_info}"
+            f"Use the live DepthAnything summary for free-space and stopping. "
+            f"YOLO labels may be wrong.\n"
+            f"If a usable corridor is already visible, prefer drive_forward and "
+            f"set drive_angle to its center; onboard depth guidance will refine "
+            f"the path while moving. Use a pure turn only when the route is "
+            f"mostly off-screen or unclear.\n"
             f"{explore_ctx}"
             f"{room_ctx}"
             f"{room_map_ctx}"
@@ -2648,10 +2864,9 @@ class Navigator:
                     if self._yolo_correction_fn:
                         self._yolo_correction_fn(yolo_corr)
                 # Feed YOLO detections into room map
-                if (self.room_map and self.detector and
-                        self.detector.last_detections):
+                if self.room_map and det_age < 1.0 and dets:
                     self.room_map.record(
-                        self.detector.last_detections,
+                        dets,
                         self.pose.x if hasattr(self.pose, 'x') else 0,
                         self.pose.y if hasattr(self.pose, 'y') else 0,
                         self.pose.body_yaw, self.pose.cam_pan,
@@ -2687,11 +2902,9 @@ class Navigator:
                     time.sleep(loop_period)
                     continue
 
-                frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8),
-                                     cv2.IMREAD_COLOR)
-                dets = self.detector.detect(frame) if self.detector else []
+                dets, _, _ = self._fresh_tracker_detections()
                 target_det = (self.detector.find(target, dets)
-                              if self.detector else None)
+                              if self.detector and dets else None)
 
                 if target_det:
                     lost_count = 0
@@ -2761,11 +2974,9 @@ class Navigator:
             self.tracker.pause(300)
 
         # Quick YOLO check on current frame
-        jpeg = self.tracker.get_jpeg()
-        if jpeg and self.detector:
-            dets = self.detector.detect(
-                cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR))
-            hit = self.detector.find(target, dets)
+        if self.detector:
+            dets, _, _ = self._fresh_tracker_detections()
+            hit = self.detector.find(target, dets) if dets else None
             if hit:
                 self._log(f"YOLO found '{target}' immediately "
                       f"(cx={hit['cx']:.2f})")
@@ -2804,10 +3015,8 @@ class Navigator:
                 continue
 
             if self.detector:
-                frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8),
-                                     cv2.IMREAD_COLOR)
-                dets = self.detector.detect(frame)
-                hit = self.detector.find(target, dets)
+                dets, _, _ = self._fresh_tracker_detections()
+                hit = self.detector.find(target, dets) if dets else None
                 if hit:
                     self._log(f"YOLO found '{target}' at pan={pan}° "
                           f"(cx={hit['cx']:.2f}, bw={hit['bw']:.2f})")
@@ -2964,10 +3173,15 @@ class Navigator:
         time.sleep(GIMBAL_SETTLE_S)
         jpeg = self._get_annotated_jpeg()
         if jpeg and target_name:
+            # Tell LLM that behind us is blocked so it doesn't send us back
+            behind_dir = "left" if turn > 0 else "right"
             result = self._llm_call(
-                f"I just backed up and turned to avoid an obstacle. "
+                f"I just backed up and turned {turn:+d}° to avoid an obstacle. "
+                f"The obstacle is now behind me to my {behind_dir}. "
+                f"Do NOT send me back toward {behind_dir} (that's where I got stuck). "
                 f"I need to get to: '{target_name}'. "
-                f"Which direction has the best path toward it? "
+                f"Which FORWARD direction has the best path? "
+                f"Prefer straight ahead (0°) or slightly away from the obstacle. "
                 f"Look for doorways, open space, bright light.\n"
                 f"Reply JSON: {{\"best_direction\": <degrees, "
                 f"neg=left, pos=right>, \"reason\": \"why\"}}",
@@ -2975,14 +3189,23 @@ class Navigator:
             if result and "best_direction" in result:
                 best = int(result["best_direction"])
                 best = max(-180, min(180, best))
+                # Clamp: don't let reacquire undo more than half the escape turn
+                max_undo = abs(turn) // 2
+                if turn > 0 and best < -max_undo:
+                    self._log(f"Reacquire clamped: {best}° → {-max_undo}° "
+                              f"(won't undo {turn:+d}° escape)")
+                    best = -max_undo
+                elif turn < 0 and best > max_undo:
+                    self._log(f"Reacquire clamped: {best}° → {max_undo}° "
+                              f"(won't undo {turn:+d}° escape)")
+                    best = max_undo
                 self._log(f"Reacquired: {best}° — "
                           f"{result.get('reason', '')[:50]}")
                 if abs(best) > 10:
-                    # Turn body to face the target, not just gimbal
                     self._spin_body(best)
                     self._move_gimbal(0, 0)
             else:
-                self._log("Could not reacquire — continuing")
+                self._log("Could not reacquire — continuing forward")
 
     def _try_floor_nav_escape(self, doorway_mode=False):
         """Use FloorNavigator to move into the best available opening.
@@ -3036,6 +3259,12 @@ class Navigator:
     def _llm_verify_obstacle(self):
         """Quick LLM check: is there actually an obstacle ahead?
         Returns True if obstacle confirmed, False if path looks clear."""
+        depth_map = (self.tracker.get_depth_map()
+                     if hasattr(self.tracker, 'get_depth_map') else None)
+        dets, _, age = self._get_detections()
+        clear_dist = self._estimate_clear_distance(
+            depth_map, dets if age < 1.0 else []) if depth_map is not None else None
+        depth_info = self._depth_llm_context(clear_dist, depth_map)
         result = self._llm_call(
             "I stopped because my sensors detected an obstacle ahead. "
             "Look at this image: is there ANYTHING blocking my forward path "
@@ -3043,6 +3272,8 @@ class Navigator:
             "large surfaces, or any solid object. "
             "A wall or surface filling most of the frame = YES, obstacle. "
             "Ignore objects that are far away or clearly to the side.\n"
+            f"{depth_info}"
+            "Trust DepthAnything for free-space and stopping more than YOLO labels.\n"
             "Reply ONLY JSON: "
             '{"obstacle": true/false, "what": "brief description"}')
         if result is None:
@@ -3056,8 +3287,9 @@ class Navigator:
         """Check if path ahead is clear using YOLO (fast, no LLM)."""
         if not self.detector:
             return True
-        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
-        dets = self.detector.detect(frame)
+        dets, _, age = self._fresh_tracker_detections()
+        if age > 1.0:
+            return True
         for d in dets:
             in_path = 0.20 < d["cx"] < 0.80
             close = d["bw"] > 0.30 or d.get("dist_m", 999) < 0.40
@@ -3107,16 +3339,22 @@ class Navigator:
         Returns parsed dict or None."""
         if jpeg is None:
             jpeg = self._get_annotated_jpeg()
+        aux_images = []
+        depth_jpeg = self._get_depth_reference_jpeg()
+        if depth_jpeg:
+            aux_images.append(("depth_anything", depth_jpeg))
         task_json = json.dumps({
             "task": self._nav_target,
             "subtask": self._current_subtask(),
             "pose": self.pose.get_pose() if hasattr(self.pose, 'get_pose') else {},
         })
-        full_prompt = f"TASK: {task_json}\n\n{prompt}"
+        guide = self._depth_image_instructions() if aux_images else ""
+        full_prompt = f"TASK: {task_json}\n\n{guide}{prompt}"
         try:
-            started = time.time()
-            raw = self.llm_vision(full_prompt, jpeg)
-            self._record_llm_rtt(time.time() - started)
+            try:
+                raw = self.llm_vision(full_prompt, jpeg, aux_images)
+            except TypeError:
+                raw = self.llm_vision(full_prompt, jpeg)
             self._consecutive_429s = 0
             return self.parse(raw)
         except Exception as e:

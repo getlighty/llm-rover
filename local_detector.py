@@ -432,6 +432,11 @@ class LocalDetector:
             return max(matches, key=lambda d: d["conf"])
         return None
 
+    def clear_cache(self):
+        """Drop any stale detections when YOLO is disabled or unavailable."""
+        with self._lock:
+            self.last_detections = []
+
     def draw(self, frame, detections=None):
         """Draw bounding boxes + labels on frame. Returns the modified frame."""
         dets = detections if detections is not None else self.last_detections
@@ -587,10 +592,16 @@ DEPTH_ENGINE_CANDIDATES = [
     os.path.join(MODEL_DIR, "depth_anything_vits14_308.trt"),
 ]
 DEPTH_INPUT_SIZE = 308
+DEPTH_SELF_FLOOR_CUTOFF = 0.88
 
 # ImageNet normalization (applied in BGR order to match model training)
 _DEPTH_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _DEPTH_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _depth_usable_bottom(h):
+    """Bottom row limit for depth consumers to ignore self-floor glow."""
+    return max(1, min(h, int(round(h * DEPTH_SELF_FLOOR_CUTOFF))))
 
 
 class DepthEstimator:
@@ -784,9 +795,13 @@ class DepthEstimator:
     def colorize(self, depth_map):
         """Convert depth map to BGR colorized image for visualization."""
         d = depth_map.copy()
-        dmin, dmax = d.min(), d.max()
+        usable_bottom = _depth_usable_bottom(d.shape[0])
+        visible = d[:usable_bottom, :] if usable_bottom > 0 else d
+        dmin, dmax = visible.min(), visible.max()
         if dmax - dmin > 1e-6:
             d = (d - dmin) / (dmax - dmin) * 255.0
         else:
             d = np.zeros_like(d)
+        if usable_bottom < d.shape[0]:
+            d[usable_bottom:, :] = 0.0
         return cv2.applyColorMap(d.astype(np.uint8), cv2.COLORMAP_INFERNO)

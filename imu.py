@@ -23,8 +23,9 @@ ACCEL_MOVING_THRESHOLD = 0.35  # accel magnitude above this = vibration/motion
 GYRO_MOVING_THRESHOLD = 1.0    # °/s angular rate above this = rotating
 STATIONARY_READINGS = 3        # consecutive still reads to confirm stuck (~300ms)
 ENCODER_MOVING_THRESHOLD = 0.02  # encoder speed (m/s) above this = moving
-TILT_ACCEL_WARN = 1.5          # accel magnitude spike suggesting large tilt/impact
-TILT_ACCEL_STOP = 3.0          # severe accel spike — emergency stop
+TILT_ACCEL_WARN = 20.0         # accel magnitude spike suggesting large tilt/impact
+                               # (resting gravity reads ~18.2 in raw units)
+TILT_ACCEL_STOP = 22.0         # severe accel spike — emergency stop
 POLL_INTERVAL = 0.10           # 10 Hz during wheel activity
 DATA_MAX_AGE = 2.0             # seconds before data considered stale
 

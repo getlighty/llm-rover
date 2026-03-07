@@ -48,6 +48,101 @@ _DATASET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset
 _MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
 
+_INA_HWMON = "/sys/bus/i2c/drivers/ina3221/1-0040/hwmon"
+
+
+def _read_power_watts():
+    """Read total board power from INA3221 VDD_IN channel. Returns watts or None."""
+    import glob as _g
+    try:
+        bases = _g.glob(os.path.join(_INA_HWMON, "hwmon*"))
+        if not bases:
+            return None
+        base = bases[0]
+        mv = int(open(os.path.join(base, "in1_input")).read().strip())
+        ma = int(open(os.path.join(base, "curr1_input")).read().strip())
+        return round(mv * ma / 1_000_000, 1)
+    except Exception:
+        return None
+
+
+def _nvp_cmd(args):
+    """Run nvpmodel command, trying without sudo first (service runs as root)."""
+    import subprocess
+    try:
+        return subprocess.check_output(
+            ["nvpmodel"] + args, stderr=subprocess.STDOUT, timeout=5).decode()
+    except (subprocess.CalledProcessError, FileNotFoundError, PermissionError):
+        return subprocess.check_output(
+            ["sudo", "-n", "nvpmodel"] + args,
+            stderr=subprocess.STDOUT, timeout=5).decode()
+
+
+def _get_nvpmodel():
+    """Query current Jetson power mode and available modes."""
+    modes = []
+    current = -1
+    try:
+        out = _nvp_cmd(["-q"])
+        for line in out.splitlines():
+            if line.startswith("NV Power Mode:"):
+                pass
+            else:
+                try:
+                    current = int(line.strip())
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    try:
+        out = _nvp_cmd(["-p", "--verbose"])
+        for line in out.splitlines():
+            if "POWER_MODEL:" in line:
+                parts = line.split()
+                mid, mname = None, None
+                for p in parts:
+                    if p.startswith("ID="):
+                        mid = int(p[3:])
+                    elif p.startswith("NAME="):
+                        mname = p[5:]
+                if mid is not None and mname:
+                    modes.append({"id": mid, "name": mname})
+    except Exception:
+        pass
+    if not modes:
+        modes = [{"id": 0, "name": "15W"},
+                 {"id": 1, "name": "25W"},
+                 {"id": 2, "name": "MAXN_SUPER"}]
+    watts = _read_power_watts()
+    return {"current": current, "modes": modes, "watts": watts}
+
+
+def _set_nvpmodel(mode_id):
+    """Set Jetson power mode and lock clocks at max. Returns result dict."""
+    import subprocess
+    try:
+        _nvp_cmd(["-m", str(mode_id)])
+        # Lock clocks at max for the new power envelope
+        try:
+            subprocess.check_output(["jetson_clocks"],
+                                    stderr=subprocess.STDOUT, timeout=10)
+        except Exception:
+            pass
+        info = _get_nvpmodel()
+        name = next((m["name"] for m in info["modes"]
+                     if m["id"] == mode_id), str(mode_id))
+        watts = info.get("watts")
+        if _log_event:
+            w_str = f" ({watts}W)" if watts else ""
+            _log_event("system",
+                       f"Jetson power mode → {name}{w_str}")
+        return {"ok": True, "mode": mode_id, "watts": watts}
+    except subprocess.CalledProcessError as e:
+        return {"error": e.output.decode().strip()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def init(*, camera, serial, detector=None, get_log_events_since, get_map_state,
          log_event, set_provider, get_providers, set_desk_mode, set_stt_enabled,
          set_tts_enabled, set_gimbal_pan_enabled, set_yolo_enabled, set_killed, get_killed,
@@ -99,7 +194,7 @@ body{background:#1a1a2e;color:#e0e0e0;font-family:'Courier New',monospace;height
 #topbar select{background:#0f3460;color:#e0e0e0;border:1px solid #333;padding:4px 8px;border-radius:4px;font-family:inherit;font-size:13px}
 #llm{min-width:180px}
 #main{display:flex;flex:1;overflow:hidden}
-#leftcol{flex:0 0 auto;padding:8px;display:flex;flex-direction:column;gap:8px}
+#leftcol{flex:0 0 auto;padding:8px;display:flex;flex-direction:column;gap:8px;overflow-y:auto}
 #leftcol img{max-width:640px;width:100%;border-radius:4px;border:1px solid #333}
 #gimbal-wrap{width:100%;max-width:640px}
 #gimbal{width:100%;aspect-ratio:2/1;border-radius:4px;border:1px solid #333;background:#0a0a1a;cursor:crosshair;touch-action:none;display:block}
@@ -137,7 +232,11 @@ body{background:#1a1a2e;color:#e0e0e0;font-family:'Courier New',monospace;height
 #log .cat-track{color:#ab47bc}
 #log .cat-floor_nav{color:#607d8b}
 #log .cat-room{color:#26a69a}
-#log-filters{padding:4px 8px;background:#16213e;display:flex;flex-wrap:wrap;gap:4px;border-bottom:1px solid #333}
+#log-filter-bar{display:flex;align-items:center;background:#16213e;border-bottom:1px solid #333;padding:2px 8px;gap:6px}
+#logFilterBtn{background:#0f3460;color:#e0e0e0;border:1px solid #444;padding:2px 10px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:11px}
+#logFilterBtn:hover{background:#1a4a80}
+#log-filters{padding:4px 8px;background:#0a0a1a;display:none;flex-wrap:wrap;gap:4px;border-bottom:1px solid #333}
+#log-filters.open{display:flex}
 #log-filters label{font-size:11px;color:#aaa;cursor:pointer;user-select:none}
 #log-filters input{margin-right:2px;cursor:pointer}
 #cmdbar{display:flex;padding:8px 12px;background:#16213e;gap:8px}
@@ -168,6 +267,7 @@ body{background:#1a1a2e;color:#e0e0e0;font-family:'Courier New',monospace;height
   <label>LLM <select id="llm"></select></label>
   <label>TTS <select id="tts"></select></label>
   <label>Orch <select id="orch"></select></label>
+  <label>Power <select id="nvpmodel"></select> <span id="pwrW" style="color:#4fc3f7;font-size:12px"></span></label>
   <label style="margin-left:auto;cursor:pointer"><input type="checkbox" id="sttmode" checked> STT</label>
   <label style="cursor:pointer"><input type="checkbox" id="ttsmode" checked> TTS</label>
   <label style="cursor:pointer"><input type="checkbox" id="deskmode" checked> Desk Mode</label>
@@ -274,7 +374,7 @@ body{background:#1a1a2e;color:#e0e0e0;font-family:'Courier New',monospace;height
       </div>
     </div>
   </div>
-  <div id="logpanel"><div id="log-filters"></div><div id="log"></div></div>
+  <div id="logpanel"><div id="log-filter-bar"><button id="logFilterBtn">Filter</button></div><div id="log-filters"></div><div id="log"></div></div>
 </div>
 <div id="cmdbar">
   <input id="cmd" type="text" placeholder="Type a command..." autocomplete="off">
@@ -356,6 +456,27 @@ yoloCb.onchange=()=>{
   fetch('/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({yolo_enabled:yoloCb.checked})});
 };
 
+// Jetson power mode
+const nvpSel=document.getElementById('nvpmodel');
+const pwrW=document.getElementById('pwrW');
+function updatePower(d){
+  if(d.watts!=null)pwrW.textContent=d.watts+'W';
+}
+fetch('/nvpmodel').then(r=>r.json()).then(d=>{
+  (d.modes||[]).forEach(m=>{
+    const o=document.createElement('option');
+    o.value=m.id;
+    o.textContent=m.name;
+    if(m.id===d.current)o.selected=true;
+    nvpSel.appendChild(o);
+  });
+  updatePower(d);
+});
+nvpSel.onchange=()=>{
+  fetch('/nvpmodel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:parseInt(nvpSel.value)})});
+};
+setInterval(()=>fetch('/nvpmodel').then(r=>r.json()).then(updatePower).catch(()=>{}),5000);
+
 // Kill switch
 const killBtn=document.getElementById('killBtn');
 let isKilled=false;
@@ -387,6 +508,9 @@ restartBtn.onclick=()=>{
 };
 
 // SSE log stream with filters
+document.getElementById('logFilterBtn').onclick=()=>{
+  document.getElementById('log-filters').classList.toggle('open');
+};
 const LOG_CATS=['llm','serial','heard','speak','plan','stuck','interrupt','system','error','nav','orchestrator','observe','decide','bash','file','follow','battery','backup','detect','yolo_corr','imu','track','floor_nav','room'];
 const logHidden=new Set(['serial']);
 const filtersDiv=document.getElementById('log-filters');
@@ -1145,6 +1269,13 @@ class StreamHandler(BaseHTTPRequestHandler):
                     time.sleep(0.3)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+        elif self.path == "/nvpmodel":
+            body = json.dumps(_get_nvpmodel())
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body.encode())
         elif self.path == "/providers":
             body = json.dumps(_get_providers())
             self.send_response(200)
@@ -1319,6 +1450,17 @@ class StreamHandler(BaseHTTPRequestHandler):
             else:
                 results = [{"error": "no serial connection"}]
             body = json.dumps({"ok": True, "results": results})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body.encode())
+        elif self.path == "/nvpmodel":
+            mode = data.get("mode")
+            if mode is not None:
+                result = _set_nvpmodel(int(mode))
+            else:
+                result = {"error": "no mode specified"}
+            body = json.dumps(result)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()

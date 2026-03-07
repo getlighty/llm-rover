@@ -1,6 +1,6 @@
 {
-  "current_room": "office",
-  "current_confidence": 0.95,
+  "current_room": "hallway",
+  "current_confidence": 0.92,
   "rooms": [
     {
       "name": "office",
@@ -54,7 +54,8 @@
       ],
       "floor_type": "wooden floor",
       "connections": [
-        "hallway"
+        "hallway",
+        "living_room"
       ],
       "entry_landmarks": [
         {
@@ -62,10 +63,10 @@
         }
       ],
       "nav_hints": "Exit is the doorway with bright hallway light behind the desk area. Go around the chair, not through it.",
-      "last_visited": "2026-03-06 07:34",
-      "visit_count": 306,
-      "last_scene": "Currently in office with yellow walls and wooden floor. Blue basket visible in center-left. Desk area with keyboard and monitor ahead-right. Office chairs obstruct direct forward path. The arched doorway with bright hallway light should be behind/beyond the desk area to the back-right of the office,",
-      "last_yolo": "rover/robot base(78%)"
+      "last_visited": "2026-03-06 22:49",
+      "visit_count": 333,
+      "last_scene": "A home office with hardwood floors, a wooden desk with exposed wiring underneath, and an occupied rolling chair.",
+      "last_yolo": "office chair(90%), sofa or bed(80%), shelving unit(70%)"
     },
     {
       "name": "hallway",
@@ -75,7 +76,12 @@
         "plant pot",
         "narrow corridor",
         "stone tile floor",
-        "arched doorway"
+        "arched doorway",
+        "potted plants",
+        "metal shelving unit",
+        "plant pot visible in distance",
+        "desk leg to the left",
+        "bright ambient light"
       ],
       "negative_features": [
         "desk",
@@ -94,13 +100,31 @@
       "entry_landmarks": [
         {
           "landmark": "stone-tiled floor transition"
+        },
+        {
+          "landmark": "wooden door frame"
+        },
+        {
+          "landmark": "bright light beyond"
+        },
+        {
+          "landmark": "stone-tiled flooring just inside"
+        },
+        {
+          "landmark": "arched doorway"
+        },
+        {
+          "landmark": "wooden parquet floor at threshold"
+        },
+        {
+          "landmark": "wooden doorway frame"
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-05 20:41",
-      "visit_count": 43,
-      "last_scene": "The arched doorway with bright hallway light is clearly visible on the left side of the frame. The view shows a transition from wooden flooring to stone tiles in the hallway beyond the arch. A large wooden structure (likely a door or furniture) obscures the right side.",
-      "last_yolo": "basket(68%) lamp_base(38%)"
+      "last_visited": "2026-03-07 07:41",
+      "visit_count": 48,
+      "last_scene": "wooden doorway with bright light and stone tiles ahead",
+      "last_yolo": "door(95%), door(90%), doorway(90%), table(80%), basket(70%), chair(70%), plant pot(60%)"
     },
     {
       "name": "kitchen",
@@ -130,10 +154,10 @@
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-05 19:57",
-      "visit_count": 48,
-      "last_scene": "Stone-tiled floor with a staircase on the left. On the right wall, an orange arched doorway is visible in the distance, leading to another room.",
-      "last_yolo": "nothing"
+      "last_visited": "2026-03-06 18:56",
+      "visit_count": 50,
+      "last_scene": "A modern kitchen with white cabinets, a stainless steel refrigerator, and a marble floor.",
+      "last_yolo": "legs(32%)"
     },
     {
       "name": "living_room",
@@ -158,7 +182,9 @@
         "basket",
         "dog",
         "shelves",
-        "bags"
+        "bags",
+        "dog in basket",
+        "person with laptop"
       ],
       "negative_features": [
         "desk",
@@ -169,18 +195,31 @@
       ],
       "floor_type": "parquet floor",
       "connections": [
-        "hallway"
+        "hallway",
+        "office"
       ],
       "entry_landmarks": [
         {
           "landmark": "arched doorway from hallway"
+        },
+        {
+          "landmark": "arched doorway"
+        },
+        {
+          "landmark": "parquet floor beyond"
+        },
+        {
+          "landmark": "wooden door frame"
+        },
+        {
+          "landmark": "bright light beyond"
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-06 07:13",
-      "visit_count": 47,
-      "last_scene": "Close-up view of a large white bag with green text and a brown paper bag blocking the immediate path. To the right, there is clear wooden floor space leading towards a couch area in the background. The camera is positioned low near the clutter.",
-      "last_yolo": "nothing"
+      "last_visited": "2026-03-06 21:52",
+      "visit_count": 52,
+      "last_scene": "A cluttered living area with a couch and basket, viewed from a low angle. Vector scan landmarks: basket 1.5m (size 0.4x0.6m), couch 2.0m (size 1.8x0.9m), legs 1.2m (size 0.1x0.1m). Task context: go to kitchen.",
+      "last_yolo": "basket(80%), couch(30%), legs(20%)"
     },
     {
       "name": "bathroom",
@@ -209,8 +248,10 @@
         }
       ],
       "nav_hints": "",
-      "last_visited": "",
-      "visit_count": 0
+      "last_visited": "2026-03-06 13:28",
+      "visit_count": 2,
+      "last_scene": "A blurry view of a hallway with a basket and a doorway leading to another room. A close-up view of a robot base and surrounding furniture in a kitchen with red flooring. Vector scan landmarks: robot base 0.5m (size 0.4x0.4m), cabinet 1.0m (size 0.6x0.5m), basket 2.5m (size 0.4x0.3m), toilet 1.2m (si",
+      "last_yolo": "robot base(90%), cabinet(80%), basket(80%), toilet(70%), doorway(70%)"
     }
   ]
 }

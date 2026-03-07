@@ -15,11 +15,11 @@ import queue
 import requests
 import readline
 import os
+from ollama_config import OLLAMA_BASE_URL
 
 # --- Configuration ---
 SERIAL_PORT = os.environ.get("ROVER_SERIAL_PORT", "/dev/ttyTHS1")
 BAUD_RATE = 115200
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:9b")
 HEARTBEAT_INTERVAL = 2.0  # seconds between heartbeat commands during motion
 

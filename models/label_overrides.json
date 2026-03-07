@@ -8,7 +8,7 @@
   "couch": "__false",
   "vase": "potted plant",
   "potted plant": "basket",
-  "basket": "plant_pot",
+  "basket": "__false",
   "clock": "wall_clock",
   "monitor": "router",
   "chair": "dining_chair",
@@ -19,7 +19,7 @@
   "rover/robot base": "tools",
   "suitcase": "backpack",
   "book": "box",
-  "box": "printer",
+  "box": "bags",
   "pet food bowl": "bowl",
   "remote": "phone",
   "oven": "stove",
@@ -30,7 +30,7 @@
   "umbrella": "trash_bin",
   "trash_bin": "chair",
   "backpack": "bag",
-  "legs": "chair",
+  "legs": "person",
   "person": "legs",
   "dining table": "chair",
   "desk_chair": "couch",
@@ -48,7 +48,8 @@
   "tie": "false",
   "wall_clock": "clock",
   "phone": "__false",
-  "wrong": "false",
-  "dining_chair": "office_chair",
-  "refrigerator_false": "__false"
+  "wrong": "legs_7",
+  "dining_chair": "__false",
+  "refrigerator_false": "__false",
+  "bus": "__false"
 }

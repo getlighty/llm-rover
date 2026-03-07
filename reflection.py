@@ -9,8 +9,9 @@ import os
 import requests
 
 import lessons
+from ollama_config import OLLAMA_CHAT_URL
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_URL = OLLAMA_CHAT_URL
 OLLAMA_MODEL = "qwen3.5:9b"
 
 # ── Orchestrator system prompt — high-level principles only ────────────
