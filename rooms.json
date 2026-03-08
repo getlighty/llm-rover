@@ -1,6 +1,6 @@
 {
   "current_room": "hallway",
-  "current_confidence": 0.92,
+  "current_confidence": 0.95,
   "rooms": [
     {
       "name": "office",
@@ -81,7 +81,14 @@
         "metal shelving unit",
         "plant pot visible in distance",
         "desk leg to the left",
-        "bright ambient light"
+        "bright ambient light",
+        "stone tile flooring",
+        "arched doorways on left and right walls",
+        "potted plant positioned centrally ahead",
+        "neutral wall color",
+        "open corridor layout",
+        "narrow corridor layout",
+        "potted plant fixture"
       ],
       "negative_features": [
         "desk",
@@ -118,12 +125,15 @@
         },
         {
           "landmark": "wooden doorway frame"
+        },
+        {
+          "landmark": "office doorway with standard frame"
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-07 07:41",
-      "visit_count": 48,
-      "last_scene": "wooden doorway with bright light and stone tiles ahead",
+      "last_visited": "2026-03-08 10:26",
+      "visit_count": 52,
+      "last_scene": "Crossed threshold into hallway, stone tiles under wheels, potted plant visible ahead",
       "last_yolo": "door(95%), door(90%), doorway(90%), table(80%), basket(70%), chair(70%), plant pot(60%)"
     },
     {
@@ -135,7 +145,20 @@
         "sink",
         "counter",
         "cabinets",
-        "orange arch"
+        "orange arch",
+        "orange arched doorway",
+        "tiled floor",
+        "refrigerator on left wall",
+        "orange archway",
+        "kitchen appliances",
+        "white tiled floor",
+        "stainless steel countertop along right wall",
+        "white cabinets with black handles",
+        "large window with blinds on left wall",
+        "orange archway on left wall (entry point)",
+        "small potted plant near entry",
+        "countertops",
+        "archway entrance"
       ],
       "negative_features": [
         "desk",
@@ -151,12 +174,33 @@
       "entry_landmarks": [
         {
           "landmark": "orange arched doorway"
+        },
+        {
+          "landmark": "hallway perspective"
+        },
+        {
+          "landmark": "distant arch visibility"
+        },
+        {
+          "landmark": "orange arch frame"
+        },
+        {
+          "landmark": "transition from hallway carpet to kitchen tile"
+        },
+        {
+          "landmark": "view of hallway behind"
+        },
+        {
+          "landmark": "orange archway frame (left wall)"
+        },
+        {
+          "landmark": "white tile floor transition from hallway\u2019s dark wood"
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-06 18:56",
-      "visit_count": 50,
-      "last_scene": "A modern kitchen with white cabinets, a stainless steel refrigerator, and a marble floor.",
+      "last_visited": "2026-03-08 09:58",
+      "visit_count": 59,
+      "last_scene": "Inside kitchen, tiled floor, counter and appliances visible",
       "last_yolo": "legs(32%)"
     },
     {

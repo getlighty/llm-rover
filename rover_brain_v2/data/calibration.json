@@ -1,0 +1,5 @@
+{
+  "gimbal_pan_center": 8,
+  "gimbal_tilt_center": -12,
+  "turn_rate_dps": 175
+}

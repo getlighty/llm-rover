@@ -30,7 +30,7 @@ class RuntimeFlags:
     tts_enabled: bool = True
     gimbal_pan_enabled: bool = True
     killed: bool = False
-    yolo_overlay_enabled: bool = True
+    yolo_overlay_enabled: bool = False
 
 
 @dataclass(slots=True)

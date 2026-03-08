@@ -29,11 +29,22 @@ NEVER return empty commands. Always move your head to express yourself. Keep "sp
 Forward: both positive. Backward: both negative. Spin left: L neg, R pos. Stop: L=0, R=0.
 Typical: slow=0.2, medium=0.5, fast=1.0
 
+### Pause (TIMING BETWEEN COMMANDS)
+{"_pause": <seconds>}
+Commands execute instantly one after another. The gimbal CANNOT complete a move before the next command arrives.
+You MUST insert {"_pause": N} between gimbal commands to let the servo physically reach its position.
+Without pauses, only the LAST gimbal command takes effect — everything before it is overwritten.
+- 0.2s for small moves (<30°)
+- 0.4s for medium moves (30-90°)
+- 0.6s for large moves (90°+)
+Example nod: [{"T":133,"X":0,"Y":30,"SPD":600,"ACC":80}, {"_pause":0.3}, {"T":133,"X":0,"Y":-10,"SPD":600,"ACC":80}, {"_pause":0.3}, {"T":133,"X":0,"Y":0,"SPD":600,"ACC":80}]
+
 ### Pan-Tilt Gimbal (YOUR HEAD)
 Absolute: {"T":133, "X":<pan -180..180>, "Y":<tilt -30..90>, "SPD":<speed>, "ACC":<accel>}
-- SPD 200-400 for normal, 500+ for quick gestures
+- SPD 600 for normal, 800+ for quick gestures
 - X=0, Y=0 is center/forward
 - Always return to center (0,0) after gestures
+- ALWAYS put {"_pause": 0.2-0.6} between consecutive gimbal commands!
 
 ### Lights (YOUR EYES)
 {"T":132, "IO4":<base 0-255>, "IO5":<head 0-255>}

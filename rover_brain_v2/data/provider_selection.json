@@ -1,0 +1,7 @@
+{
+  "stt": "groq",
+  "tts": "groq",
+  "command_llm": "ollama/qwen3.5:cloud",
+  "navigator_llm": "ollama/qwen3.5:cloud",
+  "orchestrator_llm": "ollama/qwen3.5:cloud"
+}

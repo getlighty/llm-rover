@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 from rover_brain_v2.models import ProviderSelection
+
+_PERSIST_PATH = Path(__file__).resolve().parents[1] / "data" / "provider_selection.json"
 from rover_brain_v2.providers.base import VisionLanguageClient
 from rover_brain_v2.providers.stt.groq import GroqSpeechToText
 from rover_brain_v2.providers.tts.elevenlabs import ElevenLabsTextToSpeech
@@ -52,12 +56,29 @@ class ProviderRegistry:
             command_llm="groq/meta-llama/llama-4-maverick-17b-128e-instruct",
             tts="groq",
         )
+        self._load_selection()
         self._stt_clients = {"groq": GroqSpeechToText()}
         self._tts_clients = {
             "groq": GroqTextToSpeech(),
             "elevenlabs": ElevenLabsTextToSpeech(),
         }
         self._vlm_cache: dict[str, VisionLanguageClient] = {}
+
+    def _load_selection(self):
+        try:
+            data = json.loads(_PERSIST_PATH.read_text(encoding="utf-8"))
+            for key in ("stt", "tts", "command_llm", "navigator_llm", "orchestrator_llm"):
+                if key in data and hasattr(self.selection, key):
+                    setattr(self.selection, key, data[key])
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            pass
+
+    def _save_selection(self):
+        _PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _PERSIST_PATH.write_text(
+            json.dumps(self.snapshot(), indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     def available(self) -> dict[str, list[str]]:
         return {
@@ -82,6 +103,7 @@ class ProviderRegistry:
             if not hasattr(self.selection, key):
                 continue
             setattr(self.selection, key, value)
+        self._save_selection()
         return self.snapshot()
 
     def bundle(self) -> ProviderBundle:

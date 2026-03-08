@@ -334,7 +334,10 @@ class LocalDetector:
         """Post-process raw YOLO output into detection dicts."""
         # TensorRT exports from recent Ultralytics builds may already include
         # decoded boxes with NMS: (1, N, 6) = [x1, y1, x2, y2, conf, cls].
+        # Coordinates are in input_size x input_size space — rescale to frame.
         if outputs.ndim == 3 and outputs.shape[-1] == 6:
+            sx = w / self.input_size
+            sy = h / self.input_size
             detections = []
             for row in outputs[0]:
                 x1, y1, x2, y2, conf, cls = [float(v) for v in row]
@@ -343,8 +346,8 @@ class LocalDetector:
                 cid = int(cls)
                 name = self.class_names[cid] if cid < len(self.class_names) else f"cls_{cid}"
                 name = LABEL_OVERRIDES.get(name, name)
-                x1_i, y1_i = int(max(0, x1)), int(max(0, y1))
-                x2_i, y2_i = int(min(w, x2)), int(min(h, y2))
+                x1_i, y1_i = int(max(0, x1 * sx)), int(max(0, y1 * sy))
+                x2_i, y2_i = int(min(w, x2 * sx)), int(min(h, y2 * sy))
                 bw_px = max(0, x2_i - x1_i)
                 bh_px = max(0, y2_i - y1_i)
                 if bw_px <= 1 or bh_px <= 1:

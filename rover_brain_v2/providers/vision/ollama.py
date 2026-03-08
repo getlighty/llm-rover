@@ -17,7 +17,7 @@ class OllamaVisionClient:
         self.url = ollama_chat_url()
 
     def complete(self, *, prompt: str, system: str = "",
-                 image_bytes: bytes | None = None,
+                 image_bytes: bytes | list[bytes] | None = None,
                  history: list[dict] | None = None,
                  temperature: float = 0.3,
                  max_tokens: int = 800) -> str:
@@ -28,7 +28,10 @@ class OllamaVisionClient:
             messages.append(item)
         user_message = {"role": "user", "content": prompt}
         if image_bytes:
-            user_message["images"] = [b64_image(image_bytes)]
+            if isinstance(image_bytes, list):
+                user_message["images"] = [b64_image(img) for img in image_bytes]
+            else:
+                user_message["images"] = [b64_image(image_bytes)]
         messages.append(user_message)
         think = not self.model.startswith("qwen3")
         response = requests.post(

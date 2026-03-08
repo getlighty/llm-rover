@@ -15,7 +15,7 @@ import topo_nav
 
 from rover_brain_v2.json_utils import extract_json_dict
 from rover_brain_v2.models import NavigatorResult, OrchestratorResult, OrchestratorTask
-from rover_brain_v2.prompts import room_reorg_prompt, scene_prompt
+from rover_brain_v2.prompts import load_prompt, room_reorg_prompt, scene_prompt
 
 
 LEG_RETRY_ATTEMPTS = 4
@@ -140,7 +140,13 @@ class GraphNavigationOrchestrator:
             self.events.publish("plan", f"Unknown room '{task.target_query}', using reactive navigation")
             return self._execute_direct_reactive_task(task)
 
-        current_room = self.topo.current_room or self._identify_current_room()
+        # Always re-identify current room before navigation to avoid stale state
+        fresh_room = self._identify_current_room()
+        current_room = fresh_room or self.topo.current_room
+        if fresh_room and fresh_room != self.topo.current_room:
+            self.events.publish("plan", f"Room re-identified: {self.topo.current_room} → {fresh_room}")
+            self.topo.current_room = fresh_room
+            self._save_topo()
         if self._stop_event.is_set():
             return self._aborted_result(task, target_room=target_room)
         if not current_room:
@@ -296,10 +302,12 @@ class GraphNavigationOrchestrator:
 
     def _complete_leg(self, leg, instruction: dict):
         max_attempts = max(1, int(getattr(self.navigator.config, "navigation_leg_attempts", LEG_RETRY_ATTEMPTS)))
-        waypoint_budget = max(getattr(self.navigator.config, "navigation_waypoint_budget", 18) * 2, 30)
+        waypoint_budget = max(getattr(self.navigator.config, "navigation_waypoint_budget", 40) * 2, 60)
         attempt_history: list[dict] = []
         last_scene = ""
         last_room_guess = None
+        # Track what each attempt saw so we can give better guidance on retries
+        attempt_scenes: list[str] = []
         for attempt in range(max_attempts):
             if self._stop_event.is_set():
                 return False, last_room_guess, last_scene, {
@@ -309,18 +317,24 @@ class GraphNavigationOrchestrator:
                     "status": "aborted",
                     "attempts": attempt_history,
                 }
+            # Adapt instruction for retries — widen search, add context
+            adapted = self._adapt_instruction_for_retry(
+                instruction, attempt, max_attempts, attempt_scenes,
+            )
             self.events.publish(
                 "plan",
-                f"Navigator round {attempt + 1}/{max_attempts} for {leg.transition}: insist on {leg.to_room}",
+                f"Navigator round {attempt + 1}/{max_attempts} for {leg.transition}: "
+                f"insist on {leg.to_room} (azimuth {adapted.get('expected_azimuth_deg', '?')}°)",
             )
             nav_result = self.navigator.run_doorway_task(
-                instruction,
+                adapted,
                 attempt=attempt,
                 total_attempts=max_attempts,
                 waypoint_budget=waypoint_budget,
             )
             attempt_history.append(self._navigator_result_payload(nav_result))
             last_scene = nav_result.scene or last_scene
+            attempt_scenes.append(last_scene)
             room_guess, confidence = self._room_check(last_scene) if last_scene else (None, 0.0)
             if room_guess:
                 last_room_guess = room_guess
@@ -357,7 +371,7 @@ class GraphNavigationOrchestrator:
                 }
             self.events.publish(
                 "plan",
-                f"Navigator incomplete on {leg.transition}; retrying the same doorway goal",
+                f"Navigator incomplete on {leg.transition}; adapting for retry {attempt + 2}",
             )
         return False, last_room_guess, last_scene, {
             "from_room": leg.from_room,
@@ -366,6 +380,60 @@ class GraphNavigationOrchestrator:
             "status": "incomplete",
             "attempts": attempt_history,
         }
+
+    def _adapt_instruction_for_retry(self, instruction: dict, attempt: int,
+                                      total_attempts: int,
+                                      attempt_scenes: list[str]) -> dict:
+        """Adapt the doorway instruction based on previous failed attempts.
+        Widens the search angle and adds failure context so the navigator
+        tries a different strategy each round."""
+        adapted = dict(instruction)
+        original_azimuth = instruction.get("expected_azimuth_deg")
+        if attempt == 0:
+            return adapted
+
+        # Build failure context from previous attempts
+        failure_context = []
+        for i, scene in enumerate(attempt_scenes):
+            if scene:
+                failure_context.append(f"Attempt {i + 1} saw: {scene[:100]}")
+
+        prev_hint = adapted.get("room_nav_hints", "")
+        retry_hint = (
+            f"Previous {attempt} attempt(s) failed to reach the doorway. "
+            f"Try a DIFFERENT approach: move to a new position, try the opposite side of the room, "
+            f"or navigate around furniture from a different angle. "
+        )
+        if failure_context:
+            retry_hint += "Prior observations: " + "; ".join(failure_context[-2:]) + ". "
+        adapted["room_nav_hints"] = f"{retry_hint}{prev_hint}".strip()
+
+        # Rotate the expected azimuth on each retry
+        if original_azimuth is not None:
+            azimuth = float(original_azimuth)
+            # Alternate: try opposite side, then wider angles
+            if attempt == 1:
+                azimuth = -azimuth  # try opposite side
+            elif attempt == 2:
+                azimuth = azimuth * 0.5  # try center-ish
+            elif attempt >= 3:
+                azimuth = 0  # full sweep, no bias
+            adapted["expected_azimuth_deg"] = azimuth
+            self.events.publish(
+                "plan",
+                f"Retry {attempt + 1}: azimuth adjusted {original_azimuth}° -> {azimuth}°",
+            )
+        else:
+            # No original azimuth — add sweep hints
+            sweep_angles = [90, -90, 45, -45]
+            if attempt <= len(sweep_angles):
+                adapted["expected_azimuth_deg"] = sweep_angles[attempt - 1]
+                self.events.publish(
+                    "plan",
+                    f"Retry {attempt + 1}: blind sweep at {sweep_angles[attempt - 1]}°",
+                )
+
+        return adapted
 
     def _navigator_result_payload(self, result: NavigatorResult) -> dict:
         return {
@@ -440,7 +508,7 @@ class GraphNavigationOrchestrator:
         try:
             raw = self.llm.complete(
                 prompt=scene_prompt("Identify the room"),
-                system="Describe the image plainly. Do not output JSON.",
+                system=load_prompt("scene.system.md"),
                 image_bytes=frame,
                 max_tokens=220,
             )
@@ -487,7 +555,7 @@ class GraphNavigationOrchestrator:
         try:
             raw = self.llm.complete(
                 prompt=prompt,
-                system="Reply with only the requested JSON object.",
+                system=load_prompt("json_only.system.md"),
                 max_tokens=400,
             )
             parsed = extract_json_dict(raw) or {}

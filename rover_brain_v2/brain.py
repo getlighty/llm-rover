@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import threading
 import time
 
 from imu import IMUPoller
 from local_detector import DepthEstimator, LocalDetector
+from place_recognition import PlaceDB
 
 from rover_brain_v2.command_mode import GeneralCommandController
-from rover_brain_v2.config import load_config
+from rover_brain_v2.config import load_config, save_calibration
 from rover_brain_v2.events import EventBus
 from rover_brain_v2.follow.controller import FollowMeController
 from rover_brain_v2.hardware.audio_io import AudioIO
@@ -68,6 +70,12 @@ class RoverBrainV2:
             self.events.publish("system", "DepthAnything estimator loaded")
         except Exception as exc:
             self.events.publish("error", f"Depth estimator unavailable: {exc}")
+        # Center gimbal on startup
+        pc = self.config.gimbal_pan_center
+        tc = self.config.gimbal_tilt_center
+        self.rover.send({"T": 133, "X": round(pc, 1), "Y": round(tc, 1), "SPD": 200, "ACC": 20})
+        self.events.publish("system", f"Gimbal centered to ({pc}, {tc})")
+
         self.command_controller = GeneralCommandController(
             rover=self.rover,
             camera=self.camera,
@@ -77,6 +85,10 @@ class RoverBrainV2:
             speak_fn=self.speak,
         )
         bundle = self.providers.bundle()
+        self.place_db = PlaceDB(
+            db_path=os.path.join(os.path.dirname(__file__), "..", "place_signatures.pkl"),
+        )
+        self.place_db.load()
         self.navigator = DepthVectorNavigator(
             rover=self.rover,
             camera=self.camera,
@@ -84,12 +96,16 @@ class RoverBrainV2:
             event_bus=self.events,
             flags=self.flags,
             config=self.config,
+            speak_fn=self.speak,
+            listen_fn=self._listen_once,
+            place_db=self.place_db,
         )
         self.orchestrator = GraphNavigationOrchestrator(
             llm_client=bundle.orchestrator_llm,
             navigator=self.navigator,
             event_bus=self.events,
         )
+        self.navigator.topo = self.orchestrator.topo
         self.follow = FollowMeController(
             rover=self.rover,
             camera=self.camera,
@@ -132,7 +148,26 @@ class RoverBrainV2:
             return
         self.audio.speak(text, bundle.tts, log_fn=self.events.publish)
 
-    def handle_text_command(self, text: str):
+    def _listen_once(self, timeout_s: float = 15.0) -> str | None:
+        """Record one utterance and transcribe it. Returns text or None."""
+        if not self.audio.ready:
+            return None
+        abort = threading.Event()
+        timer = threading.Timer(timeout_s, abort.set)
+        timer.start()
+        try:
+            audio_data = self.audio.listen(abort_event=abort)
+            if audio_data is None:
+                return None
+            text = self.providers.bundle().stt.transcribe(audio_data)
+            return text.strip() if text else None
+        except Exception as exc:
+            self.events.publish("error", f"listen_once failed: {exc}")
+            return None
+        finally:
+            timer.cancel()
+
+    def handle_text_command(self, text: str, *, from_voice: bool = False):
         text = (text or "").strip()
         if not text:
             return {"ok": False, "error": "empty command"}
@@ -146,6 +181,7 @@ class RoverBrainV2:
             self.events.publish("system", f"Ignoring filler while {active_mode} is active")
             return {"ok": True, "mode": active_mode, "ignored": True}
         self.events.publish("heard", text)
+        # Reserved quick commands — bypass LLM
         if STOP_RE.match(text):
             self.cancel_active_task()
             return {"ok": True, "mode": "stop"}
@@ -156,10 +192,8 @@ class RoverBrainV2:
                 target = "person"
             self.start_follow(FollowRequest(target=target, duration=60.0, target_bw=self.config.follow_target_bw))
             return {"ok": True, "mode": "follow", "target": target}
-        if self._looks_like_navigation(text):
-            self.start_navigation(NavigationRequest(target=text, topological=True))
-            return {"ok": True, "mode": "navigation", "target": text}
-        self.start_general_command(text)
+        # Everything else goes through the LLM
+        self.start_general_command(text, speak_allowed=True)
         return {"ok": True, "mode": "general"}
 
     def start_follow(self, request: FollowRequest):
@@ -187,11 +221,19 @@ class RoverBrainV2:
         cancel_fn = self.orchestrator.cancel if request.topological else self.navigator.cancel
         self._spawn_task("navigation", runner, cancel_fn)
 
-    def start_general_command(self, text: str):
+    def start_general_command(self, text: str, *, speak_allowed: bool = True):
         def runner():
             self._apply_detector_policy("general")
             bundle = self.providers.bundle()
-            result = self.command_controller.run(text, bundle.command_llm)
+            result = self.command_controller.run(text, bundle.command_llm, speak_allowed=speak_allowed)
+            # If the LLM decided this is a navigation request, hand off
+            if result.status == "navigate" and result.payload:
+                nav_target = str(result.payload.get("navigate", text)).strip()
+                self.events.publish("plan", f"LLM routed to navigation: {nav_target}")
+                self._apply_detector_policy("navigation")
+                nav_result = self.orchestrator.run_navigation_task(nav_target, topological=True)
+                self.events.publish("plan", f"Navigation finished: {nav_result.status} | {nav_result.summary}")
+                return nav_result.reached
             self.events.publish("plan", f"General command finished: {result.status}")
             return result
         self._spawn_task("general", runner, self.command_controller.cancel)
@@ -258,8 +300,37 @@ class RoverBrainV2:
         return {"ok": True, "action": action}
 
     def move_gimbal(self, pan: float, tilt: float):
-        self.rover.send({"T": 133, "X": round(float(pan), 1), "Y": round(float(tilt), 1), "SPD": 250, "ACC": 20})
+        pc = self.config.gimbal_pan_center
+        tc = self.config.gimbal_tilt_center
+        self.rover.send({"T": 133, "X": round(float(pan) + pc, 1), "Y": round(float(tilt) + tc, 1), "SPD": 250, "ACC": 20})
         return {"ok": True, "pan": pan, "tilt": tilt}
+
+    def test_turn(self, degrees: float = 90.0):
+        """Execute a direct turn for calibration testing. No LLM involved."""
+        self.events.publish("system", f"Calibration test turn: {degrees:+.0f}°")
+        self.navigator._turn(degrees)
+        self.events.publish("system", f"Calibration test turn complete")
+        return {"ok": True, "degrees": degrees}
+
+    def set_calibration(self, **values):
+        result = {"ok": True}
+        if "gimbal_pan_center" in values:
+            self.config.gimbal_pan_center = float(values["gimbal_pan_center"])
+            result["gimbal_pan_center"] = self.config.gimbal_pan_center
+        if "gimbal_tilt_center" in values:
+            self.config.gimbal_tilt_center = float(values["gimbal_tilt_center"])
+            result["gimbal_tilt_center"] = self.config.gimbal_tilt_center
+        if "turn_rate_dps" in values:
+            self.config.turn_rate_dps = float(values["turn_rate_dps"])
+            result["turn_rate_dps"] = self.config.turn_rate_dps
+        save_calibration(**{k: v for k, v in values.items()
+                           if k in ("gimbal_pan_center", "gimbal_tilt_center", "turn_rate_dps")})
+        # Move gimbal to new center
+        pc = self.config.gimbal_pan_center
+        tc = self.config.gimbal_tilt_center
+        self.rover.send({"T": 133, "X": round(pc, 1), "Y": round(tc, 1), "SPD": 200, "ACC": 20})
+        self.events.publish("system", f"Calibration saved: {result}")
+        return result
 
     def status(self):
         current_room = getattr(self.orchestrator.topo, "current_room", None)
@@ -281,6 +352,11 @@ class RoverBrainV2:
             "detector_mode": self._detector_mode(),
             "current_room": current_room,
             "known_rooms": [room.id for room in self.orchestrator.topo.rooms()],
+            "calibration": {
+                "gimbal_pan_center": self.config.gimbal_pan_center,
+                "gimbal_tilt_center": self.config.gimbal_tilt_center,
+                "turn_rate_dps": self.config.turn_rate_dps,
+            },
         }
 
     def landmarks(self):
@@ -307,6 +383,10 @@ class RoverBrainV2:
                 self.imu.stop()
             except Exception:
                 pass
+        try:
+            self.place_db.save()
+        except Exception:
+            pass
         self.camera.close()
         self.rover.close()
 
@@ -354,7 +434,7 @@ class RoverBrainV2:
             enabled = True
             reason = "follow mode"
         elif mode == "navigation":
-            enabled = False
+            enabled = True
             reason = "navigation mode"
         else:
             enabled = bool(self.flags.yolo_overlay_enabled)
@@ -385,7 +465,7 @@ class RoverBrainV2:
                     self.events.publish("heard", text)
                     self.events.publish("system", f"Ignoring voice input while {active_mode} is active")
                     continue
-                self.handle_text_command(text)
+                self.handle_text_command(text, from_voice=True)
 
 
 def main():

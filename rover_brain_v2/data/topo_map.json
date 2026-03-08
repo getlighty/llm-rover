@@ -102,21 +102,24 @@
             "wooden door frame",
             "bright light beyond",
             "wooden door",
-            "bright light source beyond threshold"
+            "bright light source beyond threshold",
+            "arched entry point on the far wall of the office",
+            "visible change from carpet to stone tile at threshold"
           ],
           "inside_features": [
             "stone tiles floor",
             "open passage",
             "potted plant to the left",
             "stone flooring",
-            "high illumination"
+            "high illumination",
+            "immediate view of stone tile floor"
           ],
           "inside_room_guess": "hallway",
-          "navigational_hint": "Follow the bright light through the wooden door to find stone-tiled flooring typical of the kitchen.",
-          "last_scene": "wooden doorway with bright light and stone tiles ahead",
+          "navigational_hint": "Exit the office through the door where the floor changes to stone tiles and proceed toward the potted plant.",
+          "last_scene": "Crossed threshold into hallway, stone tiles under wheels, potted plant visible ahead",
           "confidence": 0.95,
-          "last_observed": "2026-03-07 07:41",
-          "observation_count": 3
+          "last_observed": "2026-03-08 10:26",
+          "observation_count": 5
         },
         "living_room": {
           "to_room": "hallway",
@@ -137,7 +140,7 @@
           "observation_count": 1
         }
       },
-      "observation_count": 3
+      "observation_count": 5
     },
     {
       "id": "hall_kitchen_arch",
@@ -146,13 +149,48 @@
       "visual_cues": [
         "orange arched doorway",
         "kitchen counter visible",
-        "tiled floor beyond"
+        "tiled floor beyond",
+        "orange arch",
+        "right-side hallway view",
+        "kitchen interior",
+        "distinctive orange archway",
+        "visible tiled flooring beyond arch",
+        "side of refrigerator visible through arch",
+        "refrigerator immediately to the left"
       ],
       "azimuth_from": {
         "hallway": 90
       },
       "width_m": 1.0,
-      "nav_hints": "Turn right in the hallway. Look for the orange arched doorway."
+      "nav_hints": "Turn right in the hallway. Look for the orange arched doorway.",
+      "semantic_views": {
+        "hallway": {
+          "to_room": "kitchen",
+          "doorway_landmarks": [
+            "orange arch",
+            "right-side hallway view",
+            "distinctive orange archway",
+            "visible tiled flooring beyond arch",
+            "side of refrigerator visible through arch",
+            "orange archway on left wall (visible from hallway)"
+          ],
+          "inside_features": [
+            "kitchen interior",
+            "refrigerator immediately to the left",
+            "continuous tiled floor",
+            "open kitchen space",
+            "white tiled floor",
+            "stainless steel countertop (right side)"
+          ],
+          "inside_room_guess": "kitchen",
+          "navigational_hint": "Proceed through the archway where the floor changes to tile and appliances become visible.",
+          "last_scene": "Inside kitchen, tiled floor, counter and appliances visible",
+          "confidence": 0.98,
+          "last_observed": "2026-03-08 09:58",
+          "observation_count": 5
+        }
+      },
+      "observation_count": 5
     },
     {
       "id": "hall_living_arch",
@@ -234,11 +272,11 @@
     },
     {
       "a": "hallway",
-      "b": "hall_living_arch"
+      "b": "hall_bathroom_door"
     },
     {
       "a": "hallway",
-      "b": "hall_bathroom_door"
+      "b": "office_hall_door"
     },
     {
       "a": "hallway",
@@ -246,19 +284,19 @@
     },
     {
       "a": "hallway",
-      "b": "office_hall_door"
+      "b": "hall_living_arch"
+    },
+    {
+      "a": "kitchen",
+      "b": "hall_kitchen_arch"
     },
     {
       "a": "kitchen",
       "b": "kitchen_dining_pass"
     },
     {
-      "a": "kitchen",
-      "b": "hall_kitchen_arch"
-    },
-    {
       "a": "living_room",
-      "b": "living_dining_pass"
+      "b": "office_hall_door"
     },
     {
       "a": "living_room",
@@ -266,7 +304,7 @@
     },
     {
       "a": "living_room",
-      "b": "office_hall_door"
+      "b": "living_dining_pass"
     },
     {
       "a": "dining",

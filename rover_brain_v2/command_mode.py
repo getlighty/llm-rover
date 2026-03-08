@@ -8,7 +8,7 @@ from pathlib import Path
 
 from rover_brain_v2.json_utils import as_float, extract_json_dict
 from rover_brain_v2.models import MotionCommandResult
-from rover_brain_v2.prompts import command_system_prompt
+from rover_brain_v2.prompts import command_system_prompt, load_prompt
 
 
 MEMORY_FILE = Path(__file__).resolve().parent / "memory.md"
@@ -29,8 +29,9 @@ class GeneralCommandController:
         self._cancel.set()
         self.rover.stop()
 
-    def run(self, text: str, llm_client) -> MotionCommandResult:
+    def run(self, text: str, llm_client, *, speak_allowed: bool = True) -> MotionCommandResult:
         self._cancel.clear()
+        self._speak_allowed = speak_allowed
         rounds = 0
         pending_prompt = text
         self.events.publish("plan", f"General command: {text}")
@@ -45,10 +46,18 @@ class GeneralCommandController:
             speak_text = str(result.get("speak", "")).strip()
             remember = str(result.get("remember", "")).strip()
             observe = bool(result.get("observe", False))
-            if speak_text:
+            navigate = str(result.get("navigate", "")).strip()
+            if speak_text and self._speak_allowed:
                 self.speak(speak_text)
             if remember:
                 self._remember(remember)
+            # If LLM wants to hand off to navigation system
+            if navigate:
+                return MotionCommandResult(
+                    status="navigate",
+                    rounds=rounds,
+                    payload=result,
+                )
             self._execute(commands)
             rounds += 1
             if not observe:
@@ -89,7 +98,7 @@ class GeneralCommandController:
         return parsed
 
     def _execute(self, commands: list[dict]):
-        for command in commands:
+        for i, command in enumerate(commands):
             if self._cancel.is_set():
                 break
             if not isinstance(command, dict):
@@ -97,10 +106,45 @@ class GeneralCommandController:
             if "_pause" in command:
                 self._sleep(as_float(command["_pause"], 0.0))
                 continue
+            # Apply gimbal calibration offset
+            if command.get("T") == 133:
+                pc = getattr(self.config, "gimbal_pan_center", 0.0)
+                tc = getattr(self.config, "gimbal_tilt_center", 0.0)
+                command = dict(command, X=round(command.get("X", 0) + pc, 1),
+                               Y=round(command.get("Y", 0) + tc, 1))
             self.rover.send(command)
-            if command.get("T") == 1 and (command.get("L", 0) or command.get("R", 0)):
-                self._sleep(0.15)
+            # Auto-pause between commands unless an explicit _pause follows
+            next_cmd = commands[i + 1] if i + 1 < len(commands) else None
+            has_explicit_pause = isinstance(next_cmd, dict) and "_pause" in next_cmd
+            if not has_explicit_pause:
+                if command.get("T") == 133:
+                    # Gimbal: calculate travel time using servo kinematics
+                    if isinstance(next_cmd, dict) and next_cmd.get("T") == 133:
+                        pause = self._gimbal_travel_time(command, next_cmd)
+                        self._sleep(pause)
+                elif command.get("T") == 1 and (command.get("L", 0) or command.get("R", 0)):
+                    self._sleep(0.5)
         self.rover.stop()
+
+    @staticmethod
+    def _gimbal_travel_time(cmd: dict, next_cmd: dict) -> float:
+        """Estimate gimbal travel time based on angle distance and speed.
+
+        Empirically calibrated: at SPD=600, 180° takes ~0.8s.
+        Base rate ≈ 225 deg/s at SPD=600. Scale proportionally for other speeds.
+        Add 30% safety margin for servo lag and settling.
+        """
+        dx = abs(next_cmd.get("X", 0) - cmd.get("X", 0))
+        dy = abs(next_cmd.get("Y", 0) - cmd.get("Y", 0))
+        distance = max(dx, dy)
+        if distance < 1.0:
+            return 0.05
+        spd = max(cmd.get("SPD", 300), 50)
+        # Empirical rate: ~225 deg/s at SPD=600, scales linearly
+        rate_dps = spd * (225.0 / 600.0)
+        t = distance / rate_dps
+        # 30% safety margin + 0.08s minimum for servo response lag
+        return max(t * 1.3 + 0.08, 0.15)
 
     def _inject_duration_stop(self, commands: list[dict], duration: float):
         if duration <= 0:
@@ -118,8 +162,8 @@ class GeneralCommandController:
             return ""
         try:
             return llm_client.complete(
-                prompt="Describe what changed after the last action in one sentence.",
-                system="Reply in one plain sentence. No JSON.",
+                prompt=load_prompt("observe_scene.md"),
+                system=load_prompt("observe_scene.system.md"),
                 image_bytes=frame,
                 max_tokens=120,
             ).strip()

@@ -76,7 +76,7 @@ class CameraPipeline:
             summary = ""
             depth_map = None
             self._frame_counter += 1
-            det_interval = 1 if self._follow_mode else 3
+            det_interval = 1
             should_process = (self._frame_counter % det_interval) == 0
             if should_process and self._depth_estimator is not None:
                 try:
@@ -90,17 +90,10 @@ class CameraPipeline:
                 except Exception:
                     dets = []
                     summary = ""
-            if depth_map is not None or dets:
+            if dets:
                 overlay = frame.copy()
-                if dets and self._detector is not None:
+                if self._detector is not None:
                     self._detector.draw(overlay, dets)
-                if depth_map is not None and self._depth_estimator is not None:
-                    try:
-                        mini = cv2.resize(self._depth_estimator.colorize(depth_map), (128, 96))
-                        h, w = overlay.shape[:2]
-                        overlay[h - 96:h, w - 128:w] = mini
-                    except Exception:
-                        pass
                 _, overlay_buffer = cv2.imencode(
                     ".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 72]
                 )
@@ -127,6 +120,26 @@ class CameraPipeline:
         with self._lock:
             return self._overlay_jpeg or self._jpeg
 
+    def snap_with_yolo(self, max_dim: int = 512, quality: int = 60):
+        """Return resized JPEG with YOLO boxes drawn but NO depth minimap."""
+        with self._lock:
+            jpeg = self._jpeg
+            dets = list(self._detections)
+        if jpeg is None:
+            return None
+        arr = np.frombuffer(jpeg, dtype=np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if image is None:
+            return jpeg
+        if dets and self._detector is not None:
+            self._detector.draw(image, dets)
+        h, w = image.shape[:2]
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            image = cv2.resize(image, (int(w * scale), int(h * scale)))
+        _, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        return buffer.tobytes()
+
     def snap(self, max_dim: int = 512, quality: int = 60):
         with self._lock:
             jpeg = self._jpeg
@@ -146,6 +159,23 @@ class CameraPipeline:
     def get_depth_map(self):
         with self._lock:
             return None if self._depth_map is None else self._depth_map.copy()
+
+    def get_depth_image(self, max_dim: int = 320, quality: int = 50):
+        """Return colorized depth map as JPEG bytes, or None."""
+        with self._lock:
+            dm = self._depth_map
+        if dm is None or self._depth_estimator is None:
+            return None
+        try:
+            colorized = self._depth_estimator.colorize(dm)
+            h, w = colorized.shape[:2]
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                colorized = cv2.resize(colorized, (int(w * scale), int(h * scale)))
+            _, buf = cv2.imencode(".jpg", colorized, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            return buf.tobytes()
+        except Exception:
+            return None
 
     def get_detections(self):
         with self._lock:

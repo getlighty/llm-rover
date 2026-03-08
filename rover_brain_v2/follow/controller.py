@@ -7,7 +7,7 @@ import random
 import time
 
 from rover_brain_v2.follow.depth_guard import DepthCrashGuard
-from rover_brain_v2.prompts import follow_callout_prompt
+from rover_brain_v2.prompts import follow_callout_prompt, load_prompt
 
 
 GIMBAL_GAIN = 40.0
@@ -69,7 +69,9 @@ class FollowMeController:
         start = time.time()
         bw_sum = 0.0
         bw_count = 0
-        self.rover.send({"T": 133, "X": 0, "Y": INITIAL_TILT, "SPD": 200, "ACC": 10})
+        pc = getattr(self.config, "gimbal_pan_center", 0.0)
+        tc = getattr(self.config, "gimbal_tilt_center", 0.0)
+        self.rover.send({"T": 133, "X": round(pc, 1), "Y": round(INITIAL_TILT + tc, 1), "SPD": 200, "ACC": 10})
         self.events.publish("follow", f"Following {target} for {duration:.0f}s")
         try:
             while time.time() - start < duration:
@@ -110,7 +112,9 @@ class FollowMeController:
                     tilt -= err_y * GIMBAL_GAIN
                 pan = max(PAN_MIN, min(PAN_MAX, pan))
                 tilt = max(TILT_MIN, min(TILT_MAX, tilt))
-                self.rover.send({"T": 133, "X": round(pan, 1), "Y": round(tilt, 1), "SPD": 500, "ACC": 200})
+                gc_pan = getattr(self.config, "gimbal_pan_center", 0.0)
+                gc_tilt = getattr(self.config, "gimbal_tilt_center", 0.0)
+                self.rover.send({"T": 133, "X": round(pan + gc_pan, 1), "Y": round(tilt + gc_tilt, 1), "SPD": 500, "ACC": 200})
                 if abs(err_x) > CENTERING_TOL:
                     self.rover.send({"T": 1, "L": 0, "R": 0})
                     time.sleep(1.0 / self.config.follow_loop_hz)
@@ -153,13 +157,16 @@ class FollowMeController:
         finally:
             self.camera.set_follow_mode(False)
             self.rover.send({"T": 1, "L": 0, "R": 0})
-            self.rover.send({"T": 133, "X": 0, "Y": 0, "SPD": 200, "ACC": 10})
+            pc = getattr(self.config, "gimbal_pan_center", 0.0)
+            tc = getattr(self.config, "gimbal_tilt_center", 0.0)
+            self.rover.send({"T": 133, "X": round(pc, 1), "Y": round(tc, 1), "SPD": 200, "ACC": 10})
         return self._result("completed", time.time() - start, bw_sum, bw_count)
 
     def _depth_recover(self, guard: dict):
         heading = float(guard.get("recommended_heading_deg") or 0.0)
         if abs(heading) >= 8:
-            turn_time = min(0.7, abs(heading) / 180.0)
+            rate = getattr(self.config, "turn_rate_dps", 200.0)
+            turn_time = min(0.7, abs(heading) / max(rate, 60.0))
             if heading > 0:
                 self.rover.send({"T": 1, "L": 0.25, "R": -0.25})
             else:
@@ -177,7 +184,7 @@ class FollowMeController:
             try:
                 text = self.llm.complete(
                     prompt=follow_callout_prompt(target),
-                    system="Reply with only one short sentence.",
+                    system=load_prompt("follow_callout.system.md"),
                     max_tokens=40,
                 ).strip()
             except Exception:
@@ -193,11 +200,14 @@ class FollowMeController:
 
     def _spin_search(self, labels):
         spin_speed = 0.35
+        rate = getattr(self.config, "turn_rate_dps", 200.0)
+        step_deg = 30.0
+        step_time = step_deg / max(rate, 60.0)
         for _ in range(12):
             if self._cancelled:
                 return None
             self.rover.send({"T": 1, "L": spin_speed, "R": -spin_speed})
-            time.sleep(0.3)
+            time.sleep(step_time)
             self.rover.stop()
             time.sleep(0.15)
             dets, _, _ = self.camera.get_detections()

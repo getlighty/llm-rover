@@ -28,3 +28,11 @@ class EventBus:
         with self._lock:
             return list(self._events)[-limit:]
 
+    def compact(self, keep: int = 20):
+        """Drop old events, keeping only the most recent `keep` entries."""
+        with self._lock:
+            if len(self._events) > keep:
+                kept = list(self._events)[-keep:]
+                self._events.clear()
+                self._events.extend(kept)
+

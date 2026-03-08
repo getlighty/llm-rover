@@ -214,7 +214,7 @@ DASHBOARD_HTML = """<!doctype html>
                 <button class="soft" onclick="gimbal(0,20)">Up</button>
                 <div></div>
                 <button class="soft" onclick="gimbal(-30,0)">Left</button>
-                <button class="soft" onclick="gimbal(0,0)">Center</button>
+                <button class="soft" onclick="gimbalCenter()">Center</button>
                 <button class="soft" onclick="gimbal(30,0)">Right</button>
                 <div></div>
                 <button class="soft" onclick="gimbal(0,-15)">Down</button>
@@ -229,6 +229,17 @@ DASHBOARD_HTML = """<!doctype html>
                 <button class="soft" onclick="setCommand('say hello')">Say Hello</button>
                 <button class="soft" onclick="setCommand('center camera')">Center Camera</button>
               </div>
+              <div class="subtext" style="margin-top:12px;margin-bottom:8px">Calibration</div>
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+                <label style="font-size:12px">Gimbal Pan <input id="calPan" type="number" step="0.5" style="width:100%;padding:8px;border-radius:10px"></label>
+                <label style="font-size:12px">Gimbal Tilt <input id="calTilt" type="number" step="0.5" style="width:100%;padding:8px;border-radius:10px"></label>
+                <label style="font-size:12px">Turn °/s <input id="calTurnRate" type="number" step="5" style="width:100%;padding:8px;border-radius:10px"></label>
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:6px">
+                <button class="soft" onclick="calTest()">Test</button>
+                <button class="accent" onclick="calSave()">Save</button>
+                <button class="soft" onclick="calTestTurn()">Test 90°</button>
+              </div>
             </div>
           </div>
         </section>
@@ -236,13 +247,25 @@ DASHBOARD_HTML = """<!doctype html>
 
       <div class="stack">
         <section class="panel">
-          <h2>Providers</h2>
+          <h2>Events</h2>
+          <div class="log" id="log"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Speech</h2>
           <div class="provider-grid">
             <label><div class="subtext">STT</div><select id="stt"></select></label>
-            <label><div class="subtext">Command LLM</div><select id="command_llm"></select></label>
-            <label><div class="subtext">Navigator LLM</div><select id="navigator_llm"></select></label>
-            <label><div class="subtext">Orchestrator LLM</div><select id="orchestrator_llm"></select></label>
             <label><div class="subtext">TTS</div><select id="tts"></select></label>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>LLMs</h2>
+          <label style="margin-bottom:10px;display:block"><div class="subtext">All LLMs</div><select id="all_llm"></select></label>
+          <div class="provider-grid">
+            <label><div class="subtext">Command</div><select id="command_llm"></select></label>
+            <label><div class="subtext">Navigator</div><select id="navigator_llm"></select></label>
+            <label><div class="subtext">Orchestrator</div><select id="orchestrator_llm"></select></label>
           </div>
         </section>
 
@@ -260,11 +283,6 @@ DASHBOARD_HTML = """<!doctype html>
         <section class="panel">
           <h2>Telemetry</h2>
           <div class="pill-row" id="telemetryPills"></div>
-        </section>
-
-        <section class="panel">
-          <h2>Events</h2>
-          <div class="log" id="log"></div>
         </section>
       </div>
     </div>
@@ -296,6 +314,14 @@ DASHBOARD_HTML = """<!doctype html>
       renderRooms(status.known_rooms||[]);
       bindProviders(status.providers);
       bindFlags(status.flags);
+      if(status.calibration){
+        const cp=document.getElementById('calPan');
+        const ct=document.getElementById('calTilt');
+        const cr=document.getElementById('calTurnRate');
+        if(document.activeElement!==cp)cp.value=status.calibration.gimbal_pan_center;
+        if(document.activeElement!==ct)ct.value=status.calibration.gimbal_tilt_center;
+        if(document.activeElement!==cr)cr.value=status.calibration.turn_rate_dps;
+      }
     }
 
     function renderPills(status){
@@ -329,6 +355,7 @@ DASHBOARD_HTML = """<!doctype html>
     }
 
     function bindProviders(providerInfo){
+      const llmIds=['command_llm','navigator_llm','orchestrator_llm'];
       ['stt','command_llm','navigator_llm','orchestrator_llm','tts'].forEach(id=>{
         const sel=document.getElementById(id);
         const values=providerInfo.available[id]||[];
@@ -348,6 +375,27 @@ DASHBOARD_HTML = """<!doctype html>
         sel.value=providerInfo.current[id];
         sel.dataset.bound='1';
       });
+      // "All LLMs" combo selector
+      const allSel=document.getElementById('all_llm');
+      const allValues=providerInfo.available['command_llm']||[];
+      if(allSel.dataset.bound!=='1'){
+        allSel.innerHTML='';
+        allValues.forEach(value=>{
+          const opt=document.createElement('option');
+          opt.value=value;
+          opt.textContent=value;
+          allSel.appendChild(opt);
+        });
+        allSel.onchange=()=>{
+          const v=allSel.value;
+          llmIds.forEach(id=>{document.getElementById(id).value=v;});
+          post('/api/providers',{command_llm:v,navigator_llm:v,orchestrator_llm:v}).then(refreshStatus);
+        };
+        allSel.dataset.bound='1';
+      }
+      // Reflect current state: show value if all three match, otherwise first option
+      const cur=llmIds.map(id=>providerInfo.current[id]);
+      allSel.value=(cur[0]===cur[1]&&cur[1]===cur[2])?cur[0]:allValues[0]||'';
     }
 
     function bindFlags(flags){
@@ -409,6 +457,10 @@ DASHBOARD_HTML = """<!doctype html>
 
     function gimbal(pan,tilt){post('/api/gimbal',{pan,tilt});}
 
+    function gimbalCenter(){
+      post('/api/gimbal',{pan:0,tilt:0});
+    }
+
     function toggleKill(){
       const engage=!(lastStatus&&lastStatus.flags&&lastStatus.flags.killed);
       post('/api/kill',{engage}).then(refreshStatus);
@@ -417,6 +469,32 @@ DASHBOARD_HTML = """<!doctype html>
     function toggleLights(){
       lightsOn=!lightsOn;
       teleop(lightsOn?'lights_on':'lights_off');
+    }
+
+    function calGetValues(){
+      return {
+        gimbal_pan_center:parseFloat(document.getElementById('calPan').value)||0,
+        gimbal_tilt_center:parseFloat(document.getElementById('calTilt').value)||0,
+        turn_rate_dps:parseFloat(document.getElementById('calTurnRate').value)||200,
+      };
+    }
+
+    function calTest(){
+      post('/api/calibration',calGetValues());
+    }
+
+    function calSave(){
+      post('/api/calibration',calGetValues()).then(()=>{
+        alert('Calibration saved');
+        refreshStatus();
+      });
+    }
+
+    function calTestTurn(){
+      // Save current turn_rate_dps first, then execute a direct 90° turn
+      post('/api/calibration',calGetValues()).then(()=>{
+        post('/api/test_turn',{degrees:90});
+      });
     }
 
     async function restartService(){
@@ -496,7 +574,7 @@ class RoverWebServer:
                     self._send_json(brain.landmarks())
                     return
                 if self.path == "/api/snap":
-                    frame = brain.camera.get_overlay_jpeg()
+                    frame = brain.camera.get_overlay_jpeg() if brain.flags.yolo_overlay_enabled else brain.camera.get_jpeg()
                     if not frame:
                         self.send_error(503)
                         return
@@ -512,7 +590,7 @@ class RoverWebServer:
                     self.end_headers()
                     try:
                         while True:
-                            frame = brain.camera.get_overlay_jpeg()
+                            frame = brain.camera.get_overlay_jpeg() if brain.flags.yolo_overlay_enabled else brain.camera.get_jpeg()
                             if frame:
                                 self.wfile.write(b"--frame\r\n")
                                 self.wfile.write(b"Content-Type: image/jpeg\r\n")
@@ -563,6 +641,12 @@ class RoverWebServer:
                     return
                 if self.path == "/api/gimbal":
                     self._send_json(brain.move_gimbal(data.get("pan", 0), data.get("tilt", 0)))
+                    return
+                if self.path == "/api/calibration":
+                    self._send_json(brain.set_calibration(**data))
+                    return
+                if self.path == "/api/test_turn":
+                    self._send_json(brain.test_turn(float(data.get("degrees", 90))))
                     return
                 if self.path == "/api/follow":
                     brain.start_follow(
