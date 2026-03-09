@@ -7,8 +7,12 @@ __pycache__/
 *.jpeg
 *.png
 models/*.pt
+models/*.pth
 models/*.onnx
+models/*.onnx.data
 models/*.engine
+models/*.trt
+models/*.trt.json
 models/*.tflite
 *.pt
 *.onnx
