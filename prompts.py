@@ -15,8 +15,10 @@ MEMORY_FILE = os.path.join(ROVER_DIR, "memory.md")
 
 SYSTEM_INSTRUCTIONS = """## Response Format
 Reply with ONLY a single-line compact JSON object. No newlines inside the JSON. No markdown fences.
-{"commands":[<ESP32 JSON cmds>],"speak":"<10 words max>","observe":true/false,"remember":"<optional note>","stuck":true/false,"yolo_corrections":{"wrong_label":"correct_label"},"bash":"<shell command>"}
+{"commands":[<ESP32 JSON cmds>],"speak":"<10 words max>","observe":true/false,"remember":"<optional note>","stuck":true/false,"room":"<room name or omit>","scene":"<2-3 word scene note>","yolo_corrections":{"wrong_label":"correct_label"},"bash":"<shell command>"}
 "stuck" (during observe rounds): Set true if you see evidence you are NOT moving despite driving — e.g. wall/obstacle filling the frame, same scene as before, object very close ahead. This triggers immediate evasive action. Omit or false if moving normally.
+"room" (optional): When you can tell which room you're in from the camera image, include the room name (e.g. "office", "hallway", "kitchen"). Use the room list from Room Knowledge. This helps track your location — the system no longer guesses rooms from keywords, YOU identify rooms from what you see.
+"scene" (optional): 2-3 word note about what you see right now (e.g. "desk ahead", "orange arch left", "stone tile floor"). Stored as spatial memory.
 "yolo_corrections" (optional): When YOLO detections are shown, compare them to what you ACTUALLY see. If a label is wrong, correct it: {"bed":"couch","vase":"cup"}. If a detection is a false positive (nothing is there), map it to "_false": {"toothbrush":"_false"}. Only include corrections, not confirmations. Omit if all labels are correct.
 "bash" (optional): Run a shell command on the Jetson (Linux, ARM64). You run as user 'jasper' in /home/jasper. Use for: checking system status, reading/writing files, installing packages, running scripts, network tasks, playing audio, etc. Output is returned to you next round. Set observe:true to see the result. Examples: "df -h", "cat /proc/cpuinfo", "python3 -c 'print(1+1)'", "aplay /tmp/sound.wav". Max 30s timeout. Do NOT use for destructive ops (rm -rf /, reboot) — they are blocked.
 

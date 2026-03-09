@@ -2281,6 +2281,24 @@ def run_plan(text, ser, cam, spk, mic_card):
     if isinstance(yolo_corr, dict) and yolo_corr:
         _apply_yolo_corrections(yolo_corr)
 
+    # LLM-identified room — the LLM sees the image and tells us what room
+    llm_room = resp.get("room")
+    if llm_room and isinstance(llm_room, str) and llm_room.strip():
+        llm_room = llm_room.strip().lower().replace(" ", "_")
+        room_context.merge_room_observation(
+            llm_room, scene_text=resp.get("scene", ""),
+            mark_current=True, confidence=0.7)
+        if _topo_map:
+            _topo_map.current_room = llm_room
+            _topo_map.current_confidence = 0.7
+
+    # LLM scene note — stored as narrative spatial memory
+    llm_scene = resp.get("scene")
+    if llm_scene and isinstance(llm_scene, str) and llm_scene.strip():
+        if hasattr(_navigator, 'room_map') and _navigator.room_map:
+            _navigator.room_map.record_narrative(
+                llm_scene.strip(), room=llm_room or None)
+
     # Bash command execution
     bash_cmd = resp.get("bash")
     if bash_cmd:
@@ -2833,6 +2851,22 @@ def run_plan(text, ser, cam, spk, mic_card):
         yolo_corr = resp.get("yolo_corrections")
         if isinstance(yolo_corr, dict) and yolo_corr:
             _apply_yolo_corrections(yolo_corr)
+
+        # ── LLM room identification + scene memory ──
+        llm_room = resp.get("room")
+        if llm_room and isinstance(llm_room, str) and llm_room.strip():
+            llm_room = llm_room.strip().lower().replace(" ", "_")
+            room_context.merge_room_observation(
+                llm_room, scene_text=resp.get("scene", ""),
+                mark_current=True, confidence=0.7)
+            if _topo_map:
+                _topo_map.current_room = llm_room
+                _topo_map.current_confidence = 0.7
+        llm_scene = resp.get("scene")
+        if llm_scene and isinstance(llm_scene, str) and llm_scene.strip():
+            if nav.room_map:
+                nav.room_map.record_narrative(
+                    llm_scene.strip(), room=llm_room if llm_room else None)
 
         # ── Bash command execution ──
         bash_cmd = resp.get("bash")
@@ -3876,20 +3910,20 @@ def main():
                     pass
             return None
 
-        # Exploration grid — persists across navigate() calls, cleared on restart
+        # Exploration grid — lightweight stub (LLM handles spatial reasoning)
         _exploration_grid = None
         try:
             from exploration_grid import ExplorationGrid
             _exploration_grid = ExplorationGrid()
             navigator._exploration_grid = _exploration_grid  # expose for web_ui
-            print("[nav] Exploration grid active (80x80x2, 20cm cells)")
+            print("[nav] Exploration grid active (LLM-first stub)")
         except Exception as _eg_err:
             print(f"[nav] Exploration grid unavailable: {_eg_err}")
 
-        # Room map — 3D descriptive spatial map of objects
+        # Room map — narrative spatial memory (LLM-first, no XY coordinates)
         from room_map import RoomMap
         _room_map = RoomMap()
-        log_event("system", f"RoomMap active ({_room_map.object_count()} objects loaded)")
+        log_event("system", f"RoomMap active (narrative, {_room_map.object_count()} objects)")
 
         _navigator = Navigator(
             rover=ser, detector=cam.detector, tracker=cam,

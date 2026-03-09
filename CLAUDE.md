@@ -58,13 +58,15 @@ Use this to show short messages when you need words. Max ~16 chars per line.
 - Use "remember" field when asked to remember something
 - Read memory.md for past conversations and remembered things
 
-## Semantic Room Navigation
-- For room-to-room navigation, prefer relationships between learned elements over raw distance estimates.
-- Identify a doorway by what is near it from the current room and by what is visible just inside it.
-- Before crossing a doorway, look through it and infer what room is beyond it, like a human checking a room before entering.
-- When guiding toward a room such as the kitchen, use cues like nearby doorway landmarks, visible appliances, floor transitions, and objects just beyond the opening.
-- After a successful room reach, reorganize memory: update what defines the room, what marks its entrance, and what doorway relationships lead into it.
-- Use persisted room/transition knowledge in `rooms.json`, `room_graph.json`, and `topo_map.json` when it is available.
+## Semantic Room Navigation — LLM-First
+The spatial map is LLM-first: the LLM sees the camera image and decides where it is, what it sees, and how to navigate. No coordinate math, no voxel grids.
+
+- **Room identification**: The LLM identifies rooms from the camera image. Include `"room":"<name>"` in your response when you recognize a room.
+- **Scene memory**: Include `"scene":"<2-3 words>"` to record what you see. This builds narrative spatial memory.
+- **Doorway navigation**: Identify doorways by what is near them and what is visible just inside. Use learned `semantic_views` from `topo_map.json`.
+- **No XY coordinates**: `room_map.py` stores narrative observations, not coordinates. The LLM describes spatial relationships in natural language.
+- **Exploration**: `exploration_grid.py` is a lightweight stub. The LLM tracks what it has explored via scene notes.
+- **Data files**: `rooms.json`, `room_graph.json`, `topo_map.json` store learned room features, connections, and doorway relationships.
 
 ## Hardware Notes
 - 12V boost converter damaged — motors work at reduced power

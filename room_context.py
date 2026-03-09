@@ -1,7 +1,11 @@
-"""room_context.py — Room database with exclusion-based identification.
+"""room_context.py — Room database with LLM-first identification.
 
 Standalone module, no dependencies on rover_brain_llm.
 Stores room data in rooms.json alongside this file.
+
+Room identification is now done by the LLM (it sees the camera image and
+knows the room list). This module only persists and formats room knowledge —
+no more hand-rolled feature-scoring.
 """
 
 import json
@@ -12,6 +16,64 @@ ROVER_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOMS_FILE = os.path.join(ROVER_DIR, "rooms.json")
 ROOM_GRAPH_FILE = os.path.join(ROVER_DIR, "room_graph.json")
 TOPO_MAP_FILE = os.path.join(ROVER_DIR, "topo_map.json")
+
+
+# ── Internal helpers ─────────────────────────────────────────────────
+
+def _normalize_room_name(name):
+    return str(name or "").strip().lower().replace(" ", "_")
+
+
+def _merge_unique_text(existing, new_items, limit=12):
+    merged = []
+    seen = set()
+    for item in list(existing or []) + list(new_items or []):
+        text = str(item).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(text)
+        if limit and len(merged) >= limit:
+            break
+    return merged
+
+
+def _merge_landmarks(existing, new_landmarks, limit=6):
+    existing_text = []
+    for entry in existing or []:
+        if isinstance(entry, dict):
+            existing_text.append(entry.get("landmark", ""))
+        else:
+            existing_text.append(str(entry))
+    merged = _merge_unique_text(existing_text, new_landmarks, limit=limit)
+    return [{"landmark": text} for text in merged]
+
+
+def _ensure_room_entry(data, room_name):
+    room_id = _normalize_room_name(room_name)
+    if not room_id:
+        return None
+    for room in data.get("rooms", []):
+        if room.get("name") == room_id:
+            return room
+    room = {
+        "name": room_id,
+        "positive_features": [],
+        "negative_features": [],
+        "floor_type": "",
+        "connections": [],
+        "entry_landmarks": [],
+        "nav_hints": "",
+        "last_visited": "",
+        "visit_count": 0,
+        "last_scene": "",
+        "last_yolo": "",
+    }
+    data.setdefault("rooms", []).append(room)
+    return room
 
 
 def _graph_to_rooms(graph):
@@ -91,10 +153,8 @@ def _rooms_to_graph(data):
                 continue
             seen_edges.add(key)
             edges.append({
-                "source": a,
-                "target": b,
-                "type": "connected",
-                "weight": 1.0,
+                "source": a, "target": b,
+                "type": "connected", "weight": 1.0,
             })
 
     return {
@@ -104,105 +164,6 @@ def _rooms_to_graph(data):
         "nodes": nodes,
         "edges": edges,
     }
-
-
-def load_rooms():
-    """Read rooms.json, return full dict. Handles missing/corrupt."""
-    if not os.path.exists(ROOMS_FILE):
-        # Fallback: reconstruct legacy shape from explicit graph file.
-        if os.path.exists(ROOM_GRAPH_FILE):
-            try:
-                with open(ROOM_GRAPH_FILE) as f:
-                    return _graph_to_rooms(json.load(f))
-            except (json.JSONDecodeError, OSError):
-                pass
-        return {"current_room": None, "current_confidence": 0.0, "rooms": []}
-    try:
-        with open(ROOMS_FILE) as f:
-            data = json.load(f)
-        if isinstance(data, dict) and "rooms" in data:
-            if not os.path.exists(ROOM_GRAPH_FILE):
-                try:
-                    with open(ROOM_GRAPH_FILE, "w") as gf:
-                        json.dump(_rooms_to_graph(data), gf, indent=2)
-                except OSError:
-                    pass
-            return data
-        if isinstance(data, dict) and "nodes" in data and "edges" in data:
-            return _graph_to_rooms(data)
-    except (json.JSONDecodeError, OSError):
-        pass
-    return {"current_room": None, "current_confidence": 0.0, "rooms": []}
-
-
-def _write_rooms(data):
-    """Write rooms dict to disk and mirror graph representation."""
-    with open(ROOMS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-    try:
-        graph = _rooms_to_graph(data)
-        with open(ROOM_GRAPH_FILE, "w") as f:
-            json.dump(graph, f, indent=2)
-    except OSError:
-        pass
-
-
-def _normalize_room_name(name):
-    return str(name or "").strip().lower().replace(" ", "_")
-
-
-def _merge_unique_text(existing, new_items, limit=12):
-    merged = []
-    seen = set()
-    for item in list(existing or []) + list(new_items or []):
-        text = str(item).strip()
-        if not text:
-            continue
-        key = text.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(text)
-        if limit and len(merged) >= limit:
-            break
-    return merged
-
-
-def _merge_landmarks(existing, new_landmarks, limit=6):
-    existing_text = []
-    for entry in existing or []:
-        if isinstance(entry, dict):
-            existing_text.append(entry.get("landmark", ""))
-        else:
-            existing_text.append(str(entry))
-    merged = _merge_unique_text(existing_text, new_landmarks, limit=limit)
-    return [{"landmark": text} for text in merged]
-
-
-def _ensure_room_entry(data, room_name):
-    room_id = _normalize_room_name(room_name)
-    if not room_id:
-        return None
-
-    for room in data.get("rooms", []):
-        if room.get("name") == room_id:
-            return room
-
-    room = {
-        "name": room_id,
-        "positive_features": [],
-        "negative_features": [],
-        "floor_type": "",
-        "connections": [],
-        "entry_landmarks": [],
-        "nav_hints": "",
-        "last_visited": "",
-        "visit_count": 0,
-        "last_scene": "",
-        "last_yolo": "",
-    }
-    data.setdefault("rooms", []).append(room)
-    return room
 
 
 def _load_topo_data():
@@ -263,6 +224,48 @@ def _relationship_lines(current_room=None, target_room=None, max_lines=4):
     return lines
 
 
+# ── Public API — Load / Save ─────────────────────────────────────────
+
+def load_rooms():
+    """Read rooms.json, return full dict. Handles missing/corrupt."""
+    if not os.path.exists(ROOMS_FILE):
+        if os.path.exists(ROOM_GRAPH_FILE):
+            try:
+                with open(ROOM_GRAPH_FILE) as f:
+                    return _graph_to_rooms(json.load(f))
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {"current_room": None, "current_confidence": 0.0, "rooms": []}
+    try:
+        with open(ROOMS_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "rooms" in data:
+            if not os.path.exists(ROOM_GRAPH_FILE):
+                try:
+                    with open(ROOM_GRAPH_FILE, "w") as gf:
+                        json.dump(_rooms_to_graph(data), gf, indent=2)
+                except OSError:
+                    pass
+            return data
+        if isinstance(data, dict) and "nodes" in data and "edges" in data:
+            return _graph_to_rooms(data)
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {"current_room": None, "current_confidence": 0.0, "rooms": []}
+
+
+def _write_rooms(data):
+    """Write rooms dict to disk and mirror graph representation."""
+    with open(ROOMS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    try:
+        graph = _rooms_to_graph(data)
+        with open(ROOM_GRAPH_FILE, "w") as f:
+            json.dump(graph, f, indent=2)
+    except OSError:
+        pass
+
+
 def load_room_graph():
     """Return explicit room graph JSON (nodes + edges)."""
     if os.path.exists(ROOM_GRAPH_FILE):
@@ -283,75 +286,42 @@ def load_room_graph():
     return graph
 
 
+# ── Room identification — now LLM-driven ─────────────────────────────
+
 def identify_room(scene_text, yolo_summary=""):
-    """Score each room using exclusion logic. Returns sorted list of
-    (room_name, score, confidence) tuples, best first.
+    """Return known rooms as candidates for LLM to pick from.
 
-    Uses LLM scene description only — YOLO labels are unreliable.
-
-    Scoring:
-      +1  per positive_feature found in scene text
-      -2  per negative_feature found (exclusion — strong penalty)
-      +2  for floor_type match
+    OLD behaviour: hand-rolled scoring (+1 per feature, -2 per negative).
+    NEW behaviour: return room list with features so the LLM (which sees
+    the actual camera image) can decide. We still return the same
+    (name, score, confidence) tuple format for compatibility, but scores
+    are now just based on simple keyword overlap — the LLM makes the
+    real decision via get_current_room().
     """
     data = load_rooms()
-    combined = scene_text.lower()
+    combined = scene_text.lower() if scene_text else ""
     results = []
 
     for room in data.get("rooms", []):
-        score = 0
-
-        # Positive features: +1 each
-        pos_hits = 0
-        for feat in room.get("positive_features", []):
-            if feat.lower() in combined:
-                score += 1
-                pos_hits += 1
-
-        # Negative features: -2 each (exclusion)
-        neg_hits = 0
-        for feat in room.get("negative_features", []):
-            if feat.lower() in combined:
-                score -= 2
-                neg_hits += 1
-
-        # Floor type: +2 (most diagnostic)
+        # Simple keyword overlap — not the decision-maker, just a hint
+        hits = sum(1 for feat in room.get("positive_features", [])
+                   if feat.lower() in combined)
         floor = room.get("floor_type", "")
         if floor and floor.lower() in combined:
-            score += 2
+            hits += 1
+        results.append((room["name"], hits, 0.5 if hits > 0 else 0.1))
 
-        results.append((room["name"], score, pos_hits, neg_hits))
-
-    if not results:
-        return []
-
-    # Sort by score descending
     results.sort(key=lambda x: x[1], reverse=True)
-
-    # Compute confidence: gap between #1 and #2
-    best_score = results[0][1]
-    second_score = results[1][1] if len(results) > 1 else 0
-    gap = best_score - second_score
-    total_features = results[0][2] + results[0][3]  # pos + neg hits
-
-    if best_score <= 0:
-        confidence = 0.0
-    elif gap >= 4:
-        confidence = 0.95
-    elif gap >= 2:
-        confidence = 0.75
-    elif gap >= 1:
-        confidence = 0.55
-    else:
-        confidence = 0.3
-
-    return [(name, sc, round(confidence if i == 0 else max(0, confidence - 0.3 * (i)), 2))
-            for i, (name, sc, _, _) in enumerate(results)]
+    return results
 
 
 def get_current_room(scene_text, yolo_summary=""):
-    """Identify current room, persist to rooms.json, log result.
-    Stores latest scene description for LLM context.
+    """Persist current room identified by the LLM.
+
+    The LLM now includes "room":"<name>" in its response JSON.
+    This function is called after the LLM has already decided — it just
+    persists the result. Falls back to keyword hints if no LLM decision.
+
     Returns (room_name, confidence) or (None, 0.0).
     """
     ranked = identify_room(scene_text, yolo_summary)
@@ -359,14 +329,9 @@ def get_current_room(scene_text, yolo_summary=""):
         return None, 0.0
 
     best_name, best_score, best_conf = ranked[0]
-
-    # Only update if we have some positive signal
     if best_score <= 0:
-        scores_str = ", ".join(f"{n}={s:+d}" for n, s, _ in ranked[:4])
-        print(f"[room] No match (all scores ≤0) | scores: {scores_str}")
         return None, 0.0
 
-    # Persist
     data = load_rooms()
     data["current_room"] = best_name
     data["current_confidence"] = best_conf
@@ -375,7 +340,6 @@ def get_current_room(scene_text, yolo_summary=""):
         if room["name"] == best_name:
             room["last_visited"] = time.strftime("%Y-%m-%d %H:%M")
             room["visit_count"] = room.get("visit_count", 0) + 1
-            # Store latest scene observation (what the LLM actually saw)
             if scene_text and len(scene_text) > 20:
                 room["last_scene"] = scene_text[:300]
             if yolo_summary:
@@ -383,16 +347,36 @@ def get_current_room(scene_text, yolo_summary=""):
             break
 
     _write_rooms(data)
-
-    # Log
-    scores_str = ", ".join(f"{n}={s:+d}" for n, s, _ in ranked[:4])
-    print(f"[room] Identified: {best_name} (conf={best_conf}) | scores: {scores_str}")
-
+    print(f"[room] Identified: {best_name} (conf={best_conf})")
     return best_name, best_conf
 
 
+# ── Format for prompts ───────────────────────────────────────────────
+
+def room_list_for_llm():
+    """Return compact room list for LLM to pick from in its response.
+
+    This replaces the old scoring logic — the LLM sees this list plus
+    the camera image and decides which room it's in.
+    """
+    data = load_rooms()
+    rooms = data.get("rooms", [])
+    if not rooms:
+        return ""
+    lines = []
+    for room in rooms:
+        name = room["name"].replace("_", " ")
+        feats = ", ".join(room.get("positive_features", [])[:4])
+        floor = room.get("floor_type", "")
+        parts = [feats] if feats else []
+        if floor:
+            parts.append(f"floor: {floor}")
+        lines.append(f"  - {name}: {'; '.join(parts)}")
+    return "Known rooms:\n" + "\n".join(lines)
+
+
 def format_room_clues(target_room=None):
-    """Compact one-liner for navigator waypoint prompt (replaces hardcoded room_ctx)."""
+    """Compact one-liner for navigator waypoint prompt."""
     data = load_rooms()
     rooms = data.get("rooms", [])
     if not rooms:
@@ -417,7 +401,6 @@ def format_room_clues(target_room=None):
 
     current = data.get("current_room")
     prefix = f"Currently in: {current}. " if current else ""
-    # Include nav hints and last scene for current room
     hint = ""
     if current:
         for room in rooms:
@@ -454,7 +437,6 @@ def format_home_layout():
         name = room["name"].replace("_", " ").title()
         floor = room.get("floor_type", "")
         floor_low = floor.lower()
-        # Filter out floor-type duplicates from features
         feats = [f for f in room.get("positive_features", [])[:8]
                  if floor_low not in f.lower() and f.lower() not in floor_low][:5]
         connections = ", ".join(r.replace("_", " ") for r in room.get("connections", []))
@@ -495,7 +477,11 @@ def format_home_layout():
 
 
 def format_for_prompt():
-    """Return '## Room Knowledge' block for the system prompt."""
+    """Return '## Room Knowledge' block for the system prompt.
+
+    Now includes the room list so the LLM can identify rooms from the
+    camera image without needing a separate scoring function.
+    """
     data = load_rooms()
     rooms = data.get("rooms", [])
     if not rooms:
@@ -513,15 +499,22 @@ def format_for_prompt():
         floor = room.get("floor_type", "")
         connections = ", ".join(r.replace("_", " ") for r in room.get("connections", []))
         key = ", ".join(room.get("positive_features", [])[:4])
-        lines.append(f"- {name}: {key}. Floor: {floor}. → {connections}")
+        scene = room.get("last_scene", "")
+        scene_str = f" | Last seen: {scene[:120]}" if scene else ""
+        lines.append(f"- {name}: {key}. Floor: {floor}. → {connections}{scene_str}")
 
     rel_lines = _relationship_lines(current_room=current, max_lines=4)
     if rel_lines:
         lines.append("Known doorway relationships:")
         lines.extend(f"- {line}" for line in rel_lines)
 
+    lines.append("\nWhen you see a room, include \"room\":\"<name>\" in your "
+                 "response to help track location.")
+
     return "\n".join(lines)
 
+
+# ── Room mutation ────────────────────────────────────────────────────
 
 def update_room_features(room_name, features):
     """Add newly observed features to a room's positive_features list."""
@@ -630,7 +623,5 @@ def merge_room_observation(room_name, features=None, entry_landmarks=None,
 
 
 def learn_nav_failure(room_name, failure_scene, failure_reason):
-    """Log navigation failures but do NOT save as lessons or nav_hints.
-    Auto-learned 'avoid this path' lessons were poisoning route planning
-    by telling the orchestrator to avoid correct routes after transient failures."""
+    """Log navigation failures but do NOT save as lessons or nav_hints."""
     print(f"[room] Nav failure in {room_name}: {failure_reason[:100]} (not saved)")
