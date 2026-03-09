@@ -180,36 +180,6 @@ DASHBOARD_HTML = """<!doctype html>
         </section>
 
         <section class="panel">
-          <h2>Quick Actions</h2>
-          <div class="form-grid" style="margin-bottom:10px">
-            <input id="commandInput" placeholder="Type a free-form rover command">
-            <button class="accent" onclick="sendCommand()">Send</button>
-          </div>
-          <div class="split" style="margin-bottom:12px">
-            <div>
-              <div class="subtext" style="margin-bottom:8px">Navigation</div>
-              <div class="form-grid">
-                <input id="navTarget" placeholder="e.g. go to kitchen">
-                <button class="teal" onclick="startNavigation()">Navigate</button>
-              </div>
-            </div>
-            <div>
-              <div class="subtext" style="margin-bottom:8px">Follow</div>
-              <div class="form-grid">
-                <input id="followTarget" value="person" placeholder="person">
-                <button class="accent" onclick="startFollow()">Follow</button>
-              </div>
-            </div>
-          </div>
-          <div class="room-grid" id="roomButtons"></div>
-          <div class="danger-strip">
-            <button class="soft" onclick="post('/api/stop',{})">Stop Active Task</button>
-            <button id="killBtn" class="danger" onclick="toggleKill()">Engage Kill</button>
-            <button class="accent" onclick="restartService()" id="restartBtn">Restart Service</button>
-          </div>
-        </section>
-
-        <section class="panel">
           <h2>Teleop</h2>
           <div class="controls-grid">
             <button class="soft" onclick="teleop('forward')">Forward</button>
@@ -242,19 +212,62 @@ DASHBOARD_HTML = """<!doctype html>
                 <button class="soft" onclick="setCommand('say hello')">Say Hello</button>
                 <button class="soft" onclick="setCommand('center camera')">Center Camera</button>
               </div>
-              <div class="subtext" style="margin-top:12px;margin-bottom:8px">Calibration</div>
-              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
-                <label style="font-size:12px">Gimbal Pan <input id="calPan" type="number" step="0.5" style="width:100%;padding:8px;border-radius:10px"></label>
-                <label style="font-size:12px">Gimbal Tilt <input id="calTilt" type="number" step="0.5" style="width:100%;padding:8px;border-radius:10px"></label>
-                <label style="font-size:12px">Turn °/s <input id="calTurnRate" type="number" step="5" style="width:100%;padding:8px;border-radius:10px"></label>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Spatial Map</h2>
+          <div style="display:flex;justify-content:center">
+            <canvas id="radar" width="320" height="320" style="border:1px solid var(--line);border-radius:50%;background:#faf7f2"></canvas>
+          </div>
+          <div class="subtext" style="text-align:center;margin-top:6px" id="radarInfo">no data</div>
+        </section>
+
+        <section class="panel">
+          <h2>Quick Actions</h2>
+          <div class="form-grid" style="margin-bottom:10px">
+            <input id="commandInput" placeholder="Type a free-form rover command">
+            <button class="accent" onclick="sendCommand()">Send</button>
+          </div>
+          <div class="split" style="margin-bottom:12px">
+            <div>
+              <div class="subtext" style="margin-bottom:8px">Navigation</div>
+              <div class="form-grid">
+                <input id="navTarget" placeholder="e.g. go to kitchen">
+                <button class="teal" onclick="startNavigation()">Navigate</button>
               </div>
-              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:6px">
-                <button class="soft" onclick="calTest()">Test</button>
-                <button class="accent" onclick="calSave()">Save</button>
-                <button class="soft" onclick="calTestTurn()">Test 90°</button>
+            </div>
+            <div>
+              <div class="subtext" style="margin-bottom:8px">Follow</div>
+              <div class="form-grid">
+                <input id="followTarget" value="person" placeholder="person">
+                <button class="accent" onclick="startFollow()">Follow</button>
               </div>
             </div>
           </div>
+          <div class="room-grid" id="roomButtons"></div>
+          <div class="danger-strip">
+            <button class="soft" onclick="post('/api/stop',{})">Stop Active Task</button>
+            <button id="killBtn" class="danger" onclick="toggleKill()">Engage Kill</button>
+            <button class="accent" onclick="restartService()" id="restartBtn">Restart Service</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <details>
+            <summary style="cursor:pointer;font-size:15px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:700">Calibration</summary>
+            <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+              <label style="font-size:12px">Gimbal Pan <input id="calPan" type="number" step="0.5" style="width:100%;padding:8px;border-radius:10px"></label>
+              <label style="font-size:12px">Gimbal Tilt <input id="calTilt" type="number" step="0.5" style="width:100%;padding:8px;border-radius:10px"></label>
+              <label style="font-size:12px">Turn °/s <input id="calTurnRate" type="number" step="5" style="width:100%;padding:8px;border-radius:10px"></label>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:6px">
+              <button class="soft" onclick="calTest()">Test</button>
+              <button class="accent" onclick="calSave()">Save</button>
+              <button class="soft" onclick="calTestTurn()">Test 90°</button>
+            </div>
+          </details>
         </section>
       </div>
 
@@ -545,6 +558,7 @@ DASHBOARD_HTML = """<!doctype html>
     const es=new EventSource('/api/events');
     es.onmessage=(event)=>{
       const data=JSON.parse(event.data);
+      if(data.cat==='serial')return;
       const line=document.createElement('div');
       line.className='log-line';
       const stamp=new Date(data.ts*1000).toLocaleTimeString();
@@ -596,6 +610,69 @@ DASHBOARD_HTML = """<!doctype html>
     }
     refreshLLMLog();
     setInterval(()=>{if(document.getElementById('llmAutoRefresh').checked)refreshLLMLog();},2000);
+
+    // Radar / Spatial Map
+    const RADAR_COLORS={door:'#1f5d58',wall:'#6c7368',furniture:'#a4552d',open:'#2d8a4e',obstacle:'#9a1f1f',object:'#555',living:'#8b5cf6'};
+    const RADAR_SCALE=1.2; // meters per half-radius
+    async function drawRadar(){
+      try{
+        const res=await fetch('/api/spatial_map');
+        const data=await res.json();
+        const c=document.getElementById('radar');
+        const ctx=c.getContext('2d');
+        const cx=c.width/2,cy=c.height/2,r=c.width/2-20;
+        ctx.clearRect(0,0,c.width,c.height);
+        // Grid circles
+        ctx.strokeStyle='#d7d0c3';ctx.lineWidth=0.5;
+        for(let i=1;i<=3;i++){
+          ctx.beginPath();ctx.arc(cx,cy,r*i/3,0,Math.PI*2);ctx.stroke();
+        }
+        // Cross hairs
+        ctx.beginPath();ctx.moveTo(cx,cy-r);ctx.lineTo(cx,cy+r);ctx.moveTo(cx-r,cy);ctx.lineTo(cx+r,cy);ctx.stroke();
+        // Labels
+        ctx.fillStyle='#6c7368';ctx.font='10px sans-serif';ctx.textAlign='center';
+        ctx.fillText('0°',cx,cy-r-4);ctx.fillText('180°',cx,cy+r+12);
+        ctx.textAlign='left';ctx.fillText('90°',cx+r+3,cy+4);
+        ctx.textAlign='right';ctx.fillText('-90°',cx-r-3,cy+4);
+        // Scale labels
+        ctx.fillStyle='#999';ctx.font='9px sans-serif';ctx.textAlign='left';
+        for(let i=1;i<=3;i++){
+          ctx.fillText((RADAR_SCALE*i/3).toFixed(1)+'m',cx+3,cy-r*i/3+10);
+        }
+        // Rover triangle (center)
+        ctx.fillStyle='var(--accent)';
+        ctx.beginPath();ctx.moveTo(cx,cy-8);ctx.lineTo(cx-5,cy+5);ctx.lineTo(cx+5,cy+5);ctx.closePath();ctx.fill();
+        // Plot entries
+        const entries=data.entries||[];
+        entries.forEach(e=>{
+          const ang=((-e.bearing+90)*Math.PI/180); // Convert: 0°=up, +=right
+          const dist=Math.min(e.dist_m/RADAR_SCALE,1.0)*r;
+          const px=cx+dist*Math.cos(ang);
+          const py=cy-dist*Math.sin(ang);
+          const color=RADAR_COLORS[e.type]||'#555';
+          const sz=e.type==='door'?6:e.type==='obstacle'?5:4;
+          ctx.fillStyle=color;
+          if(e.type==='door'){
+            // Diamond for doors
+            ctx.beginPath();ctx.moveTo(px,py-sz);ctx.lineTo(px+sz,py);ctx.lineTo(px,py+sz);ctx.lineTo(px-sz,py);ctx.closePath();ctx.fill();
+          }else if(e.type==='obstacle'){
+            // X for obstacles
+            ctx.strokeStyle=color;ctx.lineWidth=2;
+            ctx.beginPath();ctx.moveTo(px-sz,py-sz);ctx.lineTo(px+sz,py+sz);ctx.moveTo(px+sz,py-sz);ctx.lineTo(px-sz,py+sz);ctx.stroke();
+          }else{
+            // Circle for everything else
+            ctx.beginPath();ctx.arc(px,py,sz,0,Math.PI*2);ctx.fill();
+          }
+          // Label
+          ctx.fillStyle=color;ctx.font='9px sans-serif';ctx.textAlign='center';
+          const lbl=e.label.length>16?e.label.slice(0,15)+'…':e.label;
+          ctx.fillText(lbl,px,py-sz-3);
+        });
+        document.getElementById('radarInfo').textContent=entries.length+' entries | heading '+data.heading+'°';
+      }catch(e){}
+    }
+    drawRadar();
+    setInterval(drawRadar,1500);
 
     refreshStatus();
     refreshTelemetry();
@@ -667,6 +744,14 @@ class RoverWebServer:
                             time.sleep(0.12)
                     except (BrokenPipeError, ConnectionResetError):
                         return
+                if self.path == "/api/spatial_map":
+                    try:
+                        arr = brain.navigator.spatial_map.to_array()
+                        heading = brain.navigator.spatial_map._heading_deg
+                        self._send_json({"entries": arr, "heading": round(heading)})
+                    except Exception:
+                        self._send_json({"entries": [], "heading": 0})
+                    return
                 if self.path == "/api/llm_log" or self.path.startswith("/api/llm_log?"):
                     since_id = 0
                     if "?" in self.path:

@@ -1,19 +1,15 @@
 AVAILABLE TOOLS (use one or more per step, executed in order):
 
 MOVEMENT:
-  drive(distance, angle, speed) — move forward while steering.
-    distance: 0.15-1.0m. angle: -60..+60°. speed: 0.05-0.25 m/s (default 0.15).
-    Small angle (±5-15°): gentle curve, minor correction.
-    Medium (±20-35°): moderate turn while moving, good for aiming at something off-center.
-    Large (±40-60°): sharp arc — one wheel nearly stops. Use for tight corners or sharp doorway entries.
+  drive(distance, speed) — move STRAIGHT forward. Always drives at angle=0.
+    distance: 0.15-2.0m. speed: 0.12-0.30 m/s (default 0.15).
+    Use "safe_drive_m" from depth to set distance — it already has 0.2m safety margin.
+    If you pass an angle, the system auto-converts it to turn_body first, then drives straight.
     Speed guidelines:
-      0.05-0.08: creep — for tight spaces, near obstacles, precision alignment.
-      0.10-0.15: normal — default navigation speed. Safe for most indoor situations.
-      0.18-0.25: fast — open corridors only, when path is clearly free for >1m.
-    Use SLOW speed (0.08) when: approaching doorways, near furniture, after a blocked drive, tight corners.
-    Use FAST speed (0.20) when: long clear corridor, open room with no obstacles ahead, momentum needed for threshold.
-    TIP: drive(angle) curves while moving — good for gentle corrections in open space.
-    But in tight spaces, near furniture, or when you need to change direction sharply, turn_body FIRST then drive straight is safer and more precise.
+      0.15: normal — default speed for all navigation.
+      0.20-0.25: fast — open corridors, long clear paths, momentum for thresholds.
+    DEFAULT TO 0.15. Do not slow down unnecessarily — slow driving wastes steps.
+    To change direction: ALWAYS use turn_body FIRST, then drive straight.
   reverse(distance, speed) — back up. distance: 0.10-0.25m. speed: 0.05-0.20 m/s (default 0.12).
     Use slow (0.06-0.08) when near obstacles behind you. Use normal (0.12) otherwise.
   turn_body(angle) — spin ENTIRE BODY (all 6 wheels) in place, -120..+120°.
@@ -55,12 +51,20 @@ VISION CORRECTION:
     Only correct labels you are CONFIDENT about. Don't guess. This change is permanent.
     You can chain this with other tools — it doesn't cost a step.
 
-MEMORY (persists across steps, use to build mental map):
+SPATIAL MAP (automatic, always visible — YOUR MEMORY OF THE ROOM):
+  The SPATIAL MAP section above shows everything you've observed, with bearing angles.
+  Bearings update automatically when you turn — if a door was at +90° and you turn_body(+90°), it's now at 0°.
+  Distances update when you drive. Entries expire after 14 steps.
+  USE THIS MAP to navigate! It tells you where doors, walls, and obstacles are even when not in your camera view.
+  When you scan with gimbal, the map fills in. When you turn/drive, bearings shift.
+  read_map() — returns the full spatial map array with all current entries and measurements.
+    Use this after scanning to see a complete picture of your surroundings.
+
+MEMORY (persists across steps):
   note(key, value) — save any info. key=string, value=string/number/object
-    Examples: note('left_wall','bookshelf at pan=-90'), note('plan','find office door then hallway')
-    note('surroundings', {'-90':'wall+shelf', '0':'desk ahead', '+90':'bright opening'})
-    IMPORTANT: Use notes to remember what you saw when scanning. You will NOT remember past images.
-  read_notes() — returns all your saved notes. Use to recall what you've seen.
+    Examples: note('plan','find office door then hallway'), note('failed_right','obstacle at +30°')
+    IMPORTANT: Use notes for PLANS and FAILURES. The spatial map handles object positions automatically.
+  read_notes() — returns all your saved notes.
 
 HELP:
   ask_user(question) — speak a question out loud and wait for the user's voice response (~15s timeout).
@@ -189,14 +193,16 @@ P2 — FIND THE EXIT FIRST:
   If you don't see a door after scanning, you may be facing the wrong wall. Turn 90° and scan again.
   Only after you've checked all 4 directions and found no door should you start exploring.
 
-P2.5 — TARGET VISIBLE? FACE IT, THEN FIND A PATH:
-  - If you SAW the target during a gimbal scan:
-    1. turn_body(X) to face where you saw it (X = the gimbal pan angle).
+P2.5 — TARGET VISIBLE? FACE IT FIRST, THEN DRIVE STRAIGHT:
+  - If you SAW the target during a gimbal scan at pan=X°:
+    1. turn_body(X) — rotate your WHOLE BODY to face it. DO NOT skip this and drive(angle) instead.
     2. gimbal(0,0) + wait(0.3) — re-center camera, let image settle.
-    3. CONFIRM: is the target still visible? Is the path to it CLEAR?
+    3. CONFIRM: is the target still visible and centered? Is the path CLEAR?
+    drive(angle>20°) near obstacles is DANGEROUS — you curve into furniture.
+    turn_body FIRST, then drive STRAIGHT (angle=0 or ±5°) is ALWAYS safer.
 
   - PATH CLEAR (open floor between you and target, depth shows no obstacle):
-    → Drive toward it. Use short drives (0.3-0.5m) near obstacles, longer (0.8m) in open space.
+    → Drive toward it using safe_drive_m distance. Use longer drives (1.0-2.0m) when clearance allows.
 
   - PATH BLOCKED (furniture, bags, objects between you and target):
     → Do NOT drive into the obstacle. You can see the target but you CANNOT reach it directly.
@@ -269,22 +275,19 @@ P7 — DOORWAY NAVIGATION (CRITICAL — READ CAREFULLY):
   Recognizing doorways: bright opening in a wall, floor transition (wood to tile), door frame edges,
   change in wall color/texture, threshold strip on floor, light spilling from adjacent room.
 
-  *** YOU MUST NOT DRIVE STRAIGHT INTO A DOORWAY FROM FAR AWAY. ***
-  *** APPROACH IN SHORT STEPS. ALIGN FIRST. THEN PASS THROUGH. ***
+  CRITICAL — AIM FOR THE OPENING, NOT THE FRAME:
+  The door FRAME is the solid wood/metal edge. The OPENING is the gap with light and floor visible beyond.
+  You must drive through the OPENING. If you aim at the frame, you will crash into it.
+  When you set target_visible=true for a doorway, make sure the OPENING (gap with light beyond)
+  is what you're looking at, not just a frame edge. The center of the bright opening = your aim point.
 
-  Your body is 26cm wide. Doorways are 70-90cm. You have ~25cm margin per side — but ONLY if perfectly centered.
+  Your body is 26cm wide. Doorways are 70-90cm. You have ~25cm margin per side — but ONLY if centered on the OPENING.
 
-  MANDATORY doorway approach sequence:
-    STEP 1 — STOP at ~0.5m from the doorway. Do NOT drive through yet.
-      Look at the door frame: is it centered in your image? Are the left and right frame edges equidistant?
-    STEP 2 — ALIGN. If the doorway is off to one side of the frame:
-      - Doorway on the left → drive(0.2, -20) to curve toward it, or turn_body(-15) then re-check.
-      - Doorway on the right → drive(0.2, +20) to curve toward it, or turn_body(+15) then re-check.
-      - Doorway centered but at an angle (one frame edge closer) → turn_body to face it squarely.
-      You are aligned when: the opening is centered (cx ≈ 0.5) AND both frame edges look equidistant.
-    STEP 3 — PASS THROUGH with a short, slow, straight drive: drive(0.5, 0, 0.08). Angle MUST be 0 or ±5° max. Speed MUST be slow (0.08).
-      NEVER drive through a doorway with angle > ±10° — you WILL clip the frame.
-    STEP 4 — After passing through, set_room() immediately.
+  Doorway approach:
+    1. Aim for the CENTER of the bright opening (not the frame edge).
+    2. The opening should be centered in your image (cx ≈ 0.5) with frame edges visible on both sides.
+    3. If the opening is off-center, turn_body a few degrees to center it, then drive straight.
+    4. Drive through at angle=0. After passing through, set_room() immediately.
 
   If you are MORE than 1m from the doorway, drive toward it in 0.3-0.4m steps, re-checking alignment each step.
   If you are LESS than 0.3m and not centered, REVERSE 0.15m and re-align. Do NOT try to squeeze through off-center.
@@ -314,6 +317,7 @@ Heuristic estimate: %heuristic%
 Depth clearance: %depth_text%
 YOLO detections (verify these match what you see — use correct_label if wrong):
 %yolo_text%
+%spatial_map%
 HOUSE MAP:
 %house_map%
 Recent observations:

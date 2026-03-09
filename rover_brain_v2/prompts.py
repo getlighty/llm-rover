@@ -48,6 +48,10 @@ def _depth_summary_text(depth_context: dict) -> str:
             min_col = distances.index(min(distances))
             side = "left" if min_col < n // 3 else "right" if min_col >= 2 * n // 3 else "center"
             parts.append(f"WARNING: obstacle at {min_d:.2f}m on {side}")
+    ahead_m = depth_context.get("ahead_clearance_m")
+    safe_m = depth_context.get("safe_drive_m")
+    if ahead_m is not None:
+        parts.append(f"Straight ahead clearance: {ahead_m:.2f}m → safe drive up to {safe_m:.2f}m")
     # 8x8 depth grid — always include if available
     grid = depth_context.get("depth_grid_8x8")
     if grid:
@@ -136,7 +140,8 @@ def navigation_prompt(*, target: str, plan_context: str, leg_hint: str,
                       yolo_detections: list[dict] | None = None,
                       topo_data: dict | None = None,
                       current_room: str | None = None,
-                      target_room: str | None = None) -> str:
+                      target_room: str | None = None,
+                      spatial_map_text: str = "") -> str:
     memory = "\n".join(f"- {line}" for line in recent_observations[-4:])
     yolo_text = "none"
     if yolo_detections:
@@ -157,6 +162,7 @@ def navigation_prompt(*, target: str, plan_context: str, leg_hint: str,
         yolo_text=yolo_text,
         house_map=_house_map_text(topo_data, current_room=current_room,
                                   target_room=target_room),
+        spatial_map=spatial_map_text or "empty — scan with gimbal to build map",
         memory=memory or "- none",
     )
 

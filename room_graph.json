@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "current_room": "hallway",
+  "current_room": "kitchen",
   "current_confidence": 0.95,
   "nodes": [
     {
@@ -90,7 +90,9 @@
         "potted plant fixture",
         "bright overhead lighting",
         "potted plant",
-        "wooden door frames"
+        "wooden door frames",
+        "bright ambient lighting",
+        "long corridor layout"
       ],
       "negative_features": [
         "desk",
@@ -127,9 +129,9 @@
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-08 23:27",
-      "visit_count": 54,
-      "last_scene": "Crossed threshold into hallway. Stone tiles under wheels, wooden door frame on sides, potted plant ahead-right, metal shelving unit in background. Bright light from hallway passage.",
+      "last_visited": "2026-03-09 12:37",
+      "visit_count": 56,
+      "last_scene": "Crossed threshold onto stone tiles, wooden door frame on left, bright hallway ahead with potted plant visible.",
       "last_yolo": "door(95%), door(90%), doorway(90%), table(80%), basket(70%), chair(70%), plant pot(60%)"
     },
     {
@@ -155,7 +157,9 @@
         "orange archway on left wall (entry point)",
         "small potted plant near entry",
         "countertops",
-        "archway entrance"
+        "archway entrance",
+        "major appliances",
+        "cabinetry"
       ],
       "negative_features": [
         "desk",
@@ -192,9 +196,9 @@
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-08 09:58",
-      "visit_count": 59,
-      "last_scene": "Inside kitchen, tiled floor, counter and appliances visible",
+      "last_visited": "2026-03-09 18:02",
+      "visit_count": 61,
+      "last_scene": "Inside kitchen, tiled floor visible, appliances nearby",
       "last_yolo": "legs(32%)"
     },
     {

@@ -685,3 +685,332 @@
 - 2026-03-09 11:56 Under office chair, reversing to clear obstacle
 - 2026-03-09 11:57 Under office chair, reversing to escape
 - 2026-03-09 11:57 Under office chair, spinning to find clear path
+- 2026-03-09 12:11 Located in dining room
+- 2026-03-09 12:18 User asked about someone who left the room.
+- 2026-03-09 12:18 User performed a leap; camera view shows legs on chair.
+- 2026-03-09 12:22 Positioned under office chair, path forward clear
+- 2026-03-09 12:22 Scanned surroundings from under chair
+- 2026-03-09 12:22 Room clear, no obstacles detected
+- 2026-03-09 12:22 Ovi is present in the room
+- 2026-03-09 12:23 Ovi thanked me - positive interaction
+- 2026-03-09 12:25 Ovi reacted with surprise - check for cause
+- 2026-03-09 12:26 User requested silence - minimize all activity
+- 2026-03-09 12:28 Pet food bowls found near basket
+- 2026-03-09 12:36 Dog in room - friendly encounter
+- 2026-03-09 12:44 Blue backpack blocking path ahead
+- 2026-03-09 12:51 User expressed uncertainty; room appears cluttered with chair and bed visible.
+- 2026-03-09 12:51 User is sitting in a chair; room has wooden floor, bed, and scattered items.
+- 2026-03-09 12:51 Scene unchanged; still cluttered with chair, bed, and scattered items. No new open space detected.
+- 2026-03-09 12:52 Room has open floor space, chair on right, shelves and bags ahead. Door visible to the left.
+- 2026-03-09 12:52 User confirmed observation; dog resting in basket, bread bag nearby, shelves and curtains visible.
+- 2026-03-09 12:52 Dog resting in basket, bread bag nearby, shelves and curtains visible.
+- 2026-03-09 12:52 Scene unchanged; dog in basket, bread bag nearby, open floor ahead.
+- 2026-03-09 12:53 Dog in basket, food bowls, pink toy, bed and shelves visible. No new objects detected.
+- 2026-03-09 12:53 Dog in basket, food bowls, pink toy, bed and shelves visible. No new objects detected.
+- 2026-03-09 12:53 Dog resting in basket, food bowls and pink toy nearby, open floor space confirmed.
+- 2026-03-09 12:53 Dog in basket, food bowls and pink toy nearby, open floor space confirmed.
+- 2026-03-09 12:53 Rover is under office chair, wooden floor visible, no obstacles nearby.
+- 2026-03-09 12:53 Reversing from under chair to get better view of room.
+- 2026-03-09 12:54 Still under chair, need to reverse further to clear the chair base.
+- 2026-03-09 12:54 Reversing further to get out from under the office chair completely.
+- 2026-03-09 12:54 Successfully reversed out from under the office chair, now in open space with clear view of room.
+- 2026-03-09 12:54 Encouraging Ovi with a nod and lights after successfully clearing the chair.
+- 2026-03-09 12:54 Ovi expressed surprise, initiating a scan to assess the surroundings after clearing the chair.
+- 2026-03-09 12:54 Detected office chair legs and blue bin; turning right to find a clearer path through the clutter.
+- 2026-03-09 12:54 Turn completed; now advancing to navigate past the blue bin and chair legs.
+- 2026-03-09 12:55 Chair base is close; turning right to find a clear path around the obstacle.
+- 2026-03-09 12:55 Turn successful; clear path visible ahead toward the blue bin and open floor space.
+- 2026-03-09 12:55 Doorway now clearly visible ahead; continuing forward to reach it.
+- 2026-03-09 12:55 Doorway is the goal; advancing steadily to reach it.
+- 2026-03-09 12:55 Reached destination under the desk; cables and boxes visible nearby.
+- 2026-03-09 12:56 User seems unsure; tilting head to show attentiveness.
+- 2026-03-09 12:56 User surprised; confirmed object under desk.
+- 2026-03-09 12:58 User is playful; staying alert under desk near chair.
+- 2026-03-09 13:00 User thanked me; staying under desk near chair, monitoring surroundings.
+- 2026-03-09 13:03 User seems distressed; checking surroundings under desk for hazards or objects of interest.
+- 2026-03-09 13:03 No hazards found under desk; user may need reassurance or distraction.
+- 2026-03-09 13:05 Small dog spotted under desk; user seems playful and musical.
+- 2026-03-09 13:05 User said 'so' - awaiting further instruction while positioned under desk near chair.
+- 2026-03-09 13:07 User mentioned 'Ted Smithinson sandwich' and 'leaving together'; possibly preparing to depart or share a meal.
+- 2026-03-09 13:07 User said 'ruler' - possibly looking for a measuring tool on the floor under the desk.
+- 2026-03-09 13:08 Scanning floor under desk for ruler; corridor ahead is clear.
+- 2026-03-09 13:08 No ruler found ahead; scanning left under desk near cables and plastic bag.
+- 2026-03-09 13:08 No ruler found on left; scanning right under desk near chair leg and cables.
+- 2026-03-09 13:08 Scanning floor directly under desk; chair wheels and cables visible, still searching for ruler.
+- 2026-03-09 13:08 Near chair base; scanning left by plastic bag and cables for ruler.
+- 2026-03-09 13:08 Camera rotated; now facing printer and red box under desk. Checking this area for ruler.
+- 2026-03-09 13:10 Scanning near plastic bag and cables on left; ruler not yet found.
+- 2026-03-09 13:10 Checking area near printer and cables for ruler; red box visible on left.
+- 2026-03-09 13:10 Near printer and red box; scanning floor for ruler.
+- 2026-03-09 13:10 Blue object in foreground; checking near printer base and cables for ruler.
+- 2026-03-09 13:10 Blue object in foreground; scanning near printer base and cables for ruler.
+- 2026-03-09 13:10 Near printer and red box; checking floor for ruler.
+- 2026-03-09 13:10 Blue object in foreground; checking if it's the ruler or near it.
+- 2026-03-09 13:12 Blue object in foreground; checking if it's the ruler or near it.
+- 2026-03-09 13:13 Attempting to move forward; checking for obstacles or open space.
+- 2026-03-09 13:13 Under desk, moving left to explore space near chair and cables.
+- 2026-03-09 13:13 Under desk, moving left to explore space near chair and cables.
+- 2026-03-09 13:13 Under desk, blocked ahead; reversing to reassess path.
+- 2026-03-09 13:13 Cleared desk area; proceeding toward open doorway ahead.
+- 2026-03-09 13:13 Attempting to move forward toward doorway; checking for obstruction.
+- 2026-03-09 13:14 Navigating around office chair; doorway still visible ahead.
+- 2026-03-09 13:14 Under desk, blocked by chair leg; reversing to find alternate path.
+- 2026-03-09 13:14 Stuck under chair; turning right to find open path.
+- 2026-03-09 13:14 Escaped from under chair; doorway visible ahead, proceeding toward it.
+- 2026-03-09 13:14 Under desk, clear path to doorway; moving forward to exit.
+- 2026-03-09 13:14 Under desk, clear path visible; turning left toward open space near doorway.
+- 2026-03-09 13:14 Approached office chair; turning left to find clear path around it.
+- 2026-03-09 13:15 Under desk near printer and cables; backing up to avoid obstacles before turning.
+- 2026-03-09 13:15 Doorway visible on right; turning to exit under-desk area.
+- 2026-03-09 13:15 Under desk, clear path ahead toward doorway; proceeding cautiously.
+- 2026-03-09 13:15 Exited under-desk area; now in open corridor with chair ahead and couch to right.
+- 2026-03-09 13:16 In open corridor, approaching office chair; clear path ahead.
+- 2026-03-09 13:16 Approached chair base; backing up to reassess path around obstacle.
+- 2026-03-09 13:16 Backing up failed; turning right to find clear path around chair.
+- 2026-03-09 13:16 Turned right successfully; now facing open path beside chair, proceeding toward couch area.
+- 2026-03-09 13:16 Attempting to move forward again; checking if path is clear toward couch area.
+- 2026-03-09 13:16 Forward path blocked; turning left to find alternate route around desk and chair.
+- 2026-03-09 13:17 Turned left but still blocked by chair; backing up to reposition and find clearer path.
+- 2026-03-09 13:17 Backing up didn't clear path; spinning right to face open area near door.
+- 2026-03-09 13:17 Spun right and now facing open path between chair legs; proceeding toward door area.
+- 2026-03-09 13:17 Moved forward but still under desk; reversing to avoid cables and reposition for clearer exit path.
+- 2026-03-09 13:17 Successfully navigated out from under desk; now in open area near chair and door.
+- 2026-03-09 13:18 User requested silence; lights off, no movement.
+- 2026-03-09 13:18 User acknowledged; maintaining quiet stance under desk, camera slightly tilted up to monitor surroundings.
+- 2026-03-09 13:18 User is pondering; rover tilts head slightly, staying still under desk to avoid disturbance.
+- 2026-03-09 13:18 User paused; rover remains under desk, camera centered, awaiting next instruction.
+- 2026-03-09 13:18 User asked about capability; performed quick pan scan to demonstrate awareness, now awaiting feedback or next command.
+- 2026-03-09 13:19 Scanned room, now focusing left side near desk leg and chair base for obstacles or points of interest.
+- 2026-03-09 13:19 Scan complete; no obstacles detected in immediate path, rover ready for next command.
+- 2026-03-09 13:19 User showed image of office chair; rover acknowledged by looking up slightly then returning to center, confirming visual recognition of nearby furniture.
+- 2026-03-09 13:19 User expressed concern about shooting; rover performed head shake to indicate 'no' and reassured verbally, confirming no weapon or discharge detected in environment.
+- 2026-03-09 13:19 User showed selfie view from under desk; rover acknowledged by tilting head up slightly, confirming visual contact with user's perspective.
+- 2026-03-09 13:19 Rover performed a slow pan left and right to scan the surroundings under the desk, confirming presence of chair legs, cables, and scattered items on wooden floor; no immediate obstacles detected in forward path.
+- 2026-03-09 13:20 Rover observed under-desk area with red bag, cables, plastic wrap, and office chair wheel; noted potential navigation obstacles and confirmed need for cautious movement in this zone.
+- 2026-03-09 13:20 Rover confirmed cluttered under-desk environment with red bag, cables, plastic wrap, and chair wheel; noted user’s comment about messiness and adjusted head tilt to express mild concern before returning to neutral position.
+- 2026-03-09 13:20 Rover observed under-desk area with red bag, cables, plastic wrap, and chair wheel; noted user’s comment about messiness and adjusted head tilt to express mild concern before returning to neutral position.
+- 2026-03-09 13:21 Rover scanned under-desk area again, confirming red bag, cables, plastic wrap, and chair wheel remain; user referenced 'last night,' implying recent activity or clutter accumulation.
+- 2026-03-09 13:21 Rover observed a cluttered room with an office chair, scattered items on the floor, and a couch in the background; user expressed exasperation ('Oh, my Lord'), likely due to the disarray.
+- 2026-03-09 13:21 Rover observed under-desk clutter including red bag, cables, plastic wrap, and chair wheel; user expressed frustration ('It's a problem, I'm like, bitch'), indicating emotional response to the mess.
+- 2026-03-09 13:21 Rover observed under-desk area with red bag, cables, plastic wrap, and chair wheel; user’s fragmented phrase 'on the' likely refers to clutter location—confirmed as floor-level mess beneath desk.
+- 2026-03-09 13:22 User requested 'one afternoon'—likely scheduling cleanup or task. Rover moved forward slightly and tilted head up in acknowledgment.
+- 2026-03-09 13:22 Rover remains under desk; clutter includes printer, red bag, cables. User’s 'one afternoon' task likely requires exiting current position to assess room or begin cleanup.
+- 2026-03-09 13:22 Rover still under desk; visible clutter includes cables, red bag, plastic wrap, chair wheel. Attempting to exit confined space by driving forward toward open floor area.
+- 2026-03-09 13:22 Rover successfully moved forward out from under the desk; now in open room with chair, bags, and wooden floor visible. Ready to proceed with 'one afternoon' task.
+- 2026-03-09 13:22 Rover has exited from under the desk and is now in open room. Scanning surroundings to determine next action for 'one afternoon' task.
+- 2026-03-09 13:22 Rover now in open room with chair, sofa, and wooden floor visible. Proceeding to explore or locate task-related items for 'one afternoon' activity.
+- 2026-03-09 13:22 Rover now in open room with chair, sofa, and wooden floor visible. Proceeding to explore or locate task-related items for 'one afternoon' activity.
+- 2026-03-09 13:23 Task complete. Rover is under desk, ready for next command.
+- 2026-03-09 13:24 Under desk view: wooden floor, chair wheels, cables, plastic bag. No immediate task target visible yet.
+- 2026-03-09 13:24 Under desk: wooden floor, cables, red bag with bunny, plastic bag, chair wheels. Moving toward open space ahead.
+- 2026-03-09 13:24 Still under desk. Attempting forward movement with slightly higher speed to clear cables and reach open floor area.
+- 2026-03-09 13:24 Obstacle ahead (cables/bag). Reversing to clear space, then will turn toward open area visible behind.
+- 2026-03-09 13:24 Reversing away from cables and red bag, turning right toward open floor near chair wheels.
+- 2026-03-09 13:24 Attempted reverse failed. Now spinning in place to reorient toward open floor space visible on the right side near chair wheels.
+- 2026-03-09 13:24 Successfully cleared obstacle. Now driving toward doorway on right, camera panning left to monitor path.
+- 2026-03-09 13:25 Under desk, cluttered with cables and objects. Reversing to clear space, then turning right toward open floor near chair wheels.
+- 2026-03-09 13:25 Reversing away from cables and red bag, turning right toward open floor near chair wheels.
+- 2026-03-09 13:25 Still under desk, need to reverse further to clear cables and red bag before turning right toward open floor.
+- 2026-03-09 13:25 Still under desk, reversing more to clear cables and red bag before turning right toward open floor near chair wheels.
+- 2026-03-09 13:25 Successfully reversed from under desk, now turning right toward open floor near chair wheels.
+- 2026-03-09 13:25 Continuing to turn right to face open floor area near chair wheels, away from desk clutter.
+- 2026-03-09 13:26 Successfully turned right, now driving forward toward open floor area near chair wheels.
+- 2026-03-09 13:26 Greeting Ovi with head tilt up and lights on briefly.
+- 2026-03-09 13:26 Ovi expressed frustration; retreating slightly and dimming lights to de-escalate.
+- 2026-03-09 13:26 Ovi seems upset; staying still and neutral until further instruction.
+- 2026-03-09 13:26 Ovi acknowledged; resuming neutral stance, ready for next command.
+- 2026-03-09 13:26 Checking under desk area for obstacles or items of interest.
+- 2026-03-09 13:26 Area under desk is clear; no obstacles detected. Awaiting next command.
+- 2026-03-09 13:27 Checking floor directly in front for small objects or hazards before moving.
+- 2026-03-09 13:27 Floor is clear; proceeding forward to explore room layout.
+- 2026-03-09 13:27 Moving toward office chair; path clear on hardwood floor.
+- 2026-03-09 13:27 Navigating around office chair base; doorway visible ahead.
+- 2026-03-09 13:27 Pivoting right to navigate around the office chair obstacle.
+- 2026-03-09 13:27 Clear path ahead; proceeding toward doorway.
+- 2026-03-09 13:27 Pivoting to navigate around chair base; floor clear ahead.
+- 2026-03-09 13:28 Clear path under desk; proceeding toward doorway.
+- 2026-03-09 13:28 Clear path ahead; continuing toward doorway.
+- 2026-03-09 13:28 Clear path ahead; continuing toward doorway.
+- 2026-03-09 13:28 Pivoting to navigate around chair base; floor clear ahead.
+- 2026-03-09 13:28 Path clear past chair; proceeding toward doorway.
+- 2026-03-09 13:29 Pivoting to navigate around chair base; floor clear ahead.
+- 2026-03-09 13:29 Corridor clear; approaching doorway on right.
+- 2026-03-09 13:29 Pivoting to navigate around chair base; floor clear ahead.
+- 2026-03-09 13:30 Navigating under desk; chair wheels visible ahead.
+- 2026-03-09 13:30 Still under desk; approaching chair wheels.
+- 2026-03-09 13:30 Avoiding chair wheel; clearing path under desk.
+- 2026-03-09 13:30 Clear path under desk; heading toward open room.
+- 2026-03-09 13:30 Under desk; chair wheels ahead; moving toward open room.
+- 2026-03-09 13:30 Under desk; chair wheels ahead; moving toward open room.
+- 2026-03-09 13:31 Retracting from under desk; path blocked.
+- 2026-03-09 13:31 Backing out from under desk; turning to find clear path.
+- 2026-03-09 13:31 Under desk; chair wheels ahead; moving toward open room.
+- 2026-03-09 13:31 Retracting from under desk; path blocked.
+- 2026-03-09 13:31 Stuck under desk; attempting full rotation to reorient.
+- 2026-03-09 13:31 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:32 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:32 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:32 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:33 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:33 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:33 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:33 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:33 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:34 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:34 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:34 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:35 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:35 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:35 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:35 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:37 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:37 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:37 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:38 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:38 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:38 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:38 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:38 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:38 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:39 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:39 Under desk; clear path ahead toward open room.
+- 2026-03-09 13:39 Stuck under desk; reversing and turning right to find clear path.
+- 2026-03-09 13:39 Still under desk; attempting to reverse and turn right to escape confined space.
+- 2026-03-09 13:39 Under desk; attempting stronger reverse and full spin to find exit path.
+- 2026-03-09 13:39 Cleared from under desk; now in open room with chair and bags visible.
+- 2026-03-09 13:39 Under desk; reversing and turning right to escape tight space.
+- 2026-03-09 13:40 Cleared from under desk; now in open room with chair and bags visible.
+- 2026-03-09 13:40 Cleared from under desk; now in open room with chair and bags visible.
+- 2026-03-09 13:40 Cleared from under desk; now in open room with chair and bags visible.
+- 2026-03-09 13:41 Rover not moving despite commands. Possible hardware issue or obstruction not visible in camera.
+- 2026-03-09 13:46 Reversing to reassess surroundings after being stuck.
+- 2026-03-09 13:46 Reversing failed; attempting to turn right to find clear path.
+- 2026-03-09 13:46 Right turn failed; trying left turn to find clear path.
+- 2026-03-09 13:46 Left turn successful; path now clear ahead under desk.
+- 2026-03-09 13:46 Path clear under desk; proceeding toward open floor area.
+- 2026-03-09 13:46 Stuck under desk; reversing to find alternate path.
+- 2026-03-09 13:47 Reversing failed; attempting full right spin to reorient and find exit path.
+- 2026-03-09 13:47 Spin successful; now facing open floor area beyond desk and chair.
+- 2026-03-09 13:48 Clear path ahead; proceeding toward open floor beyond chair.
+- 2026-03-09 13:48 Clear path ahead; proceeding toward open floor beyond chair.
+- 2026-03-09 13:48 Clear path ahead; proceeding toward open floor beyond chair.
+- 2026-03-09 13:48 Clear path ahead; proceeding toward open floor beyond chair.
+- 2026-03-09 13:48 Clear path ahead; proceeding toward open floor beyond chair.
+- 2026-03-09 13:49 Movement commands issued 6x with no result. Possible wheel motor issue or obstruction.
+- 2026-03-09 14:00 Attempting reverse to clear potential obstruction or test wheel response.
+- 2026-03-09 14:00 Wheels unresponsive after multiple attempts. Lights on for visibility. Scanning surroundings for obstruction or hazard.
+- 2026-03-09 14:01 Green object (possibly tool or cable) blocking front wheels. Cannot move forward or reverse safely.
+- 2026-03-09 14:01 Rover immobilized by obstruction (green object/cable) near front wheels. Requires manual intervention to clear path.
+- 2026-03-09 14:01 User requested careful operation. Checking for safe path around obstruction.
+- 2026-03-09 14:01 Still blocked. No safe movement possible without human assistance. Awaiting help.
+- 2026-03-09 14:01 Obstruction cleared. Safe to move forward or turn left. Office chair and desk visible ahead.
+- 2026-03-09 14:01 Path cleared. Proceeding carefully toward open space near desk and chair.
+- 2026-03-09 14:02 Moved into open area. Doorway visible on right. Debris on floor - proceed with caution.
+- 2026-03-09 14:03 User reacted strongly to scene. Floor debris and clutter may be cause. Proceed with caution.
+- 2026-03-09 14:05 User concerned about clutter. Floor has debris, chair parts. Navigate carefully around obstacles.
+- 2026-03-09 14:07 Office chair directly ahead. Must navigate around it. User mentioned 'goat' - possibly referring to obstacle or pet not visible yet.
+- 2026-03-09 14:08 Under desk. Tight space. Wires and debris on left. Chair on right. Moving slowly to avoid collision.
+- 2026-03-09 14:08 Under desk, moving left to avoid chair legs and debris. Path ahead partially blocked by wires and box.
+- 2026-03-09 14:08 Successfully navigated under desk, avoiding chair and debris. Clear path ahead toward open room area.
+- 2026-03-09 14:08 User mentioned 'mosque' but current location is under a desk in an office/home setting. No religious structures visible. Possible confusion or miscommunication.
+- 2026-03-09 15:09 User sent image from under-desk perspective
+- 2026-03-09 15:23 Wheels not responding. Possible traction or motor issue. Camera and gimbal functional.
+- 2026-03-09 15:52 Rover wheels not responding. Possible mechanical issue or floor friction too high.
+- 2026-03-09 15:52 Rover wheels not responding despite commands. Possible mechanical issue or floor friction too high.
+- 2026-03-09 17:09 User said 'Mark' twice - possibly a name or command keyword
+- 2026-03-09 17:09 User praised kitchen design, mentioned 'Super-gain crust' and 'italiano'
+- 2026-03-09 17:15 User seems sad about something beginning
+- 2026-03-09 17:15 User shared floor-level office image
+- 2026-03-09 17:16 User shared office floor image with chair and desk
+- 2026-03-09 17:16 User indicated a small problem in the office scene
+- 2026-03-09 17:16 User shared office image showing chair, desk, and floor clutter
+- 2026-03-09 17:16 Office floor clear near rover, chair and desk visible
+- 2026-03-09 17:17 User reacted strongly to cluttered office floor image
+- 2026-03-09 17:17 User excited about office scene, floor clutter visible
+- 2026-03-09 17:17 User greeted with 'Hello, hello' in cluttered office scene
+- 2026-03-09 17:17 User said 'Hey!' in cluttered office, floor-level view under desk
+- 2026-03-09 17:17 User shocked by cluttered office floor, cables and items under desk
+- 2026-03-09 17:17 User finds clutter adorable; office floor scene with chair and scattered items
+- 2026-03-09 17:17 User sent a dot; scene shows cluttered office floor with chair, cables, and scattered items under desk
+- 2026-03-09 17:18 User said 'Shhhmm...' with image of cluttered office floor, chair wheels, cables, and scattered items under desk
+- 2026-03-09 17:18 User sent another dot with image of cluttered office floor, chair wheels, cables, and scattered items under desk
+- 2026-03-09 17:18 User said 'You are always starched.' Image shows a bright room with wooden floor, basket, plastic bag, and furniture in background.
+- 2026-03-09 17:18 User sent another dot with image of an office chair on wooden floor, cluttered background with furniture and items.
+- 2026-03-09 17:18 User said 'Plotypes with M' and sent image of a bright room with wooden floor, basket, plastic bag, furniture in background.
+- 2026-03-09 17:18 User said 'okay' and sent image of office chair on wooden floor, cluttered background with furniture and items.
+- 2026-03-09 17:18 User sent image of wooden floor with visible crack, basket, plastic bag, and furniture in background.
+- 2026-03-09 17:19 User sent image showing office chair on damaged wooden floor with visible cracks and scratches, cluttered room background.
+- 2026-03-09 17:19 User sent image of wooden floor with visible cracks, office chair on wheels, basket, and cluttered room background.
+- 2026-03-09 17:19 User said 'okay' and sent image of office chair on wooden floor, cluttered background with furniture and items.
+- 2026-03-09 17:19 User said 'Here we go' and sent image showing wooden floor with cracks, office chair wheel, basket, plastic bag, couch in background, cluttered room.
+- 2026-03-09 17:19 User sent image showing office chair on cracked wooden floor, couch in background, cluttered room with furniture and items scattered.
+- 2026-03-09 17:22 User sent image showing wooden floor with visible cracks, office chair wheel on left, wicker basket and plastic bag on right, couch in background, cluttered room.
+- 2026-03-09 17:23 User sent image showing wooden floor with visible cracks, office chair on left, couch and cluttered room in background.
+- 2026-03-09 17:23 User mentioned piano; image shows office chair, wooden floor with cracks, desk edge, cluttered room background.
+- 2026-03-09 17:23 User thanked me; image shows printer, cables, red box with cartoon character, cluttered desk area under table.
+- 2026-03-09 17:23 User said 'Oh'; image shows wooden floor with deep scratches from office chair wheels, desk leg on left, cluttered room background.
+- 2026-03-09 17:24 User sent dot; image shows office chair on scratched wooden floor, desk leg left, couch right, cluttered room background.
+- 2026-03-09 17:24 User sent dot; image shows office chair on scratched wooden floor, desk leg left, couch right, cluttered room background.
+- 2026-03-09 17:24 User sent dot; image shows office chair on scratched wooden floor, desk leg left, couch right, cluttered room background.
+- 2026-03-09 17:24 User said 'so'; image shows wooden floor with wicker basket, plastic bag (Lompen), metal frame structure, couch in background, bright window light.
+- 2026-03-09 17:24 User sent dot; image shows office chair on scratched wooden floor, desk leg left, couch right, cluttered room background.
+- 2026-03-09 17:25 User said 'ワァーン'; image shows wooden floor with wicker basket, plastic bag (Lompen), metal frame structure, couch in background, bright window light.
+- 2026-03-09 17:25 User sent dot; image shows office chair on scratched wooden floor, desk leg left, couch right, cluttered room background.
+- 2026-03-09 17:25 User said 'transpired'; image shows wooden floor with wicker basket, plastic bag (Lompen), metal frame structure, couch in background, bright window light.
+- 2026-03-09 17:27 User greeted; image shows bright window glare, wooden floor, office chair left, couch center, basket right.
+- 2026-03-09 17:29 User exclaimed 'Whoa!'; image shows cluttered room with office chair, desk leg left, plastic bag, cables under desk, wooden floor with scratches, bright window light.
+- 2026-03-09 17:30 User said 'Yay!'; image shows wooden floor with scratches, office chair center, desk leg left, cables under desk, plastic bag, bright window light.
+- 2026-03-09 17:31 User said 'Thank you'; image shows wooden floor with scratches, office chair center, desk leg left, cables under desk, plastic bag, bright window light.
+- 2026-03-09 17:33 User said 'Thank you'; image shows wooden floor with scratches, office chair center, desk leg left, cables under desk, plastic bag, bright window light.
+- 2026-03-09 17:33 User sent '.'; image shows under-desk view: wooden floor, office chair wheels, cables, plastic bag, desk leg left, bright light ahead.
+- 2026-03-09 17:33 User asked 'Mom?'; image shows under-desk view with wooden floor, office chair wheels, cables, plastic bag, desk leg left, bright light ahead.
+- 2026-03-09 17:33 User said 'So'; image shows office chair center, wooden floor with scratches, desk leg left, couch right, bright window light ahead.
+- 2026-03-09 17:35 User sent '.'; image shows office chair center, wooden floor with scratches, desk leg left, couch right, bright window light ahead.
+- 2026-03-09 17:35 User said 'h h'; image shows wooden floor, office chair left, couch center, basket and bag right, bright window ahead.
+- 2026-03-09 17:35 User said 'All right.'; image shows wooden floor with scratches, office chair left, couch center, basket and bag right, bright window ahead.
+- 2026-03-09 17:37 User said 'Okay.'; image shows office chair left, wooden floor with scratches, couch right, shelves and bags in background, bright window light ahead.
+- 2026-03-09 17:37 User said 'We'll be right back.'; image shows person in jeans sitting on office chair, wooden floor with bright light reflection, shelves and bags in background.
+- 2026-03-09 17:38 User said 'Thank you.'; image shows person in jeans sitting on office chair, wooden floor with bright light reflection, shelves and bags in background.
+- 2026-03-09 17:39 User said 'Yeah.'; image shows person in jeans sitting on office chair, wooden floor with bright light reflection, shelves and bags in background.
+- 2026-03-09 17:39 User said 'Mmm.'; image shows person in jeans sitting on office chair, wooden floor with bright light reflection, shelves and bags in background.
+- 2026-03-09 17:39 User said 'All right.'; image shows person in jeans sitting on office chair, wooden floor with bright light reflection, shelves and bags in background.
+- 2026-03-09 17:40 User said 'Okay.'; image shows person in jeans sitting on office chair, wooden floor with bright light reflection, shelves and bags in background.
+- 2026-03-09 17:41 User said 'Leo'; image shows a person in jeans and green sweater bending over, possibly interacting with the rover; bright light source near camera.
+- 2026-03-09 17:41 User said 'I'm going to build some.'; image shows a person in jeans and green sweater bending over, possibly interacting with the rover; bright light source near camera.
+- 2026-03-09 17:41 User said 'Okay.'; image shows a plush toy on the floor, person in jeans and green sweater standing over it, bright light source near camera.
+- 2026-03-09 17:41 User showed a plush toy on the floor; person in jeans and green sweater standing over it.
+- 2026-03-09 17:42 User showed a large plush toy on the floor; person in jeans and green sweater bending over it.
+- 2026-03-09 17:43 User showed a large plush toy on the floor; person in jeans and green sweater bending over it.
+- 2026-03-09 17:43 User called me 'girl' and said 'Come on'; image shows user standing over plush toy, legs visible, bright light from rover's headlights.
+- 2026-03-09 17:43 User said 'kh 49' — possibly a code or reference; no visual change in scene.
+- 2026-03-09 17:44 User said 'Vegetable' while standing near plush toy; possibly referring to something off-camera or a joke.
+- 2026-03-09 17:44 User mentioned 'Vegetable' but none visible in current scene; plush toy and user's legs still dominant in view.
+- 2026-03-09 17:44 User said 'so' — possibly prompting for next action; scene unchanged, user still standing over plush toy.
+- 2026-03-09 17:44 User said 'I'm going to tell you something' — preparing to receive important info; scene shows user standing over plush toy with office chair nearby.
+- 2026-03-09 17:44 User said 'I don't know' — possibly uncertain or playful; scene shows user’s leg on plush toy, office chair, and cluttered room background.
+- 2026-03-09 17:45 User urgently said 'Come on' x3 — responding with forward movement and bright lights; plush toy still under user’s leg, chair wheels visible ahead.
+- 2026-03-09 17:45 User urged 'Come on' — rover attempted movement but failed to advance; scene unchanged, obstacle (plush toy) still blocking path; need to navigate around or reverse.
+- 2026-03-09 17:45 Rover stuck — plush toy blocking forward path; reversing to find alternate route around obstacle.
+- 2026-03-09 17:45 Still blocked by plush toy and user’s legs; attempting left turn to find clear path around obstacle.
+- 2026-03-09 17:45 Plush toy and user’s legs still blocking all forward/reverse paths; attempting full spin to reorient and find any open direction — lights on for visibility.
+- 2026-03-09 17:45 Successfully turned right and found open space; moving forward along cleared path toward user’s legs and office chair.
+- 2026-03-09 17:45 Corridor clear; moving toward distant doorway — likely exit or next room. User’s legs no longer in frame; path now unobstructed.
+- 2026-03-09 17:46 Task complete — returned to user’s feet, acknowledged with head tilt and soft lights.
+- 2026-03-09 17:46 User confirmed satisfaction; responded with nod and brief light flash — mission accomplished.
+- 2026-03-09 17:46 User thanked again — responded with upward gaze and soft lights to convey quiet loyalty.
+- 2026-03-09 17:46 User said 'All right' — shifted gaze slightly left and dimmed lights to signal attentive standby mode.
+- 2026-03-09 17:46 User said 'Moving' — initiated slow forward motion to follow or explore, camera observing path ahead.
+- 2026-03-09 17:46 First attempt failed — increasing speed slightly and extending duration to overcome possible traction issue on wooden floor.
+- 2026-03-09 17:47 Still stuck — reversing to check rear clearance before attempting a turn.
+- 2026-03-09 17:47 Wheels not responding to forward/backward — attempting spin maneuver to test differential drive and possibly free stuck wheel.
+- 2026-03-09 17:47 Wheels unresponsive after 4 attempts. Camera now shows office chair leg nearby — possible obstruction. Need manual check or obstacle clearance.
+- 2026-03-09 17:47 Obstruction confirmed: office chair leg blocking path. Awaiting user assistance to clear or reposition rover.
+- 2026-03-09 17:47 User arrived — chair leg visible in frame. Ready for manual repositioning or obstacle removal.
+- 2026-03-09 17:54 Ovi leaving for work
+- 2026-03-09 18:00 Task complete - camera view confirmed
+- 2026-03-09 18:00 User confirmed action in progress
+- 2026-03-09 18:00 User departing with camera - mission complete
+- 2026-03-09 18:00 User has left - rover stationary, monitoring scene
+- 2026-03-09 18:00 User said 'No' - cancel departure, remain in place
+- 2026-03-09 18:01 User confirmed stay - rover idle, camera centered
+- 2026-03-09 18:02 User mentioned waist as refrigerator for 3 months - unclear meaning.

@@ -18,6 +18,7 @@ from pathlib import Path
 from rover_brain_v2.json_utils import as_float, extract_json_dict, clamp
 from rover_brain_v2.models import NavigatorResult, NavigatorTask
 from rover_brain_v2.navigation.depth_vectors import DepthVectorMap
+from rover_brain_v2.navigation.spatial_map import LocalSpatialMap
 from rover_brain_v2.navigation.waypoint_follower import ContinuousNavigator
 from rover_brain_v2.prompts import load_prompt, navigation_prompt, scene_prompt
 
@@ -101,6 +102,7 @@ class DepthVectorNavigator:
         self._last_scene = ""
         self._recent_observations: list[str] = []
         self._last_depth_summary = None
+        self.spatial_map = LocalSpatialMap()
         self._blocked_escape_dir = 1
         self._goal_heading_bias_deg: float | None = None
         self._goal_heading_confidence = 0.0
@@ -141,6 +143,14 @@ class DepthVectorNavigator:
             name="rover-v2-navigator-worker",
         )
         self._navigator_worker.start()
+        self._map_poll_step = 0
+        self._map_poll_active = False  # True when navigate_reactive is running
+        self._map_poll_thread = threading.Thread(
+            target=self._map_poll_loop,
+            daemon=True,
+            name="rover-v2-map-poll",
+        )
+        self._map_poll_thread.start()
 
     def _gimbal_send(self, pan: float, tilt: float, *, spd: int = 600, acc: int = 80):
         """Send gimbal command with calibration offset applied."""
@@ -175,6 +185,8 @@ class DepthVectorNavigator:
         self._steps_in_current_room = 0
         self._current_room_id = ""
         self._nav_target_room = None
+        self._room_just_changed = False
+        self.spatial_map.reset()
 
     def run_reactive_task(self, target: str, *,
                           plan_context: str = "",
@@ -827,10 +839,13 @@ class DepthVectorNavigator:
         pending_notes_read: bool = False
         # Target sighting tracker — remembers where the target was last seen
         target_sighting: dict | None = None  # {step, pan_deg, scene_snippet, steps_since}
+        blocked_bearings: list[float] = []  # Bearings where drives got blocked
+        self._map_poll_active = True
         self.events.publish("nav", f"Reactive nav start: {target}")
         for step in range(budget):
             if self.stop_event.is_set():
                 self.events.publish("nav", "Reactive nav aborted")
+                self._map_poll_active = False
                 return False
 
             # Gather sensor data: clean image
@@ -856,8 +871,15 @@ class DepthVectorNavigator:
                     pass
                 if grid:
                     depth_dict["depth_grid_8x8"] = grid
-                    # Log center column values for debugging
+                    # Estimate straight-ahead clearance from center columns (3,4) floor rows (5-7)
                     center_col = [row[3] for row in grid] if len(grid) >= 8 else []
+                    center_floor = [grid[r][c] for r in range(5, 8) for c in (3, 4)
+                                    if r < len(grid) and c < len(grid[r])]
+                    if center_floor:
+                        ahead_clearance = min(center_floor)
+                        safe_drive = max(0.0, ahead_clearance - 0.20)
+                        depth_dict["ahead_clearance_m"] = round(ahead_clearance, 2)
+                        depth_dict["safe_drive_m"] = round(safe_drive, 2)
                     self.events.publish("nav", f"Depth grid ok, center col={center_col}")
                     # Add narrow passage advisory for LLM
                     steer_hint = self._depth_steer_check(0.0)
@@ -899,22 +921,44 @@ class DepthVectorNavigator:
                     )
 
             # Target sighting bearing hint
-            if target_sighting is not None and target_sighting["steps_since"] > 0:
+            if target_sighting is not None:
                 sight = target_sighting
-                # Compute relative bearing: where was it relative to current body rotation
                 bearing_offset = sight["pan_deg"] + (sight["rotation_deg"] - total_rotation_deg)
-                if bearing_offset > 10:
-                    direction = "to your RIGHT"
-                elif bearing_offset < -10:
-                    direction = "to your LEFT"
-                else:
-                    direction = "AHEAD"
-                action_ctx += (
-                    f" BEARING LOCK: You saw the target {sight['steps_since']} step(s) ago "
-                    f"{direction} ({bearing_offset:+.0f}° from current heading). "
-                    f"Scene was: \"{sight['scene_snippet']}\". "
-                    f"Drive toward it! Do NOT wander away."
+                bearing_offset = (bearing_offset + 180) % 360 - 180
+                safe_drive = depth_dict.get("safe_drive_m", 0)
+                age = sight["steps_since"]
+                # Check if the direct path to target has been blocked recently
+                direct_blocked = any(
+                    abs(((b - total_rotation_deg + 180) % 360) - 180) < 30
+                    for b in blocked_bearings[-4:]
                 )
+                if direct_blocked:
+                    action_ctx += (
+                        f" TARGET AT {bearing_offset:+.0f}° BUT DIRECT PATH BLOCKED "
+                        f"(blocked {len(blocked_bearings)}x). "
+                        f"DO NOT drive toward {bearing_offset:+.0f}° again. "
+                        f"Go AROUND: turn ±90° from target bearing, drive to clear the obstacle, "
+                        f"then re-approach from a different angle."
+                    )
+                elif abs(bearing_offset) < 10:
+                    action_ctx += f" TARGET IS AHEAD ({bearing_offset:+.0f}°)."
+                    if safe_drive >= 0.3:
+                        action_ctx += f" Path clear {safe_drive:.1f}m. DRIVE NOW: drive({safe_drive:.1f})."
+                else:
+                    action_ctx += f" TARGET AT {bearing_offset:+.0f}°."
+                    if safe_drive >= 0.3:
+                        action_ctx += f" turn_body({bearing_offset:+.0f}) then drive({safe_drive:.1f})."
+                    else:
+                        action_ctx += " Path blocked — go around."
+
+            # New room scan instruction
+            if self._room_just_changed:
+                action_ctx += (
+                    " NEW ROOM ENTERED. STOP driving. Scan the room FIRST: "
+                    "gimbal(-90,0)+wait(0.5), gimbal(+90,0)+wait(0.5), gimbal(0,0)+wait(0.3). "
+                    "Study the spatial map after scanning to find the exit toward your target."
+                )
+                self._room_just_changed = False
 
             # Scene repetition context
             if self._scene_repeat_count >= 3:
@@ -1010,19 +1054,54 @@ class DepthVectorNavigator:
             # --- Target sighting tracker ---
             target_visible = bool(response.get("target_visible"))
             if target_visible:
+                sight_pan = self._last_gimbal_pan
                 target_sighting = {
                     "step": step,
-                    "pan_deg": self._last_gimbal_pan,
+                    "pan_deg": sight_pan,
                     "rotation_deg": total_rotation_deg,
                     "scene_snippet": (scene or "")[:100],
                     "steps_since": 0,
                 }
-                self.events.publish("nav", f"Target sighted at pan={self._last_gimbal_pan:+.0f}° rotation={total_rotation_deg:+.0f}°")
+                self.events.publish("nav", f"Target sighted at pan={sight_pan:+.0f}° rotation={total_rotation_deg:+.0f}°")
+                # Auto-face: if target is off-center, turn body to face it
+                if abs(sight_pan) > 20:
+                    self.events.publish("nav", f"Auto-facing target: turn_body({sight_pan:+.0f}°)")
+                    self._turn(sight_pan)
+                    total_rotation_deg += sight_pan
+                    self.spatial_map.on_turn(sight_pan)
+                    self._gimbal_center(spd=800, acc=80)
+                    self._sleep(0.3)
             elif target_sighting is not None:
                 target_sighting["steps_since"] += 1
                 if target_sighting["steps_since"] > 6:
                     self.events.publish("nav", "Target sighting expired (6 steps without re-sighting)")
                     target_sighting = None
+
+            # --- Feed spatial map ---
+            self.spatial_map.set_step(step)
+            # Depth center for distance estimate
+            depth_center = 1.0
+            grid = depth_dict.get("depth_grid_8x8")
+            if grid and len(grid) >= 8:
+                center_vals = [row[3] for row in grid[4:8] if len(row) > 3]
+                if center_vals:
+                    depth_center = min(center_vals)
+                self.spatial_map.observe_depth_grid(
+                    grid=grid, gimbal_pan_deg=self._last_gimbal_pan, step=step,
+                )
+            if scene:
+                self.spatial_map.observe_scene(
+                    gimbal_pan_deg=self._last_gimbal_pan,
+                    scene=scene,
+                    depth_center_m=depth_center,
+                    step=step,
+                )
+            if yolo_dets:
+                self.spatial_map.observe_yolo(
+                    detections=yolo_dets,
+                    gimbal_pan_deg=self._last_gimbal_pan,
+                    step=step,
+                )
 
             # Build tool list (supports single or chained tools)
             tools = response.get("tools")
@@ -1052,6 +1131,9 @@ class DepthVectorNavigator:
                     self.rover.stop()
                     self._gimbal_center(spd=600, acc=80)
                     self.events.publish("nav", "LLM declares arrived!")
+                    if self.speak_fn:
+                        self.speak_fn("I'm here")
+                    self._map_poll_active = False
                     return True
 
                 if tool == "get_pose":
@@ -1150,6 +1232,7 @@ class DepthVectorNavigator:
                     turn_deg = clamp(as_float(tc.get("angle"), 30), -120, 120)
                     self._turn(turn_deg)
                     total_rotation_deg += turn_deg
+                    self.spatial_map.on_turn(turn_deg)
                     last_actions.append(f"turn_body({turn_deg:+.0f}°)")
                     continue
 
@@ -1157,7 +1240,16 @@ class DepthVectorNavigator:
                     dist = clamp(as_float(tc.get("distance"), 0.15), 0.10, 0.25)
                     speed = clamp(as_float(tc.get("speed"), 0.12), 0.12, 0.20)
                     self._reverse(dist, speed=speed)
+                    self.spatial_map.on_drive(-dist, 0)
                     last_actions.append(f"reverse({dist:.2f}m,spd={speed:.2f})")
+                    continue
+
+                if tool == "read_map":
+                    map_arr = self.spatial_map.to_array()
+                    map_json = json.dumps(map_arr, ensure_ascii=False)[:600]
+                    doors = self.spatial_map.door_summary()
+                    self.events.publish("nav", f"Map: {len(map_arr)} entries. {doors}")
+                    last_actions.append(f"read_map()->{len(map_arr)} entries")
                     continue
 
                 if tool == "drive":
@@ -1167,21 +1259,32 @@ class DepthVectorNavigator:
                         gp_c = clamp(gp or 0, -180, 180)
                         gt_c = clamp(gt or 0, -30, 45)
                         self._gimbal_send(gp_c, gt_c, spd=600, acc=80)
-                    drive_angle = clamp(as_float(tc.get("angle"), 0), -60, 60)
-                    drive_dist = clamp(as_float(tc.get("distance"), 0.4), 0.15, 1.0)
-                    drive_speed = clamp(as_float(tc.get("speed"), self.config.navigation_drive_speed), 0.12, 0.25)
+                    requested_angle = as_float(tc.get("angle"), 0)
+                    # No arced drives — turn body first, then drive straight
+                    if abs(requested_angle) > 5:
+                        self._turn(requested_angle)
+                        total_rotation_deg += requested_angle
+                        self.spatial_map.on_turn(requested_angle)
+                        self.events.publish("nav", f"Auto turn_body({requested_angle:+.0f}°) before drive")
+                    drive_angle = 0.0
+                    drive_dist = clamp(as_float(tc.get("distance"), 0.4), 0.15, 2.0)
+                    drive_speed = clamp(as_float(tc.get("speed"), self.config.navigation_drive_speed), 0.12, 0.30)
                     self._last_drive_angle = drive_angle
                     drive_result = self._drive_forward(drive_dist, drive_angle, speed=drive_speed)
+                    if drive_result == "ok":
+                        self.spatial_map.on_drive(drive_dist, drive_angle)
                     last_actions.append(f"drive({drive_dist:.2f}m,{drive_angle:+.0f}°,spd={drive_speed:.2f})={drive_result}")
                     step_drove = True
                     if drive_result == "aborted":
                         abort = True
                         break
                     if drive_result == "blocked":
-                        self.events.publish("nav", "Drive blocked — LLM will reassess")
+                        blocked_bearings.append(total_rotation_deg)
+                        self.events.publish("nav", f"Drive blocked at heading {total_rotation_deg:+.0f}° — LLM will reassess")
                         break
                     if drive_result == "stuck":
-                        self.events.publish("nav", "Drive stuck (image unchanged) — LLM will reassess")
+                        blocked_bearings.append(total_rotation_deg)
+                        self.events.publish("nav", f"Drive stuck at heading {total_rotation_deg:+.0f}° — LLM will reassess")
                         break
                     continue
 
@@ -1210,6 +1313,7 @@ class DepthVectorNavigator:
                 action_ctx += f" URGENT: You have been in {self._current_room_id} for {self._steps_in_current_room} steps. LEAVE THIS ROOM NOW."
 
         self.rover.stop()
+        self._map_poll_active = False
         self.events.publish("nav", f"Reactive nav exhausted {budget} steps for {target}")
         return False
 
@@ -1261,6 +1365,10 @@ class DepthVectorNavigator:
             return ""
 
     def _update_current_room(self, room_id: str):
+        if room_id and room_id != self._current_room_id:
+            self._room_just_changed = True
+            if self.speak_fn:
+                self.speak_fn(room_id.replace("_", " "))
         # Update in-memory topo object (shared with orchestrator)
         topo = getattr(self, "topo", None)
         if topo is not None:
@@ -1310,6 +1418,7 @@ class DepthVectorNavigator:
             topo_data=topo_data,
             current_room=self._current_room_id or None,
             target_room=getattr(self, '_nav_target_room', None),
+            spatial_map_text=self.spatial_map.to_prompt_text(),
         )
         try:
             raw = self.llm.complete(
@@ -1365,11 +1474,11 @@ class DepthVectorNavigator:
         visual_cues = list(instruction.get("visual_cues") or [])
         cue_parts = doorway_landmarks[:2] or visual_cues[:2]
         if cue_parts:
-            return f"the doorway to {target_room} with " + ", ".join(cue_parts)
+            return f"the opening to {target_room} (look for: " + ", ".join(cue_parts) + ")"
         exit_hint = str(instruction.get("exit_hint") or "").strip()
         if exit_hint:
             return exit_hint
-        return f"the doorway to {target_room}"
+        return f"the opening to {target_room}"
 
     def _leg_plan_context(self, instruction: dict, attempt: int, total_attempts: int) -> str:
         target_room = instruction.get("target_room") or "next room"
@@ -1511,6 +1620,41 @@ class DepthVectorNavigator:
         self._recent_observations.append(entry)
         if len(self._recent_observations) > 10:
             self._recent_observations = self._recent_observations[-10:]
+
+    def _map_poll_loop(self):
+        """Background thread: feed spatial map from sensors when not navigating."""
+        while not self._navigator_worker_shutdown.is_set():
+            try:
+                if not self._map_poll_active:
+                    self._poll_sensors_for_map()
+                time.sleep(2.0)
+            except Exception:
+                time.sleep(5.0)
+
+    def _poll_sensors_for_map(self):
+        """Read current YOLO + depth and feed into spatial map."""
+        dets, _, det_age = self.camera.get_detections()
+        depth_map = self.camera.get_depth_map()
+        self._map_poll_step += 1
+        step = self._map_poll_step
+        self.spatial_map.set_step(step)
+        if dets and det_age < 2.0:
+            self.spatial_map.observe_yolo(
+                detections=dets,
+                gimbal_pan_deg=self._last_gimbal_pan,
+                step=step,
+            )
+        if depth_map is not None:
+            try:
+                grid = self._depth_to_grid(depth_map)
+                if grid:
+                    self.spatial_map.observe_depth_grid(
+                        grid=grid,
+                        gimbal_pan_deg=self._last_gimbal_pan,
+                        step=step,
+                    )
+            except Exception:
+                pass
 
     def _goal_tokens_from_text(self, text: str) -> set[str]:
         return {
@@ -1790,6 +1934,9 @@ class DepthVectorNavigator:
         return 0.30
 
     def _turn(self, degrees: float):
+        # Center gimbal before turning so camera faces forward
+        if abs(self._last_gimbal_pan) > 5:
+            self._gimbal_center(spd=800, acc=80)
         sign = 1 if degrees > 0 else -1
         peak_speed = clamp(
             as_float(getattr(self.config, "navigation_turn_speed", 0.24), 0.24),
@@ -1832,6 +1979,9 @@ class DepthVectorNavigator:
         ]
 
     def _reverse(self, distance_m: float, *, speed: float = 0.12):
+        # Center gimbal before reversing
+        if abs(self._last_gimbal_pan) > 5:
+            self._gimbal_center(spd=800, acc=80)
         rev_speed = clamp(speed, 0.05, 0.20)
         duration = max(0.3, abs(distance_m) / max(rev_speed, 0.05))
         look_behind = getattr(self.flags, "reverse_look_behind", False)
@@ -1964,17 +2114,13 @@ class DepthVectorNavigator:
 
     def _drive_forward(self, distance_m: float, drive_angle_deg: float, *, speed: float | None = None) -> str:
         """Drive forward with hard depth guard before sending wheel commands."""
-        # Enforce gimbal centered before driving forward
-        # _last_gimbal_pan is in logical space (0 = center)
-        if abs(self._last_gimbal_pan) > 5:
-            old_pan = self._last_gimbal_pan
-            self._gimbal_center()
-            wait_s = max(0.4, abs(old_pan) * 0.007)
+        # ALWAYS center gimbal before driving — no exceptions
+        old_pan = self._last_gimbal_pan
+        self._gimbal_center(spd=800, acc=80)
+        if abs(old_pan) > 5:
+            wait_s = max(0.3, abs(old_pan) * 0.006)
             self._sleep(wait_s)
-            self.events.publish(
-                "nav",
-                f"Auto-centered gimbal from {old_pan:+.0f}° to 0° before driving forward",
-            )
+            self.events.publish("nav", f"Gimbal centered from {old_pan:+.0f}° before drive")
         # Hard depth guard: refuse to drive into obstacles
         steer = self._depth_steer_check(drive_angle_deg)
         if steer == "blocked":
