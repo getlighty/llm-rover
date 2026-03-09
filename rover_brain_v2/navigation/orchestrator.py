@@ -502,6 +502,21 @@ class GraphNavigationOrchestrator:
         return normalized
 
     def _identify_current_room(self) -> Optional[str]:
+        # Trust existing topo state if confidence is reasonable
+        if self.topo.current_room and getattr(self.topo, 'current_confidence', 0) >= 0.5:
+            self.events.publish("room", f"Current room (topo): {self.topo.current_room} "
+                                f"({getattr(self.topo, 'current_confidence', 0):.2f})")
+            return self.topo.current_room
+        # Low confidence or unknown — use navigator's last scene if available
+        last_scene = getattr(self.navigator, '_last_scene', '') or ''
+        if last_scene:
+            room, confidence = self._room_check(last_scene)
+            if room:
+                self.topo.current_room = room
+                self.topo.current_confidence = confidence
+                self.events.publish("room", f"Current room (scene): {room} ({confidence:.2f})")
+                return room
+        # Last resort: capture frame and describe scene via LLM
         frame = self.navigator.camera.snap()
         if frame is None:
             return None
@@ -519,7 +534,7 @@ class GraphNavigationOrchestrator:
         if room:
             self.topo.current_room = room
             self.topo.current_confidence = confidence
-            self.events.publish("room", f"Current room: {room} ({confidence:.2f})")
+            self.events.publish("room", f"Current room (LLM fallback): {room} ({confidence:.2f})")
         return room
 
     def _room_check(self, scene_text: str):

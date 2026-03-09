@@ -22,6 +22,7 @@ from rover_brain_v2.hardware.serial_link import SerialLink
 from rover_brain_v2.models import FollowRequest, NavigationRequest, RuntimeFlags
 from rover_brain_v2.navigation.navigator import DepthVectorNavigator
 from rover_brain_v2.navigation.orchestrator import GraphNavigationOrchestrator
+from rover_brain_v2.providers.llm_logger import LoggingVLMWrapper, llm_call_log
 from rover_brain_v2.providers.registry import ProviderRegistry
 
 
@@ -85,6 +86,7 @@ class RoverBrainV2:
             speak_fn=self.speak,
         )
         bundle = self.providers.bundle()
+        self.llm_log = llm_call_log
         self.place_db = PlaceDB(
             db_path=os.path.join(os.path.dirname(__file__), "..", "place_signatures.pkl"),
         )
@@ -92,7 +94,7 @@ class RoverBrainV2:
         self.navigator = DepthVectorNavigator(
             rover=self.rover,
             camera=self.camera,
-            llm_client=bundle.navigator_llm,
+            llm_client=LoggingVLMWrapper(bundle.navigator_llm, role="navigator"),
             event_bus=self.events,
             flags=self.flags,
             config=self.config,
@@ -101,7 +103,7 @@ class RoverBrainV2:
             place_db=self.place_db,
         )
         self.orchestrator = GraphNavigationOrchestrator(
-            llm_client=bundle.orchestrator_llm,
+            llm_client=LoggingVLMWrapper(bundle.orchestrator_llm, role="orchestrator"),
             navigator=self.navigator,
             event_bus=self.events,
         )
@@ -111,7 +113,7 @@ class RoverBrainV2:
             camera=self.camera,
             event_bus=self.events,
             config=self.config,
-            llm_client=bundle.command_llm,
+            llm_client=LoggingVLMWrapper(bundle.command_llm, role="command"),
             speak_fn=self.speak,
             flags=self.flags,
             imu=self.imu,
@@ -127,9 +129,9 @@ class RoverBrainV2:
 
     def refresh_provider_bindings(self):
         bundle = self.providers.bundle()
-        self.navigator.llm = bundle.navigator_llm
-        self.orchestrator.llm = bundle.orchestrator_llm
-        self.follow.llm = bundle.command_llm
+        self.navigator.llm = LoggingVLMWrapper(bundle.navigator_llm, role="navigator")
+        self.orchestrator.llm = LoggingVLMWrapper(bundle.orchestrator_llm, role="orchestrator")
+        self.follow.llm = LoggingVLMWrapper(bundle.command_llm, role="command")
         self.events.publish(
             "system",
             "Providers updated: "
@@ -221,11 +223,20 @@ class RoverBrainV2:
         cancel_fn = self.orchestrator.cancel if request.topological else self.navigator.cancel
         self._spawn_task("navigation", runner, cancel_fn)
 
+    def start_vlm_navigation(self, target: str):
+        """Start continuous VLM-guided navigation (smooth, not stop-go)."""
+        def runner():
+            self._apply_detector_policy("navigation")
+            result = self.navigator.run_vlm_guided_task(target)
+            self.events.publish("plan", f"VLM navigation finished: {result.status} | {result.summary}")
+            return result.reached
+        self._spawn_task("navigation", runner, self.navigator.cancel)
+
     def start_general_command(self, text: str, *, speak_allowed: bool = True):
         def runner():
             self._apply_detector_policy("general")
             bundle = self.providers.bundle()
-            result = self.command_controller.run(text, bundle.command_llm, speak_allowed=speak_allowed)
+            result = self.command_controller.run(text, LoggingVLMWrapper(bundle.command_llm, role="command"), speak_allowed=speak_allowed)
             # If the LLM decided this is a navigation request, hand off
             if result.status == "navigate" and result.payload:
                 nav_target = str(result.payload.get("navigate", text)).strip()
@@ -342,6 +353,7 @@ class RoverBrainV2:
                 "gimbal_pan_enabled": self.flags.gimbal_pan_enabled,
                 "yolo_overlay_enabled": self.flags.yolo_overlay_enabled,
                 "killed": self.flags.killed,
+                "reverse_look_behind": self.flags.reverse_look_behind,
             },
             "providers": {
                 "current": self.providers.snapshot(),

@@ -14,8 +14,7 @@ MOVEMENT:
     Use FAST speed (0.20) when: long clear corridor, open room with no obstacles ahead, momentum needed for threshold.
     TIP: drive(angle) curves while moving — good for gentle corrections in open space.
     But in tight spaces, near furniture, or when you need to change direction sharply, turn_body FIRST then drive straight is safer and more precise.
-  reverse(distance, speed) — back up. Gimbal auto-looks behind (180°) then returns to center.
-    distance: 0.10-0.25m. speed: 0.05-0.20 m/s (default 0.12).
+  reverse(distance, speed) — back up. distance: 0.10-0.25m. speed: 0.05-0.20 m/s (default 0.12).
     Use slow (0.06-0.08) when near obstacles behind you. Use normal (0.12) otherwise.
   turn_body(angle) — spin ENTIRE BODY (all 6 wheels) in place, -120..+120°.
     Use when: you need to face a new direction (>30°), tight spaces where curving would hit something,
@@ -140,8 +139,6 @@ P1.2 — DEAD END TEST (do this EVERY step before driving):
   not whether you can drive THROUGH it. A bed 0.8m away reads as 0.8m clearance — but you can't drive through a bed.
 
 P1.5 — REVERSING (when and how to back up):
-  When reversing, the gimbal auto-rotates to 180° so you see what's BEHIND you.
-  After reversing, the gimbal auto-returns to center. Use the rear view to plan your next move.
   WHEN to reverse:
     - Depth center < 0.3m — obstacle dead ahead, back up before turning.
     - Stuck/blocked after driving — the drive result said "blocked", so reverse 0.15-0.20m and try a different angle.

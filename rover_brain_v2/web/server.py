@@ -121,6 +121,19 @@ DASHBOARD_HTML = """<!doctype html>
     .log-line:last-child{border-bottom:0}
     .tag{font-weight:700;color:var(--teal)}
     .subtext{font-size:13px;color:var(--muted)}
+    .llm-entry{border:1px solid var(--line);border-radius:12px;background:#fff;overflow:hidden}
+    .llm-header{display:flex;gap:8px;align-items:center;padding:8px 12px;cursor:pointer;font-size:12px;font-family:"IBM Plex Mono","SFMono-Regular",monospace;user-select:none}
+    .llm-header:hover{background:#f5f2eb}
+    .llm-header .role{font-weight:700;color:var(--accent);min-width:72px}
+    .llm-header .model{color:var(--teal);flex:1}
+    .llm-header .elapsed{color:var(--muted)}
+    .llm-header .err{color:var(--danger);font-weight:700}
+    .llm-header .img-badge{background:var(--teal-soft);color:var(--teal);border-radius:6px;padding:1px 6px;font-size:10px;font-weight:700}
+    .llm-body{display:none;padding:0 12px 12px;font-size:12px;font-family:"IBM Plex Mono","SFMono-Regular",monospace;line-height:1.5}
+    .llm-body.open{display:block}
+    .llm-section{margin-top:8px}
+    .llm-section-label{font-weight:700;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px}
+    .llm-section pre{margin:0;white-space:pre-wrap;word-break:break-word;background:#faf7f2;border:1px solid var(--line);border-radius:8px;padding:8px;max-height:300px;overflow:auto}
     .split{display:grid;grid-template-columns:1fr 1fr;gap:12px}
     .toggle{
       display:flex;align-items:center;justify-content:space-between;gap:12px;
@@ -252,6 +265,16 @@ DASHBOARD_HTML = """<!doctype html>
         </section>
 
         <section class="panel">
+          <h2>LLM Log</h2>
+          <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
+            <label class="toggle" style="flex:0 0 auto;padding:8px 12px"><span style="font-size:12px">Auto-refresh</span><input id="llmAutoRefresh" type="checkbox" checked></label>
+            <button class="soft" style="flex:0 0 auto;padding:8px 14px;font-size:12px" onclick="refreshLLMLog()">Refresh</button>
+            <span class="subtext" id="llmCount" style="font-size:11px"></span>
+          </div>
+          <div id="llmLog" style="max-height:600px;overflow:auto;display:grid;gap:6px"></div>
+        </section>
+
+        <section class="panel">
           <h2>Speech</h2>
           <div class="provider-grid">
             <label><div class="subtext">STT</div><select id="stt"></select></label>
@@ -277,6 +300,7 @@ DASHBOARD_HTML = """<!doctype html>
             <label class="toggle"><span>Speech Output</span><input id="tts_enabled" type="checkbox"></label>
             <label class="toggle"><span>Gimbal Pan</span><input id="gimbal_pan_enabled" type="checkbox"></label>
             <label class="toggle"><span>YOLO Overlay</span><input id="yolo_overlay_enabled" type="checkbox"></label>
+            <label class="toggle"><span>Reverse Look-Behind</span><input id="reverse_look_behind" type="checkbox"></label>
           </div>
         </section>
 
@@ -399,7 +423,7 @@ DASHBOARD_HTML = """<!doctype html>
     }
 
     function bindFlags(flags){
-      ['desk_mode','stt_enabled','tts_enabled','gimbal_pan_enabled','yolo_overlay_enabled'].forEach(id=>{
+      ['desk_mode','stt_enabled','tts_enabled','gimbal_pan_enabled','yolo_overlay_enabled','reverse_look_behind'].forEach(id=>{
         const cb=document.getElementById(id);
         cb.checked=!!flags[id];
         if(cb.dataset.bound==='1')return;
@@ -530,6 +554,49 @@ DASHBOARD_HTML = """<!doctype html>
       log.scrollTop=log.scrollHeight;
     };
 
+    // LLM Log
+    let llmLastId=0;
+    async function refreshLLMLog(){
+      try{
+        const res=await fetch('/api/llm_log?since='+llmLastId);
+        const entries=await res.json();
+        if(!entries.length)return;
+        const wrap=document.getElementById('llmLog');
+        const countEl=document.getElementById('llmCount');
+        entries.forEach(e=>{
+          if(e.id>llmLastId)llmLastId=e.id;
+          const div=document.createElement('div');
+          div.className='llm-entry';
+          const stamp=new Date(e.ts*1000).toLocaleTimeString();
+          const imgBadge=e.has_image?'<span class="img-badge">IMG</span>':'';
+          const errText=e.error?'<span class="err">ERR</span>':'';
+          const hdr=document.createElement('div');
+          hdr.className='llm-header';
+          hdr.innerHTML=
+              '<span class="role">'+esc(e.role)+'</span>'+
+              '<span class="model">'+esc(e.model)+'</span>'+
+              imgBadge+errText+
+              '<span class="elapsed">'+e.elapsed_s+'s</span>'+
+              '<span class="subtext">'+esc(stamp)+'</span>';
+          const body=document.createElement('div');
+          body.className='llm-body';
+          body.innerHTML=
+              (e.system?'<div class="llm-section"><div class="llm-section-label">System</div><pre>'+esc(e.system)+'</pre></div>':'')+
+              '<div class="llm-section"><div class="llm-section-label">Prompt</div><pre>'+esc(e.prompt)+'</pre></div>'+
+              '<div class="llm-section"><div class="llm-section-label">Response</div><pre>'+esc(e.response||e.error||'(empty)')+'</pre></div>';
+          hdr.onclick=function(){body.classList.toggle('open');};
+          div.appendChild(hdr);
+          div.appendChild(body);
+          wrap.prepend(div);
+        });
+        // Cap displayed entries
+        while(wrap.children.length>60)wrap.removeChild(wrap.lastChild);
+        countEl.textContent=wrap.children.length+' entries';
+      }catch(e){}
+    }
+    refreshLLMLog();
+    setInterval(()=>{if(document.getElementById('llmAutoRefresh').checked)refreshLLMLog();},2000);
+
     refreshStatus();
     refreshTelemetry();
     setInterval(refreshStatus,3000);
@@ -600,6 +667,17 @@ class RoverWebServer:
                             time.sleep(0.12)
                     except (BrokenPipeError, ConnectionResetError):
                         return
+                if self.path == "/api/llm_log" or self.path.startswith("/api/llm_log?"):
+                    since_id = 0
+                    if "?" in self.path:
+                        for part in self.path.split("?", 1)[1].split("&"):
+                            if part.startswith("since="):
+                                try:
+                                    since_id = int(part.split("=", 1)[1])
+                                except ValueError:
+                                    pass
+                    self._send_json(brain.llm_log.entries(since_id))
+                    return
                 if self.path == "/api/events":
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -665,6 +743,10 @@ class RoverWebServer:
                             topological=bool(data.get("topological", True)),
                         )
                     )
+                    self._send_json({"ok": True})
+                    return
+                if self.path == "/api/navigate_vlm":
+                    brain.start_vlm_navigation(data.get("target", ""))
                     self._send_json({"ok": True})
                     return
                 if self.path == "/api/stop":

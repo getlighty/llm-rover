@@ -87,7 +87,10 @@
         "neutral wall color",
         "open corridor layout",
         "narrow corridor layout",
-        "potted plant fixture"
+        "potted plant fixture",
+        "bright overhead lighting",
+        "potted plant",
+        "wooden door frames"
       ],
       "negative_features": [
         "desk",
@@ -124,9 +127,9 @@
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-08 10:26",
-      "visit_count": 52,
-      "last_scene": "Crossed threshold into hallway, stone tiles under wheels, potted plant visible ahead",
+      "last_visited": "2026-03-08 23:27",
+      "visit_count": 54,
+      "last_scene": "Crossed threshold into hallway. Stone tiles under wheels, wooden door frame on sides, potted plant ahead-right, metal shelving unit in background. Bright light from hallway passage.",
       "last_yolo": "door(95%), door(90%), doorway(90%), table(80%), basket(70%), chair(70%), plant pot(60%)"
     },
     {

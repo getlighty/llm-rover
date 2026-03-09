@@ -18,6 +18,7 @@ from pathlib import Path
 from rover_brain_v2.json_utils import as_float, extract_json_dict, clamp
 from rover_brain_v2.models import NavigatorResult, NavigatorTask
 from rover_brain_v2.navigation.depth_vectors import DepthVectorMap
+from rover_brain_v2.navigation.waypoint_follower import ContinuousNavigator
 from rover_brain_v2.prompts import load_prompt, navigation_prompt, scene_prompt
 
 
@@ -27,8 +28,8 @@ DRIVE_COMMAND_REFRESH_S = 0.35
 LEG_SEARCH_ATTEMPTS = 4
 BLOCKED_ESCAPE_REVERSE_M = 0.18
 BLOCKED_ESCAPE_FURNITURE_REVERSE_M = 0.22
-BLOCKED_ESCAPE_MIN_TURN_DEG = 35.0
-BLOCKED_ESCAPE_MAX_TURN_DEG = 65.0
+BLOCKED_ESCAPE_MIN_TURN_DEG = 55.0
+BLOCKED_ESCAPE_MAX_TURN_DEG = 100.0
 AVOID_STEER = 0.13
 DRIVE_CHECK_INTERVAL_S = 0.20
 WALL_CLOSE_FRACTION = 0.60
@@ -121,6 +122,14 @@ class DepthVectorNavigator:
         self._prefetch_executor = ThreadPoolExecutor(max_workers=1)
         self._prefetch_future = None
         self._prefetch_context: dict | None = None
+        self._continuous_nav = ContinuousNavigator(
+            rover=rover,
+            camera=camera,
+            depth_vectors=self.depth_vectors,
+            event_bus=event_bus,
+            flags=flags,
+            config=config,
+        )
         self._navigator_tasks: queue.Queue[NavigatorTask] = queue.Queue()
         self._navigator_results: queue.Queue[NavigatorResult] = queue.Queue()
         self._navigator_result_cache: dict[int, NavigatorResult] = {}
@@ -165,6 +174,7 @@ class DepthVectorNavigator:
         self._scene_repeat_count = 0
         self._steps_in_current_room = 0
         self._current_room_id = ""
+        self._nav_target_room = None
 
     def run_reactive_task(self, target: str, *,
                           plan_context: str = "",
@@ -202,6 +212,24 @@ class DepthVectorNavigator:
             instruction=instruction,
             attempt=attempt,
         )
+        self._navigator_tasks.put(task)
+        return self._wait_for_task_result(task.task_id)
+
+    def run_vlm_guided_task(self, target: str, *,
+                            plan_context: str = "",
+                            max_vlm_cycles: int = 30) -> NavigatorResult:
+        """Continuous VLM-guided navigation using pixel waypoints and pure pursuit.
+
+        Instead of stop-go, the VLM marks pixel waypoints on keyframes and the
+        follower smoothly drives toward them at 10Hz.
+        """
+        self.stop_event.clear()
+        task = self._new_task(
+            mode="vlm_guided",
+            target=target,
+            plan_context=plan_context,
+        )
+        task.instruction = {"max_vlm_cycles": max_vlm_cycles}
         self._navigator_tasks.put(task)
         return self._wait_for_task_result(task.task_id)
 
@@ -265,6 +293,8 @@ class DepthVectorNavigator:
         try:
             if task.mode == "doorway_search":
                 return self._execute_doorway_task(task)
+            if task.mode == "vlm_guided":
+                return self._execute_vlm_guided_task(task)
             reached = self.navigate_reactive(
                 task.target,
                 plan_context=task.plan_context,
@@ -290,8 +320,119 @@ class DepthVectorNavigator:
                 payload={"target": task.target},
             )
 
+    def _execute_vlm_guided_task(self, task: NavigatorTask) -> NavigatorResult:
+        """Continuous depth-reactive navigation with async LLM steering.
+
+        The rover drives immediately using depth and never stops to think.
+        The LLM fires in the background and adjusts steering bias.
+        """
+        self.reset()
+        target = task.target
+        max_cycles = task.instruction.get("max_vlm_cycles", 30)
+        nav = self._continuous_nav
+        stop = self.stop_event
+
+        self.events.publish("nav", f"Continuous nav start: {target}")
+        self._gimbal_center()
+        self._sleep(0.3)
+
+        # Start LLM advisor in background — it sets nav.set_bias() while
+        # the driver loop runs in the foreground.
+        llm_thread = threading.Thread(
+            target=self._llm_advisor_loop,
+            args=(target, stop, nav, max_cycles),
+            daemon=True,
+            name="vlm-advisor",
+        )
+        llm_thread.start()
+
+        # Run 10Hz driver — this blocks until stop or arrived
+        try:
+            arrived = nav.run(stop)
+        except Exception as exc:
+            self.events.publish("error", f"Continuous nav crashed: {exc}")
+            arrived = False
+        finally:
+            stop.set()
+            self.rover.stop()
+            llm_thread.join(timeout=3.0)
+            self._last_scene = nav.scene
+
+        self.events.publish("nav", f"Continuous nav done: arrived={arrived}")
+        return NavigatorResult(
+            task_id=task.task_id,
+            mode="vlm_guided",
+            status="completed" if arrived else "incomplete",
+            summary=f"Continuous: {'arrived' if arrived else 'did not arrive'} at {target}",
+            scene=nav.scene,
+            reached=arrived,
+            payload={"target": target},
+        )
+
+    def _llm_advisor_loop(self, target: str, stop: threading.Event,
+                          nav: ContinuousNavigator, max_cycles: int):
+        """Background LLM thread: periodically captures frame, calls VLM,
+        and sets steering bias.  The driver keeps moving the whole time."""
+        for cycle in range(max_cycles):
+            if stop.is_set():
+                break
+
+            frame = self.camera.snap_with_yolo(max_dim=512, quality=60)
+            if frame is None:
+                time.sleep(1.0)
+                continue
+
+            # Get detection summary without holding the lock long
+            try:
+                with self.camera._lock:
+                    det_summary = self.camera._detection_summary or "none"
+            except Exception:
+                det_summary = "none"
+
+            # Call LLM — this is the slow part (~3-60s depending on provider)
+            # The driver keeps moving the whole time.
+            try:
+                raw = self.llm.complete(
+                    prompt=load_prompt("vlm_waypoints.md",
+                                       target=target,
+                                       detections=det_summary),
+                    system="You are a navigation assistant for a ground rover. Respond with JSON only.",
+                    image_bytes=frame,
+                    max_tokens=200,
+                    temperature=0.2,
+                )
+                data = extract_json_dict(raw)
+            except Exception as exc:
+                self.events.publish("error", f"LLM advisor failed: {exc}")
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            arrived = bool(data.get("arrived", False))
+            scene = str(data.get("scene", ""))
+            confidence = float(data.get("confidence", 0.5))
+
+            # Extract steering target — use first waypoint's x-coordinate
+            pixel_x = None
+            waypoints = data.get("waypoints", [])
+            if waypoints and isinstance(waypoints[0], (list, tuple)) and len(waypoints[0]) >= 2:
+                pixel_x = int(waypoints[0][0])
+
+            nav.set_bias(
+                pixel_x=pixel_x,
+                arrived=arrived,
+                scene=scene,
+                confidence=confidence,
+            )
+
+            if arrived:
+                self.events.publish("nav", f"LLM says arrived at {target}")
+                break
+
     def _execute_doorway_task(self, task: NavigatorTask) -> NavigatorResult:
         instruction = dict(task.instruction or {})
+        self._nav_target_room = instruction.get("target_room") or None
         try:
             plan_ctx = task.plan_context
             if task.attempt > 0:
@@ -493,11 +634,12 @@ class DepthVectorNavigator:
                         self.events.publish("nav", "YOLO depth blocked — recovering")
                         self.rover.stop()
                         self._reverse(0.15)
-                        # Turn away from obstacle, keeping target direction in mind
-                        escape = 45 if pan <= 0 else -45
+                        # Scan for best opening after reversing
+                        escape = self._find_best_escape_turn(pan)
                         self._turn(escape)
+                        self._gimbal_center(spd=600, acc=80)
+                        self._sleep(0.3)
                         pan -= escape * 0.5
-                        time.sleep(0.2)
                         continue
                     if steer_dir == "left":
                         left -= AVOID_STEER
@@ -675,10 +817,6 @@ class DepthVectorNavigator:
         """LLM-driven navigation. LLM sees the image with YOLO overlay + depth
         + detections, decides what to do, rover executes. Simple loop."""
         self.reset()
-        # Summarize prior event history so LLM has context without stale noise
-        prior_summary = self._summarize_prior_events(target)
-        if prior_summary:
-            plan_context = f"{prior_summary} {plan_context}".strip()
         budget = waypoint_budget or self.config.navigation_waypoint_budget
         consecutive_non_drive = 0
         total_rotation_deg = 0.0
@@ -687,6 +825,8 @@ class DepthVectorNavigator:
         # pending_depth_image removed — depth grid is text-based now
         nav_notes: dict = {}
         pending_notes_read: bool = False
+        # Target sighting tracker — remembers where the target was last seen
+        target_sighting: dict | None = None  # {step, pan_deg, scene_snippet, steps_since}
         self.events.publish("nav", f"Reactive nav start: {target}")
         for step in range(budget):
             if self.stop_event.is_set():
@@ -757,6 +897,24 @@ class DepthVectorNavigator:
                         f" CRITICAL: {consecutive_non_drive} non-drive steps! "
                         f"Safest heading is {safest:+.0f}°. Drive NOW or you will waste your budget."
                     )
+
+            # Target sighting bearing hint
+            if target_sighting is not None and target_sighting["steps_since"] > 0:
+                sight = target_sighting
+                # Compute relative bearing: where was it relative to current body rotation
+                bearing_offset = sight["pan_deg"] + (sight["rotation_deg"] - total_rotation_deg)
+                if bearing_offset > 10:
+                    direction = "to your RIGHT"
+                elif bearing_offset < -10:
+                    direction = "to your LEFT"
+                else:
+                    direction = "AHEAD"
+                action_ctx += (
+                    f" BEARING LOCK: You saw the target {sight['steps_since']} step(s) ago "
+                    f"{direction} ({bearing_offset:+.0f}° from current heading). "
+                    f"Scene was: \"{sight['scene_snippet']}\". "
+                    f"Drive toward it! Do NOT wander away."
+                )
 
             # Scene repetition context
             if self._scene_repeat_count >= 3:
@@ -849,6 +1007,23 @@ class DepthVectorNavigator:
             if room_guess:
                 self._update_current_room(room_guess)
 
+            # --- Target sighting tracker ---
+            target_visible = bool(response.get("target_visible"))
+            if target_visible:
+                target_sighting = {
+                    "step": step,
+                    "pan_deg": self._last_gimbal_pan,
+                    "rotation_deg": total_rotation_deg,
+                    "scene_snippet": (scene or "")[:100],
+                    "steps_since": 0,
+                }
+                self.events.publish("nav", f"Target sighted at pan={self._last_gimbal_pan:+.0f}° rotation={total_rotation_deg:+.0f}°")
+            elif target_sighting is not None:
+                target_sighting["steps_since"] += 1
+                if target_sighting["steps_since"] > 6:
+                    self.events.publish("nav", "Target sighting expired (6 steps without re-sighting)")
+                    target_sighting = None
+
             # Build tool list (supports single or chained tools)
             tools = response.get("tools")
             if not tools or not isinstance(tools, list):
@@ -917,8 +1092,9 @@ class DepthVectorNavigator:
                     answer = self._ask_user(question)
                     last_actions.append(f"ask_user('{question[:30]}')->'{answer[:40]}'")
                     if answer:
-                        # Inject answer into action context for next LLM step
-                        plan_context += f" User answered: \"{answer}\""
+                        # Keep only the last user answer, not all of them
+                        plan_context = re.sub(r' User answered: ".*?"', '', plan_context)
+                        plan_context += f' User answered: "{answer}"'
                     continue
 
                 if tool == "check_depth":
@@ -1132,6 +1308,8 @@ class DepthVectorNavigator:
             recent_observations=self._recent_observations,
             yolo_detections=yolo_detections,
             topo_data=topo_data,
+            current_room=self._current_room_id or None,
+            target_room=getattr(self, '_nav_target_room', None),
         )
         try:
             raw = self.llm.complete(
@@ -1312,67 +1490,21 @@ class DepthVectorNavigator:
         if self._goal_recently_seen_steps > 0:
             self._goal_recently_seen_steps -= 1
 
-    def _summarize_prior_events(self, target: str) -> str | None:
-        """Summarize prior event bus history into compact context for a new navigation."""
-        events = self.events.snapshot(limit=200)
-        if len(events) < 5:
-            return None
-        # Filter to nav/error events, format compactly
-        nav_lines = []
-        for ev in events:
-            if ev["cat"] in ("nav", "error", "system"):
-                nav_lines.append(f"[{ev['cat']}] {ev['data']}")
-        if not nav_lines:
-            return None
-        history_text = "\n".join(nav_lines[-60:])
-        try:
-            raw = self.llm.complete(
-                prompt=(
-                    f"You are a rover about to start navigating to: {target}\n"
-                    f"Below is the event log from your previous actions. Summarize what happened, "
-                    f"where you ended up, what obstacles you found, and what you learned. "
-                    f"Keep it to ONE short paragraph (max 150 words). Focus on useful spatial info.\n\n"
-                    f"{history_text}"
-                ),
-                system="Summarize concisely. Plain text only, no JSON.",
-                max_tokens=250,
-            ).strip()
-            if raw and len(raw) > 20:
-                self.events.compact(keep=5)
-                self.events.publish("nav", f"Prior history compacted: {raw[:120]}...")
-                return f"Prior navigation context: {raw}"
-        except Exception as exc:
-            self.events.publish("error", f"Event history summarization failed: {exc}")
-        return None
-
     def _compact_history(self, *, target: str, observations: list[str],
                          actions: list[str], notes: dict,
                          total_rotation: float) -> str | None:
-        """Ask the LLM to summarize navigation history into a compact paragraph."""
-        obs_text = "\n".join(f"- {o}" for o in observations[-8:])
-        act_text = ", ".join(actions[-10:])
-        notes_text = json.dumps(notes, ensure_ascii=False)[:300] if notes else "none"
-        prompt = (
-            f"You are a rover navigating to: {target}\n"
-            f"Summarize your navigation so far into ONE short paragraph (max 200 words).\n"
-            f"Include: where you are now, what you've tried, what worked/didn't, "
-            f"which directions you've checked, what obstacles you found, and your current plan.\n"
-            f"Body rotation so far: {total_rotation:+.0f}°\n"
-            f"Recent observations:\n{obs_text}\n"
-            f"Recent actions: [{act_text}]\n"
-            f"Notes: {notes_text}"
-        )
-        try:
-            raw = self.llm.complete(
-                prompt=prompt,
-                system="Summarize concisely. Plain text only, no JSON.",
-                max_tokens=250,
-            ).strip()
-            if raw and len(raw) > 20:
-                return f"Navigation summary so far: {raw}"
-        except Exception as exc:
-            self.events.publish("error", f"History compaction failed: {exc}")
-        return None
+        """Truncate navigation history to keep context small. No LLM call."""
+        kept_obs = observations[-2:]
+        kept_acts = actions[-3:]
+        kept_notes = {k: v for k, v in list(notes.items())[-3:]} if notes else {}
+        parts = [f"Navigating to {target}. Rotation: {total_rotation:+.0f}°."]
+        if kept_obs:
+            parts.append("Recent: " + "; ".join(kept_obs))
+        if kept_acts:
+            parts.append("Actions: " + ", ".join(kept_acts))
+        if kept_notes:
+            parts.append("Notes: " + json.dumps(kept_notes, ensure_ascii=False)[:200])
+        return " ".join(parts)
 
     def _remember(self, scene: str):
         entry = scene[:160]
@@ -1702,64 +1834,72 @@ class DepthVectorNavigator:
     def _reverse(self, distance_m: float, *, speed: float = 0.12):
         rev_speed = clamp(speed, 0.05, 0.20)
         duration = max(0.3, abs(distance_m) / max(rev_speed, 0.05))
-        # Look behind before reversing — wait for gimbal to reach 180° and camera to refresh
-        self._gimbal_send(180, 0, spd=600, acc=80)
-        self.events.publish("nav", f"Looking behind (pan 180°) before reversing {distance_m:.2f}m at speed={rev_speed:.2f}")
-        # Wait for gimbal to reach 180° (~0.8s at SPD 600) + camera frame refresh
-        self._sleep(1.0)
-        # Analyze what's behind: depth + YOLO
-        rear_depth_map = self.camera.get_depth_map()
-        if rear_depth_map is not None:
-            try:
-                ds = self.depth_vectors.analyze(rear_depth_map)
-                rear_center = ds.center_distance()
-                rear_corridor = ds.closest_corridor_distance() or rear_center
-                self.events.publish("nav", f"Rear depth: center={rear_center:.2f}m, corridor={rear_corridor:.2f}m")
-                stop_m = max(0.05, float(self.config.depth_guard_stop_m))
-                if min(rear_center, rear_corridor) < stop_m:
-                    self.events.publish("nav", f"REAR DEPTH GUARD: obstacle at {min(rear_center, rear_corridor):.2f}m behind, aborting reverse")
-                    self._gimbal_center()
-                    self._sleep(0.6)
-                    return
-            except Exception:
-                pass
-        dets, det_summary, det_age = self.camera.get_detections()
-        if det_age < 2.0 and dets:
-            det_names = [f"{d['name']}({d.get('bh', 0):.0%})" for d in dets[:5]]
-            self.events.publish("nav", f"Rear YOLO: {', '.join(det_names)}")
-            for d in dets:
-                if 0.25 < d.get("cx", 0) < 0.75 and d.get("bh", 0) > 0.4:
-                    self.events.publish("nav", f"YOLO GUARD: {d['name']} behind rover (bh={d['bh']:.0%}), aborting reverse")
-                    self._gimbal_center()
-                    self._sleep(0.6)
-                    return
-        self.events.publish("nav", f"Rear clear, reversing {distance_m:.2f}m")
-        self.rover.send({"T": 1, "L": round(-rev_speed, 3), "R": round(-rev_speed, 3)})
-        # YOLO guard while reversing (gimbal is pointed behind)
-        start = time.time()
-        while time.time() - start < duration:
-            if self.stop_event.is_set():
-                self.rover.stop()
-                return
-            dets, _, det_age = self.camera.get_detections()
-            if det_age < 1.0:
+        look_behind = getattr(self.flags, "reverse_look_behind", False)
+        if look_behind:
+            # Look behind before reversing — wait for gimbal to reach 180° and camera to refresh
+            self._gimbal_send(180, 0, spd=600, acc=80)
+            self.events.publish("nav", f"Looking behind (pan 180°) before reversing {distance_m:.2f}m at speed={rev_speed:.2f}")
+            # Wait for gimbal to reach 180° (~0.8s at SPD 600) + camera frame refresh
+            self._sleep(1.0)
+            # Analyze what's behind: depth + YOLO
+            rear_depth_map = self.camera.get_depth_map()
+            if rear_depth_map is not None:
+                try:
+                    ds = self.depth_vectors.analyze(rear_depth_map)
+                    rear_center = ds.center_distance()
+                    rear_corridor = ds.closest_corridor_distance() or rear_center
+                    self.events.publish("nav", f"Rear depth: center={rear_center:.2f}m, corridor={rear_corridor:.2f}m")
+                    stop_m = max(0.05, float(self.config.depth_guard_stop_m))
+                    if min(rear_center, rear_corridor) < stop_m:
+                        self.events.publish("nav", f"REAR DEPTH GUARD: obstacle at {min(rear_center, rear_corridor):.2f}m behind, aborting reverse")
+                        self._gimbal_center()
+                        self._sleep(1.2)
+                        return
+                except Exception:
+                    pass
+            dets, det_summary, det_age = self.camera.get_detections()
+            if det_age < 2.0 and dets:
+                det_names = [f"{d['name']}({d.get('bh', 0):.0%})" for d in dets[:5]]
+                self.events.publish("nav", f"Rear YOLO: {', '.join(det_names)}")
                 for d in dets:
                     if 0.25 < d.get("cx", 0) < 0.75 and d.get("bh", 0) > 0.4:
-                        self.rover.stop()
-                        self.events.publish("nav", f"YOLO GUARD: {d['name']} behind rover (bh={d['bh']:.0%}), stopping reverse")
+                        self.events.publish("nav", f"YOLO GUARD: {d['name']} behind rover (bh={d['bh']:.0%}), aborting reverse")
                         self._gimbal_center()
-                        self._sleep(0.8)
+                        self._sleep(1.2)
                         return
-            time.sleep(0.05)
+        else:
+            self.events.publish("nav", f"Reversing {distance_m:.2f}m at speed={rev_speed:.2f} (look-behind disabled)")
+        self.rover.send({"T": 1, "L": round(-rev_speed, 3), "R": round(-rev_speed, 3)})
+        if look_behind:
+            # YOLO guard while reversing (gimbal is pointed behind)
+            start = time.time()
+            while time.time() - start < duration:
+                if self.stop_event.is_set():
+                    self.rover.stop()
+                    return
+                dets, _, det_age = self.camera.get_detections()
+                if det_age < 1.0:
+                    for d in dets:
+                        if 0.25 < d.get("cx", 0) < 0.75 and d.get("bh", 0) > 0.4:
+                            self.rover.stop()
+                            self.events.publish("nav", f"YOLO GUARD: {d['name']} behind rover (bh={d['bh']:.0%}), stopping reverse")
+                            self._gimbal_center()
+                            self._sleep(1.2)
+                            return
+                time.sleep(0.05)
+        else:
+            # Simple timed reverse without look-behind
+            start = time.time()
+            while time.time() - start < duration:
+                if self.stop_event.is_set():
+                    self.rover.stop()
+                    return
+                time.sleep(0.05)
         self.rover.stop()
-        # Re-center gimbal after reverse
-        self._gimbal_center()
-        self._sleep(0.6)
-        # Auto-turn toward safest heading based on depth
-        turn_deg = self._reverse_escape_angle()
-        if abs(turn_deg) >= 10:
-            self.events.publish("nav", f"Auto-turning {turn_deg:+.0f}° after reverse to clear path")
-            self._turn(turn_deg)
+        if look_behind:
+            # Re-center gimbal after reverse (was at 180°, needs ~1s at SPD 600)
+            self._gimbal_center()
+            self._sleep(1.2)
 
     def _reverse_escape_angle(self) -> float:
         """Compute a turn angle after reversing based on depth clearance."""
@@ -1893,41 +2033,132 @@ class DepthVectorNavigator:
     def _recover_from_close_obstacle(self, *, drive_angle_deg: float, depth_summary, scene: str) -> bool:
         if self.stop_event.is_set():
             return False
-        plan = self._blocked_escape_plan(
-            drive_angle_deg=drive_angle_deg,
-            depth_summary=depth_summary,
-            scene=scene,
-        )
-        self.events.publish(
-            "nav",
-            f"Blocked recovery: reverse {plan['reverse_distance_m']:.2f}m, "
-            f"turn {plan['turn_degrees']:+.0f}° ({plan['reason']})",
-        )
-        self._reverse(plan["reverse_distance_m"])
+        # Determine reverse distance based on how close the obstacle is
+        stop_threshold = max(0.05, float(self.config.depth_guard_stop_m))
+        center_clear = depth_summary.center_distance() if depth_summary is not None else stop_threshold
+        furniture_trap, _ = self._scene_furniture_trap(scene)
+        reverse_distance = BLOCKED_ESCAPE_REVERSE_M
+        if furniture_trap or center_clear <= stop_threshold * 0.75:
+            reverse_distance = BLOCKED_ESCAPE_FURNITURE_REVERSE_M
+
+        self.events.publish("nav", f"Blocked recovery: reversing {reverse_distance:.2f}m, then scanning for opening")
+        self._reverse(reverse_distance)
         if self.stop_event.is_set():
             return False
-        self._turn(plan["turn_degrees"])
+
+        # After reversing, get FRESH depth from the new position and find the best opening
+        turn_deg = self._find_best_escape_turn(drive_angle_deg)
+        self.events.publish("nav", f"Escape turn: {turn_deg:+.0f}°")
+        self._turn(turn_deg)
+        # Re-send gimbal center after turn (rover.stop() sends T:135 which kills servos)
+        self._gimbal_center()
+        self._sleep(0.3)
+
         if self._goal_target_label:
             self._goal_reacquire_steps = max(self._goal_reacquire_steps, 8)
             self._goal_recently_seen_steps = max(self._goal_recently_seen_steps, 6)
             if self._goal_heading_bias_deg is not None:
-                # Preserve the original goal heading — do NOT blend with escape
-                # turn direction. Flip the sign so reacquire steers back toward
-                # the goal (opposite of the escape turn).
-                escape_sign = 1 if plan["turn_degrees"] >= 0 else -1
+                escape_sign = 1 if turn_deg >= 0 else -1
                 goal_sign = 1 if self._goal_heading_bias_deg >= 0 else -1
-                if escape_sign == goal_sign:
-                    # Escaped in the same direction as the goal — keep heading
-                    pass
-                else:
-                    # Escaped away from goal — boost heading confidence to
-                    # ensure reacquire logic kicks in strongly
+                if escape_sign != goal_sign:
                     self._goal_heading_confidence = max(self._goal_heading_confidence, 0.82)
             else:
-                # No prior heading — use opposite of escape turn as best guess
-                self._goal_heading_bias_deg = clamp(-plan["turn_degrees"] * 0.6, -28.0, 28.0)
+                self._goal_heading_bias_deg = clamp(-turn_deg * 0.6, -28.0, 28.0)
             self._goal_heading_confidence = max(self._goal_heading_confidence, 0.70)
         return not self.stop_event.is_set()
+
+    def _find_best_escape_turn(self, last_drive_angle: float) -> float:
+        """After reversing, scan depth for the widest passable opening.
+
+        Returns a turn angle in degrees toward the best gap.  The depth camera
+        only covers ~65° FOV, so if the best gap is at the frame edge the
+        real opening is probably further out — we extrapolate.  Alternates
+        tie-break direction to avoid always picking the same side.
+        """
+        depth_map = self.camera.get_depth_map()
+        if depth_map is None:
+            turn = float(self._blocked_escape_dir * BLOCKED_ESCAPE_MIN_TURN_DEG)
+            self._blocked_escape_dir *= -1
+            return turn
+
+        try:
+            ds = self.depth_vectors.analyze(depth_map)
+        except Exception:
+            turn = float(self._blocked_escape_dir * BLOCKED_ESCAPE_MIN_TURN_DEG)
+            self._blocked_escape_dir *= -1
+            return turn
+
+        dists = ds.smoothed_distances_m
+        n = len(dists)
+        passable_m = max(0.05, float(self.config.depth_guard_stop_m)) + 0.15
+
+        # Find the widest contiguous gap of passable columns
+        best_start, best_len, best_center = 0, 0, n // 2
+        run_start = None
+        for i, d in enumerate(dists):
+            if d >= passable_m:
+                if run_start is None:
+                    run_start = i
+            else:
+                if run_start is not None:
+                    run_len = i - run_start
+                    if run_len > best_len:
+                        best_len = run_len
+                        best_start = run_start
+                        best_center = run_start + run_len // 2
+                    run_start = None
+        if run_start is not None:
+            run_len = n - run_start
+            if run_len > best_len:
+                best_len = run_len
+                best_start = run_start
+                best_center = run_start + run_len // 2
+
+        if best_len == 0:
+            # Nothing passable in the entire FOV — need a big turn to find open space
+            turn = float(self._blocked_escape_dir * BLOCKED_ESCAPE_MAX_TURN_DEG)
+            self._blocked_escape_dir *= -1
+            self.events.publish("nav", f"No passable gap in FOV, blind escape {turn:+.0f}°")
+            return turn
+
+        # Convert gap center column to heading degrees within FOV
+        # Column 0 = far left (~-32.5°), column n-1 = far right (~+32.5°)
+        center_norm = (best_center - (n - 1) / 2.0) / max((n - 1) / 2.0, 1.0)
+        heading_deg = center_norm * 32.5
+
+        # If the gap touches the frame edge, the real opening extends beyond
+        # what we can see.  Extrapolate outward: the opening is at LEAST at
+        # the FOV edge, probably further.  Add 50% of the edge heading as
+        # extra turn so we actually face the opening.
+        gap_end = best_start + best_len - 1
+        edge_margin = max(1, n // 6)  # ~3 columns for 21-col map
+        at_left_edge = best_start <= edge_margin
+        at_right_edge = gap_end >= n - 1 - edge_margin
+        if at_left_edge and not at_right_edge:
+            # Gap extends off the left edge — turn more left
+            heading_deg = min(heading_deg, -20.0)
+            heading_deg *= 1.5
+        elif at_right_edge and not at_left_edge:
+            # Gap extends off the right edge — turn more right
+            heading_deg = max(heading_deg, 20.0)
+            heading_deg *= 1.5
+
+        # Clamp and enforce minimum
+        turn = clamp(heading_deg, -BLOCKED_ESCAPE_MAX_TURN_DEG, BLOCKED_ESCAPE_MAX_TURN_DEG)
+        if abs(turn) < BLOCKED_ESCAPE_MIN_TURN_DEG:
+            sign = 1.0 if turn >= 0 else -1.0
+            if abs(turn) < 5.0:
+                # Nearly centered gap — use alternating direction
+                sign = float(self._blocked_escape_dir)
+                self._blocked_escape_dir *= -1
+            turn = sign * BLOCKED_ESCAPE_MIN_TURN_DEG
+
+        self.events.publish(
+            "nav",
+            f"Depth scan: gap cols {best_start}-{gap_end} "
+            f"(width={best_len}/{n}), raw={heading_deg:+.1f}° → turn={turn:+.0f}°",
+        )
+        return turn
 
     def _blocked_escape_plan(self, *, drive_angle_deg: float, depth_summary, scene: str) -> dict:
         stop_threshold = max(0.05, float(self.config.depth_guard_stop_m))
@@ -2149,18 +2380,15 @@ class DepthVectorNavigator:
         self._reverse(0.20)
         if self.stop_event.is_set():
             return
-        # Use depth data to pick the more open side instead of stale _last_drive_angle
-        depth_map = self.camera.get_depth_map()
-        if depth_map is not None:
-            try:
-                ds = self.depth_vectors.analyze(depth_map)
-                turn_deg = 90 if ds.recommended_heading_deg > 0 else -90
-            except Exception:
-                turn_deg = -90 if self._last_drive_angle > 0 else 90
-        else:
-            turn_deg = -90 if self._last_drive_angle > 0 else 90
-        self.events.publish("nav", f"Wall recovery: turning {turn_deg:+d}°")
+        # Scan for best opening after reversing
+        turn_deg = self._find_best_escape_turn(self._last_drive_angle)
+        # Wall recovery needs a bigger turn — at least 60°
+        if abs(turn_deg) < 60:
+            turn_deg = 60.0 * (1 if turn_deg >= 0 else -1)
+        self.events.publish("nav", f"Wall recovery: turning {turn_deg:+.0f}°")
         self._turn(turn_deg)
+        self._gimbal_center()
+        self._sleep(0.3)
         if self._goal_target_label:
             self._goal_reacquire_steps = max(self._goal_reacquire_steps, 8)
             self._goal_heading_confidence = max(self._goal_heading_confidence, 0.70)

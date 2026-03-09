@@ -655,3 +655,33 @@
 - 2026-03-08 22:39 Scene is very dark. Activated base and head lights to improve visibility. Tilting camera up slightly to assess surroundings and light sources.
 - 2026-03-08 22:40 Moved forward into corridor. Doorway on right is now clearly visible and accessible. Path ahead is open. Chair is behind me. Ready to proceed through doorway or continue down corridor.
 - 2026-03-08 22:48 Task complete. Rover is positioned in corridor with doorway on right. Lights off to save power. Awaiting next command.
+- 2026-03-08 23:07 Scene is very dark with yellow ambient light. Activated lights to improve visibility. Detected person sitting in office chair on left, shelves and clutter ahead, couch on right. Floor is wooden planks. Assessing safe path forward.
+- 2026-03-08 23:07 Moved forward slightly to get better view of path between chair and shelves. Turning camera left to assess clearance around office chair wheels.
+- 2026-03-08 23:07 User mentioned 'first time necessities' - possibly unpacking or organizing
+- 2026-03-08 23:07 Floor clutter: cables, boxes, chair legs. User seated nearby.
+- 2026-03-08 23:08 Wheels stuck - possible cable entanglement under chassis
+- 2026-03-08 23:08 Human seated in office chair, legs visible at floor level
+- 2026-03-08 23:08 Cable visible near left wheel - possible obstruction source
+- 2026-03-08 23:09 Obstacle ahead: person's foot and cables near floor
+- 2026-03-08 23:09 Moved back 24cm, now checking right side for path
+- 2026-03-08 23:09 Path blocked by basket and cables; turning left to find clear route
+- 2026-03-09 11:23 User mentioned design packages and common items - unclear context
+- 2026-03-09 11:27 Under desk - chair base visible, cables and items on floor
+- 2026-03-09 11:27 Under chair - clear path to left, shelves visible in background
+- 2026-03-09 11:27 Under chair - clear path to right, shelves and items visible in background
+- 2026-03-09 11:28 Under chair - backing out to get clearer view of room
+- 2026-03-09 11:28 Backed out from under chair, room layout now visible
+- 2026-03-09 11:28 Still under chair, need more backward movement to clear the base
+- 2026-03-09 11:28 Under office chair - can see chair base and wheels, room visible beyond
+- 2026-03-09 11:53 Cleared office chair, now in open room with bookshelf and door visible
+- 2026-03-09 11:54 Under office chair, moving toward open room with bookshelf and door visible
+- 2026-03-09 11:54 Under office chair, moving toward open room with bookshelf and door visible
+- 2026-03-09 11:54 Under office chair, moving toward open room with bookshelf and door visible
+- 2026-03-09 11:54 Wheels not responding, possibly stuck under chair or on debris
+- 2026-03-09 11:54 Successfully backed out from under chair, now spinning to reorient
+- 2026-03-09 11:54 Freed from under chair, now navigating toward open room with bookshelf
+- 2026-03-09 11:56 Under chair, moving toward bookshelf and door
+- 2026-03-09 11:56 Wheels not responding, possibly stuck under chair or on debris
+- 2026-03-09 11:56 Under office chair, reversing to clear obstacle
+- 2026-03-09 11:57 Under office chair, reversing to escape
+- 2026-03-09 11:57 Under office chair, spinning to find clear path

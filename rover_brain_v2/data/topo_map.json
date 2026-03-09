@@ -1,6 +1,6 @@
 {
-  "current_room": "hallway",
-  "current_confidence": 0.65,
+  "current_room": "office",
+  "current_confidence": 0.75,
   "nodes": [
     {
       "id": "office",
@@ -115,11 +115,11 @@
             "immediate view of stone tile floor"
           ],
           "inside_room_guess": "hallway",
-          "navigational_hint": "Exit the office through the door where the floor changes to stone tiles and proceed toward the potted plant.",
-          "last_scene": "Crossed threshold into hallway, stone tiles under wheels, potted plant visible ahead",
+          "navigational_hint": "Exit the office through the wooden door frame onto the stone tiles, looking for the potted plant on the immediate right.",
+          "last_scene": "Crossed threshold into hallway. Stone tiles under wheels, wooden door frame on sides, potted plant ahead-right, metal shelving unit in background. Bright light from hallway passage.",
           "confidence": 0.95,
-          "last_observed": "2026-03-08 10:26",
-          "observation_count": 5
+          "last_observed": "2026-03-08 23:27",
+          "observation_count": 6
         },
         "living_room": {
           "to_room": "hallway",
@@ -140,7 +140,7 @@
           "observation_count": 1
         }
       },
-      "observation_count": 5
+      "observation_count": 6
     },
     {
       "id": "hall_kitchen_arch",
@@ -272,18 +272,18 @@
     },
     {
       "a": "hallway",
+      "b": "office_hall_door"
+    },
+    {
+      "a": "hallway",
+      "b": "hall_kitchen_arch"
+    },
+    {
+      "a": "hallway",
       "b": "hall_bathroom_door"
     },
     {
       "a": "hallway",
-      "b": "office_hall_door"
-    },
-    {
-      "a": "hallway",
-      "b": "hall_kitchen_arch"
-    },
-    {
-      "a": "hallway",
       "b": "hall_living_arch"
     },
     {
@@ -300,19 +300,19 @@
     },
     {
       "a": "living_room",
-      "b": "hall_living_arch"
+      "b": "living_dining_pass"
     },
     {
       "a": "living_room",
+      "b": "hall_living_arch"
+    },
+    {
+      "a": "dining",
       "b": "living_dining_pass"
     },
     {
       "a": "dining",
       "b": "kitchen_dining_pass"
-    },
-    {
-      "a": "dining",
-      "b": "living_dining_pass"
     },
     {
       "a": "bathroom",

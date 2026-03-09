@@ -31,6 +31,7 @@ class RuntimeFlags:
     gimbal_pan_enabled: bool = True
     killed: bool = False
     yolo_overlay_enabled: bool = False
+    reverse_look_behind: bool = False
 
 
 @dataclass(slots=True)

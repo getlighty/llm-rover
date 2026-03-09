@@ -59,13 +59,19 @@ def _depth_summary_text(depth_context: dict) -> str:
     return "\n".join(parts)
 
 
-def _house_map_text(topo_data: dict | None) -> str:
-    """Build a concise text description of the house layout for the LLM."""
+def _house_map_text(topo_data: dict | None, *,
+                    current_room: str | None = None,
+                    target_room: str | None = None) -> str:
+    """Build a concise text description of the house layout for the LLM.
+
+    When current_room and target_room are provided, only include those rooms
+    plus 1-hop neighbors to keep the prompt focused.
+    """
     if not topo_data:
         return "no house map available"
     nodes = topo_data.get("nodes", [])
     edges = topo_data.get("edges", [])
-    current_room = topo_data.get("current_room", "unknown")
+    topo_current = current_room or topo_data.get("current_room", "unknown")
 
     rooms = {}
     transitions = {}
@@ -83,24 +89,41 @@ def _house_map_text(topo_data: dict | None) -> str:
             transitions[nid] = f"{n.get('label', nid)} cues=[{cues}] azimuth=[{az_text}] hint={hint}"
 
     # Build adjacency: which rooms connect via which transition
-    connections = []
     edge_map: dict[str, list[str]] = {}
     for e in edges:
         a, b = e.get("a", ""), e.get("b", "")
         edge_map.setdefault(b, []).append(a)
         edge_map.setdefault(a, []).append(b)
 
+    # Determine which rooms to include: current + target + 1-hop neighbors
+    if current_room or target_room:
+        relevant_rooms: set[str] = set()
+        for seed in (topo_current, target_room):
+            if seed and seed in rooms:
+                relevant_rooms.add(seed)
+                # Add 1-hop neighbors (rooms connected via shared transitions)
+                for tid in edge_map.get(seed, []):
+                    for neighbor in edge_map.get(tid, []):
+                        if neighbor in rooms:
+                            relevant_rooms.add(neighbor)
+    else:
+        relevant_rooms = set(rooms.keys())
+
+    # Build connections only for relevant rooms
+    connections = []
     for tid, tdesc in transitions.items():
-        connected_rooms = [r for r in edge_map.get(tid, []) if r in rooms]
+        connected_rooms = [r for r in edge_map.get(tid, []) if r in rooms and r in relevant_rooms]
         if len(connected_rooms) >= 2:
             connections.append(f"  {connected_rooms[0]} <--[{tid}]--> {connected_rooms[1]}: {tdesc}")
         elif connected_rooms:
             connections.append(f"  {connected_rooms[0]} --[{tid}]-->: {tdesc}")
 
-    lines = [f"You are currently in: {current_room}"]
+    lines = [f"You are currently in: {topo_current}"]
     lines.append("Rooms:")
     for rid, rdesc in rooms.items():
-        marker = " (YOU ARE HERE)" if rid == current_room else ""
+        if rid not in relevant_rooms:
+            continue
+        marker = " (YOU ARE HERE)" if rid == topo_current else ""
         lines.append(f"  {rid}: {rdesc}{marker}")
     lines.append("Connections (how rooms link via doorways/passages):")
     lines.extend(connections)
@@ -111,7 +134,9 @@ def navigation_prompt(*, target: str, plan_context: str, leg_hint: str,
                       depth_context: dict, recent_observations: list[str],
                       heuristic_context: str = "",
                       yolo_detections: list[dict] | None = None,
-                      topo_data: dict | None = None) -> str:
+                      topo_data: dict | None = None,
+                      current_room: str | None = None,
+                      target_room: str | None = None) -> str:
     memory = "\n".join(f"- {line}" for line in recent_observations[-4:])
     yolo_text = "none"
     if yolo_detections:
@@ -130,7 +155,8 @@ def navigation_prompt(*, target: str, plan_context: str, leg_hint: str,
         heuristic=heuristic_context or "none",
         depth_text=_depth_summary_text(depth_context),
         yolo_text=yolo_text,
-        house_map=_house_map_text(topo_data),
+        house_map=_house_map_text(topo_data, current_room=current_room,
+                                  target_room=target_room),
         memory=memory or "- none",
     )
 
