@@ -108,6 +108,10 @@ class DepthVectorNavigator:
         self._goal_heading_confidence = 0.0
         self._goal_reacquire_steps = 0
         self._goal_target_label = ""
+        self._last_servo_obstacle = ""
+        # Orchestrator LLM for dot confirmation (set by orchestrator)
+        self.orchestrator_llm = None
+        self._nav_route_context = ""  # full route plan from orchestrator
         self._goal_recently_seen_steps = 0
         self._goal_cue_tokens: set[str] = set()
         self._last_drive_angle: float = 0.0
@@ -182,6 +186,9 @@ class DepthVectorNavigator:
         self._last_scene = ""
         self._last_depth_summary = None
         self._scene_repeat_count = 0
+        self._last_servo_obstacle = ""
+        self.camera.clear_nav_target()
+        self.camera.clear_nav_next_target()
         self._steps_in_current_room = 0
         self._current_room_id = ""
         self._nav_target_room = None
@@ -389,7 +396,7 @@ class DepthVectorNavigator:
             if stop.is_set():
                 break
 
-            frame = self.camera.snap_with_yolo(max_dim=512, quality=60)
+            frame = self.camera.snap(max_dim=512, quality=60)
             if frame is None:
                 time.sleep(1.0)
                 continue
@@ -900,7 +907,7 @@ class DepthVectorNavigator:
             # Inject notes into context if read was requested or notes exist
             notes_ctx = ""
             if pending_notes_read or nav_notes:
-                notes_ctx = f" Your notes: {json.dumps(nav_notes, ensure_ascii=False)[:400]}"
+                notes_ctx = f" Your notes: {json.dumps(nav_notes, ensure_ascii=False)[:800]}"
                 pending_notes_read = False
 
             # Build action history context for LLM
@@ -919,6 +926,15 @@ class DepthVectorNavigator:
                         f" CRITICAL: {consecutive_non_drive} non-drive steps! "
                         f"Safest heading is {safest:+.0f}°. Drive NOW or you will waste your budget."
                     )
+
+            # Blocked bearings summary — tell LLM what directions already failed
+            if blocked_bearings:
+                blocked_list = ", ".join(f"{b:+.0f}°" for b in blocked_bearings[-6:])
+                action_ctx += (
+                    f" BLOCKED DIRECTIONS (do NOT try these again): [{blocked_list}]. "
+                    f"Total {len(blocked_bearings)} blocked attempts. "
+                    f"Pick a DIFFERENT direction far from these bearings."
+                )
 
             # Target sighting bearing hint
             if target_sighting is not None:
@@ -1204,10 +1220,18 @@ class DepthVectorNavigator:
                 if tool == "wheels":
                     lw = clamp(as_float(tc.get("left"), 0), -0.20, 0.20)
                     rw = clamp(as_float(tc.get("right"), 0), -0.20, 0.20)
-                    self.rover.send({"T": 1, "L": round(lw, 3), "R": round(rw, 3)})
-                    last_actions.append(f"wheels(L={lw:.2f},R={rw:.2f})")
-                    if lw != 0 or rw != 0:
+                    if lw > 0 and rw > 0:
+                        avg_speed = (lw + rw) / 2.0
+                        steer_diff = lw - rw
+                        approx_angle = (steer_diff / max(avg_speed, 0.05)) * 30.0
+                        drive_result = self._drive_forward(0.4, approx_angle, speed=avg_speed)
+                        last_actions.append(f"wheels->servo({approx_angle:+.0f}°)={drive_result}")
                         step_drove = True
+                    else:
+                        self.rover.send({"T": 1, "L": round(lw, 3), "R": round(rw, 3)})
+                        last_actions.append(f"wheels(L={lw:.2f},R={rw:.2f})")
+                        if lw != 0 or rw != 0:
+                            step_drove = True
                     continue
 
                 if tool in ("gimbal", "look"):
@@ -1237,6 +1261,16 @@ class DepthVectorNavigator:
                     continue
 
                 if tool == "reverse":
+                    # Guard: suppress excessive reversing
+                    recent_reverses = sum(1 for a in last_actions[-4:] if a.startswith("reverse("))
+                    if recent_reverses >= 2:
+                        self.events.publish("nav", "REVERSE SUPPRESSED — too many reverses, forcing turn instead")
+                        self._turn(90.0 * self._blocked_escape_dir)
+                        total_rotation_deg += 90.0 * self._blocked_escape_dir
+                        self.spatial_map.on_turn(90.0 * self._blocked_escape_dir)
+                        self._blocked_escape_dir *= -1
+                        last_actions.append(f"turn_body(+90°) [reverse suppressed]")
+                        continue
                     dist = clamp(as_float(tc.get("distance"), 0.15), 0.10, 0.25)
                     speed = clamp(as_float(tc.get("speed"), 0.12), 0.12, 0.20)
                     self._reverse(dist, speed=speed)
@@ -1280,11 +1314,29 @@ class DepthVectorNavigator:
                         break
                     if drive_result == "blocked":
                         blocked_bearings.append(total_rotation_deg)
+                        # Auto-log failure so LLM remembers across steps
+                        obstacle_detail = getattr(self, '_last_servo_obstacle', '')
+                        nav_notes[f"blocked_{len(blocked_bearings)}"] = (
+                            f"heading {total_rotation_deg:+.0f}° BLOCKED. {obstacle_detail}"
+                        )
+                        self.spatial_map.add_entry(
+                            label=f"BLOCKED path ({obstacle_detail[:40]})",
+                            bearing_deg=total_rotation_deg,
+                            distance_m=0.25,
+                            feature="obstacle",
+                            source="drive_fail",
+                        )
                         self.events.publish("nav", f"Drive blocked at heading {total_rotation_deg:+.0f}° — LLM will reassess")
                         break
                     if drive_result == "stuck":
                         blocked_bearings.append(total_rotation_deg)
+                        nav_notes[f"stuck_{len(blocked_bearings)}"] = (
+                            f"heading {total_rotation_deg:+.0f}° STUCK"
+                        )
                         self.events.publish("nav", f"Drive stuck at heading {total_rotation_deg:+.0f}° — LLM will reassess")
+                        break
+                    if drive_result == "dot_lost":
+                        self.events.publish("nav", "Dot left frame — LLM will pick new target")
                         break
                     continue
 
@@ -1466,6 +1518,8 @@ class DepthVectorNavigator:
             parts.append(f"Relationship hint: {instruction['relationship_hint']}")
         if instruction.get("verify_features"):
             parts.append("Verify room with: " + ", ".join(instruction["verify_features"][:4]))
+        if instruction.get("next_leg_direction"):
+            parts.append(f"IMPORTANT NEXT STEP: {instruction['next_leg_direction']}")
         return " | ".join(parts)
 
     def _leg_target_phrase(self, instruction: dict) -> str:
@@ -1491,6 +1545,8 @@ class DepthVectorNavigator:
         ]
         if instruction.get("expected_floor"):
             parts.append(f"After crossing, expect {instruction['expected_floor']}.")
+        if instruction.get("next_leg_direction"):
+            parts.append(f"CRITICAL: {instruction['next_leg_direction']}")
         return " ".join(parts)
 
     def _begin_leg_goal_tracking(self, instruction: dict, immediate_target: str):
@@ -2112,64 +2168,179 @@ class DepthVectorNavigator:
             self._turn(25 if (self._scan_index % 2 == 0) else -25)
             self._scan_index += 1
 
+    # ── Visual servo constants ──
+    SERVO_HZ = 10.0
+    SERVO_MAX_STEER = 0.10
+    SERVO_TIMEOUT_S = 15.0
+
     def _drive_forward(self, distance_m: float, drive_angle_deg: float, *, speed: float | None = None) -> str:
-        """Drive forward with hard depth guard before sending wheel commands."""
-        # ALWAYS center gimbal before driving — no exceptions
+        """Drive toward a visual target using optical-flow tracked dot.
+
+        1. LLM picks exact floor pixel to drive toward
+        2. LLM checks if path line is clear
+        3. Center dot in frame (gimbal 0, body turn, tilt down)
+        4. 10Hz local servo toward the dot (prefetches next dot in background)
+        5. Dot leaves frame or reached → chain to prefetch or return
+        """
         old_pan = self._last_gimbal_pan
         self._gimbal_center(spd=800, acc=80)
         if abs(old_pan) > 5:
-            wait_s = max(0.3, abs(old_pan) * 0.006)
-            self._sleep(wait_s)
-            self.events.publish("nav", f"Gimbal centered from {old_pan:+.0f}° before drive")
-        # Hard depth guard: refuse to drive into obstacles
-        steer = self._depth_steer_check(drive_angle_deg)
-        if steer == "blocked":
-            self.events.publish("nav", "DEPTH GUARD: blocked at center, refusing drive")
+            self._sleep(max(0.3, abs(old_pan) * 0.006))
+
+        steer_check = self._depth_steer_check(drive_angle_deg)
+        if steer_check == "blocked":
+            self.events.publish("nav", "DEPTH GUARD: blocked, refusing drive")
             return "blocked"
-        # Snap before driving for stuck detection
-        snap_before = self.camera.get_jpeg()
+
+        # ── Step 1: LLM picks floor target pixel ──
+        target_x, target_y = self._llm_pick_floor_target(drive_angle_deg)
+        if target_x is None:
+            return "blocked"
+
+        # ── Step 2: Place dot, then LLM confirms it's safe ──
+        self.camera.set_nav_target(target_x, target_y)
+        self._sleep(0.25)
+        if not self._confirm_dot_placement(target_x, target_y):
+            self.camera.clear_nav_target()
+            self.events.publish("nav",
+                f"Dot ({target_x},{target_y}) rejected — retrying")
+            # One retry with LLM picking a new point
+            target_x, target_y = self._llm_pick_floor_target(drive_angle_deg)
+            if target_x is None:
+                return "blocked"
+            self.camera.set_nav_target(target_x, target_y)
+            self._sleep(0.25)
+            if not self._confirm_dot_placement(target_x, target_y):
+                self.camera.clear_nav_target()
+                self.events.publish("nav", "Both dot placements rejected")
+                return "blocked"
+
+        drive_angle_deg = ((target_x / 640.0) - 0.5) * 65.0
+
+        # ── Step 3: Center dot in frame ──
+        self._center_dot_in_frame(drive_angle_deg)
+
+        # ── Step 4: 10Hz servo loop ──
         base_speed = speed if speed is not None else self.config.navigation_drive_speed
-        duration = distance_m / max(base_speed, 0.05)
-        steer = clamp(drive_angle_deg / 60.0, -1.0, 1.0) * base_speed * 0.8
-        left = base_speed + steer
-        right = base_speed - steer
-        self.events.publish("nav", f"Driving {distance_m:.2f}m at {drive_angle_deg:+.0f}° speed={base_speed:.2f}")
-        self.rover.send({"T": 1, "L": round(left, 3), "R": round(right, 3)})
+        interval = 1.0 / self.SERVO_HZ
+        self.events.publish("nav", f"Servo driving — angle={drive_angle_deg:+.0f}°")
+        snap_before = self.camera.get_jpeg()
         start = time.time()
-        last_depth_check = 0.0
-        while time.time() - start < duration:
+        dot_cx, dot_cy = 0.5, 0.0  # Initialize before loop
+
+        while time.time() - start < self.SERVO_TIMEOUT_S:
+            t0 = time.time()
             if self.stop_event.is_set():
                 self.rover.stop()
+                self.camera.clear_nav_target()
+                self.camera.clear_nav_next_target()
                 return "aborted"
-            # Real-time collision guard: check every ~200ms while driving
-            # Only use center_distance (not corridor, which picks up floor noise)
-            now = time.time()
-            if now - last_depth_check >= 0.20:
-                last_depth_check = now
-                depth_map = self.camera.get_depth_map()
-                if depth_map is not None:
-                    try:
-                        ds = self.depth_vectors.analyze(depth_map)
-                        center_d = ds.center_distance()
-                        if center_d < 0.15:
+
+            # ── Continuous depth guard (every frame) ──
+            # Check 3 zones: center, dot direction, and full corridor
+            depth_map = self.camera.get_depth_map()
+            if depth_map is not None:
+                h, w = depth_map.shape[:2]
+                dmax = float(depth_map[:int(h * 0.88)].max())
+                if dmax > 1e-6:
+                    r = 15
+                    # Zone 1: center of frame (straight ahead)
+                    cy1, cx1 = int(h * 0.6), w // 2
+                    p1 = depth_map[max(0,cy1-r):min(h,cy1+r), max(0,cx1-r):min(w,cx1+r)]
+                    center_close = float(p1.mean()) / dmax if p1.size else 0
+
+                    # Zone 2: at the dot position (where we're steering)
+                    dot_close = 0.0
+                    if dot_cx is not None and dot_cy is not None and dot_cx > 0:
+                        cx2 = int(dot_cx * w)
+                        cy2 = int(min(dot_cy, 0.75) * h)
+                        p2 = depth_map[max(0,cy2-r):min(h,cy2+r), max(0,cx2-r):min(w,cx2+r)]
+                        dot_close = float(p2.mean()) / dmax if p2.size else 0
+
+                    # Zone 3: wide band across steering direction
+                    band_y = int(h * 0.55)
+                    band = depth_map[band_y-10:band_y+10, :]
+                    band_close = float(band.mean()) / dmax if band.size else 0
+
+                    worst = max(center_close, dot_close, band_close)
+                    if worst > 0.85:
+                        zone = "center" if center_close == worst else "dot" if dot_close == worst else "band"
+                        self.rover.send({"T": 1, "L": 0, "R": 0})
+                        self.rover.stop()
+                        self.camera.clear_nav_target()
+                        self.camera.clear_nav_next_target()
+                        # Get directional info for LLM
+                        left_band = depth_map[band_y-10:band_y+10, :w//3]
+                        right_band = depth_map[band_y-10:band_y+10, 2*w//3:]
+                        left_close = float(left_band.mean()) / dmax if left_band.size else 0
+                        right_close = float(right_band.mean()) / dmax if right_band.size else 0
+                        clear_side = "left" if left_close < right_close else "right"
+                        self._last_servo_obstacle = (
+                            f"Very close object ({zone} zone, {worst:.0%} closeness). "
+                            f"Clearer side: {clear_side}.")
+                        self.events.publish("nav", f"SERVO STOP: {self._last_servo_obstacle}")
+                        return "blocked"
+
+                    # Slow down when getting close (70-85% closeness)
+                    if worst > 0.70:
+                        base_speed = min(base_speed, 0.10)
+
+            dot = self.camera.get_nav_dot()
+            dot_cx = dot[0] if dot else 0.5
+            dot_cy = dot[1] if dot else 0.0
+
+            if dot is None:
+                self.rover.stop()
+                self.camera.clear_nav_target()
+                self.events.publish("nav", "Dot left frame")
+                self._frame_unchanged_count = 0
+                return "dot_lost"
+
+            if dot_cy >= 0.80:
+                self.rover.stop()
+                self.camera.clear_nav_target()
+                self.events.publish("nav", "Reached target — stopping")
+                self._frame_unchanged_count = 0
+                return "ok"
+
+            # Depth-based arrival check
+            if depth_map is not None:
+                try:
+                    h, w = depth_map.shape[:2]
+                    px, py = int(dot_cx * w), int(dot_cy * h)
+                    r = 10
+                    patch = depth_map[max(0,py-r):min(h,py+r), max(0,px-r):min(w,px+r)]
+                    if patch.size > 0:
+                        dmax = float(depth_map[:int(h*0.88)].max())
+                        if dmax > 0 and float(patch.mean()) / dmax > 0.85:
                             self.rover.stop()
-                            self.events.publish("nav", f"DEPTH GUARD: obstacle at {center_d:.2f}m while driving, emergency stop")
-                            return "blocked"
-                    except Exception:
-                        pass
-            time.sleep(0.05)
+                            self.camera.clear_nav_target()
+                            self.camera.clear_nav_next_target()
+                            self.events.publish("nav", "Target very close — stopping")
+                            self._frame_unchanged_count = 0
+                            return "ok"
+                except Exception:
+                    pass
+
+            # Steer toward dot
+            err_x = dot_cx - 0.5
+            steer = clamp(err_x * base_speed * 3.0, -self.SERVO_MAX_STEER, self.SERVO_MAX_STEER)
+            left = max(0.0, min(base_speed * 1.3, base_speed + steer))
+            right = max(0.0, min(base_speed * 1.3, base_speed - steer))
+            self.rover.send({"T": 1, "L": round(left, 3), "R": round(right, 3)})
+
+            elapsed = time.time() - t0
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+
+        # Timeout
         self.rover.stop()
-        # Image-based stuck detection: if frame barely changed, we didn't move
+        self.camera.clear_nav_target()
+        self.camera.clear_nav_next_target()
         snap_after = self.camera.get_jpeg()
         if snap_before and snap_after and self._frames_similar(snap_before, snap_after, threshold=0.05):
             self._frame_unchanged_count += 1
-            self.events.publish(
-                "nav",
-                f"STUCK detected: image changed <5% after drive "
-                f"(streak={self._frame_unchanged_count})",
-            )
             if self._frame_unchanged_count >= 2:
-                self.events.publish("nav", "Auto-reversing after repeated stuck detection")
                 self._reverse(0.15)
                 self._frame_unchanged_count = 0
             return "stuck"
@@ -2704,6 +2875,166 @@ class DepthVectorNavigator:
         if self._prefetch_future is not None:
             self._prefetch_future.cancel()
             self._prefetch_future = None
+
+    def _llm_pick_floor_target(self, hint_angle_deg: float) -> tuple:
+        """Ask the LLM to pick an exact pixel on the driveable floor.
+
+        Provides spatial map context and blocked history so the LLM
+        picks a strategic target toward the doorway, not random open space.
+        """
+        frame = self.camera.snap(max_dim=512, quality=60)
+        if frame is None:
+            x = int(320 + (hint_angle_deg / 32.5) * 320)
+            return (max(20, min(620, x)), 320)
+        target_label = getattr(self, '_goal_target_label', '') or 'the exit'
+        obstacle_info = getattr(self, '_last_servo_obstacle', '')
+
+        # Build spatial context for the LLM
+        map_text = self.spatial_map.to_prompt_text()
+        door_text = self.spatial_map.door_summary()
+
+        prompt = (
+            f"You are a ground rover navigating toward: {target_label}\n"
+            f"Suggested heading: {hint_angle_deg:+.0f}° from center.\n"
+        )
+        if door_text:
+            prompt += f"DOORWAY LOCATIONS: {door_text}\n"
+        if obstacle_info:
+            prompt += f"LAST OBSTACLE: {obstacle_info}\n"
+        prompt += (
+            f"\n{map_text}\n\n"
+            f"Look at this 640x480 image. Pick ONE point on the WIDEST CLEAR "
+            f"FLOOR PATH that leads toward the doorway/exit.\n\n"
+            f"CRITICAL RULES:\n"
+            f"- Pick a point in the CENTER of the widest open corridor, NOT near walls/furniture\n"
+            f"- The point must be on a path TOWARD THE DOORWAY, not just any open space\n"
+            f"- If you see the doorway/exit, pick a point on the floor LEADING TO IT\n"
+            f"- AVOID directions marked BLOCKED in the spatial map\n"
+            f"- Stay far from walls, bags, baskets, furniture edges\n"
+            f"- y should be 250-380 (floor area)\n"
+            f"- If no safe path toward the exit exists, set safe=false\n\n"
+            f"Respond with ONLY JSON:\n"
+            f'{{"x": 320, "y": 320, "safe": true, "reason": "wide corridor toward doorway"}}'
+        )
+        try:
+            raw = self.llm.complete(
+                prompt=prompt,
+                system="You are a floor target picker. Respond with JSON only.",
+                image_bytes=frame, max_tokens=80, temperature=0.2,
+            )
+            data = extract_json_dict(raw)
+            if isinstance(data, dict):
+                if not bool(data.get("safe", True)):
+                    self.events.publish("nav", f"LLM: no safe floor target — {data.get('reason','')}")
+                    return (None, None)
+                x = max(20, min(620, int(data.get("x", 320))))
+                y = max(200, min(380, int(data.get("y", 320))))
+                self.events.publish("nav", f"LLM floor target: ({x},{y}) — {data.get('reason','')}")
+                return (x, y)
+        except Exception as exc:
+            self.events.publish("error", f"LLM floor target failed: {exc}")
+        x = int(320 + (hint_angle_deg / 32.5) * 320)
+        return (max(20, min(620, x)), 320)
+
+    def _check_path_depth(self, target_x: int, target_y: int) -> bool:
+        """Ask the LLM if the path line from rover to target is clear."""
+        self.camera.set_nav_target(target_x, target_y)
+        self._sleep(0.15)
+        frame = self.camera.snap(max_dim=512, quality=60)
+        self.camera.clear_nav_target()
+        if frame is None:
+            return False
+        prompt = (
+            f"A red line is drawn from bottom center to a red dot at ({target_x},{target_y}).\n"
+            f"Does the line cross ANY obstacle (furniture, wall, basket, cable)?\n"
+            f"Floor texture changes are OK.\n\n"
+            f"Respond with ONLY JSON:\n"
+            f'{{"clear": true, "reason": "open floor"}}\n'
+            f'{{"clear": false, "reason": "crosses chair leg"}}'
+        )
+        try:
+            raw = self.llm.complete(
+                prompt=prompt,
+                system="You are a path safety checker. Respond with JSON only.",
+                image_bytes=frame, max_tokens=60, temperature=0.1,
+            )
+            data = extract_json_dict(raw)
+            if isinstance(data, dict):
+                clear = bool(data.get("clear", True))
+                self.events.publish("nav", f"Path check: clear={clear}, {data.get('reason','')}")
+                return not clear
+        except Exception as exc:
+            self.events.publish("error", f"Path check failed: {exc}")
+        return False
+
+    def _confirm_dot_placement(self, dot_x: int, dot_y: int) -> bool:
+        """Ask the orchestrator LLM to verify the dot is strategic and safe.
+
+        The orchestrator LLM knows the full route plan and can judge if
+        the target actually leads toward the destination, not just any
+        open space.
+        """
+        llm = self.orchestrator_llm or self.llm
+        frame = self.camera.snap(max_dim=512, quality=60)
+        if frame is None:
+            return True
+
+        target_label = getattr(self, '_goal_target_label', '') or 'the exit'
+        route_ctx = self._nav_route_context or f"Navigate toward {target_label}"
+        door_text = self.spatial_map.door_summary()
+
+        prompt = (
+            f"ROUTE PLAN: {route_ctx}\n"
+            f"TARGET: {target_label}\n"
+        )
+        if door_text:
+            prompt += f"KNOWN DOORS: {door_text}\n"
+        prompt += (
+            f"\nA red dot is placed at ({dot_x},{dot_y}) on this 640x480 image. "
+            f"The rover will drive toward this dot.\n\n"
+            f"Check:\n"
+            f"1. Is the dot on DRIVEABLE FLOOR? (not on wall, furniture, bag, basket)\n"
+            f"2. Does driving toward this dot make PROGRESS toward the target room/doorway?\n"
+            f"   (reject if it leads away from the exit or into a dead end)\n\n"
+            f"Respond with ONLY JSON:\n"
+            f'{{"safe": true, "reason": "floor, leads toward doorway"}}\n'
+            f'{{"safe": false, "reason": "dot is on bag, not toward exit"}}'
+        )
+        try:
+            raw = llm.complete(
+                prompt=prompt,
+                system="You are a navigation route checker. Respond with JSON only.",
+                image_bytes=frame, max_tokens=60, temperature=0.1,
+            )
+            data = extract_json_dict(raw)
+            if isinstance(data, dict):
+                safe = bool(data.get("safe", True))
+                reason = data.get("reason", "")
+                self.events.publish("nav", f"Dot confirm: safe={safe}, {reason}")
+                return safe
+        except Exception as exc:
+            self.events.publish("error", f"Dot confirmation failed: {exc}")
+        return True
+
+    def _center_dot_in_frame(self, drive_angle_deg: float):
+        """Center the tracked dot: gimbal 0 → body turn → tilt down."""
+        self._gimbal_center(spd=800, acc=80)
+        self._sleep(1.0)
+        if abs(drive_angle_deg) > 3.0:
+            self.events.publish("nav", f"Centering: body turn {drive_angle_deg:+.0f}°")
+            self._turn(drive_angle_deg)
+            self._sleep(0.3)
+        self._gimbal_send(0, -15, spd=600, acc=80)
+        self._sleep(0.4)
+        dot = self.camera.get_nav_dot()
+        if dot is not None:
+            dot_cx, dot_cy = dot
+            self.events.publish("nav", f"Dot centered at ({dot_cx:.2f}, {dot_cy:.2f})")
+            err_x = dot_cx - 0.5
+            if abs(err_x) > 0.15:
+                correction = clamp(err_x * 65.0, -20.0, 20.0)
+                self._turn(correction)
+                self._sleep(0.2)
 
     def _sleep(self, seconds: float):
         end = time.time() + max(seconds, 0.0)

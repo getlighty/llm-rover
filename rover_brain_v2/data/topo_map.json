@@ -1,6 +1,6 @@
 {
-  "current_room": "kitchen",
-  "current_confidence": 0.65,
+  "current_room": "office",
+  "current_confidence": 0.9,
   "nodes": [
     {
       "id": "office",
@@ -94,6 +94,11 @@
         "yellow wall on right after entry",
         "plant pot straight ahead through hallway"
       ],
+      "azimuth_from": {
+        "office": 0,
+        "hallway": 180,
+        "living_room": -30
+      },
       "nav_hints": "Move forward through the doorway where wood meets stone.",
       "semantic_views": {
         "office": {
@@ -115,32 +120,56 @@
             "immediate view of stone tile floor"
           ],
           "inside_room_guess": "hallway",
-          "navigational_hint": "Exit the office through the wooden door where the floor changes to stone tiles and head toward the potted plant.",
-          "last_scene": "Crossed threshold onto stone tiles, wooden door frame on left, bright hallway ahead with potted plant visible.",
+          "navigational_hint": "Exit the office through the open archway where the floor changes to stone tiles, looking for a potted plant on your immediate left.",
+          "last_scene": "Crossed threshold onto stone tiles, potted plant visible ahead-left in hallway.",
           "confidence": 0.95,
-          "last_observed": "2026-03-09 12:37",
-          "observation_count": 7
+          "last_observed": "2026-03-10 17:34",
+          "observation_count": 12
         },
         "living_room": {
           "to_room": "hallway",
           "doorway_landmarks": [
             "arched doorway from living room side",
-            "parquet flooring leading into arch"
+            "parquet flooring leading into arch",
+            "wide archway without a door",
+            "distinct floor material change",
+            "flanked by living room seating area"
           ],
           "inside_features": [
             "stone tile floor begins immediately inside",
             "yellow wall on right after entry",
-            "plant pot straight ahead through hallway"
+            "plant pot straight ahead through hallway",
+            "immediate view of stone tiles",
+            "straight path forward",
+            "walls converging slightly"
           ],
           "inside_room_guess": "hallway",
-          "navigational_hint": "From living room, take the arched doorway with parquet floor; stone tiles begin just inside.",
-          "last_scene": "The rover is on a wooden parquet floor, facing an arched doorway. Through the arch, there is a hallway with stone tiles, yellow walls, and a plant pot visible in the distance. A desk leg is to the left.",
-          "confidence": 0.85,
-          "last_observed": "2026-03-06 21:55",
+          "navigational_hint": "From the living room, aim for the wide archway where the carpet ends and stone tiles begin.",
+          "last_scene": "Crossed into hallway, stone tiles under wheels, archway behind",
+          "confidence": 0.95,
+          "last_observed": "2026-03-10 14:22",
+          "observation_count": 2
+        },
+        "hallway": {
+          "to_room": "office",
+          "doorway_landmarks": [
+            "doorway leading into room with wooden floor",
+            "visible desk and monitor through opening"
+          ],
+          "inside_features": [
+            "wooden floor immediately inside",
+            "desk with monitor straight ahead",
+            "office chair near desk"
+          ],
+          "inside_room_guess": "office",
+          "navigational_hint": "From the hallway, locate the doorway revealing a wooden floor and a desk with a monitor directly inside.",
+          "last_scene": "Inside office - wooden floor, desk with monitor, office chair visible ahead. Target reached.",
+          "confidence": 0.95,
+          "last_observed": "2026-03-10 10:55",
           "observation_count": 1
         }
       },
-      "observation_count": 7
+      "observation_count": 12
     },
     {
       "id": "hall_kitchen_arch",
@@ -159,7 +188,8 @@
         "refrigerator immediately to the left"
       ],
       "azimuth_from": {
-        "hallway": 90
+        "hallway": 90,
+        "kitchen": -90
       },
       "width_m": 1.0,
       "nav_hints": "Turn right in the hallway. Look for the orange arched doorway.",
@@ -183,14 +213,39 @@
             "stainless steel countertop (right side)"
           ],
           "inside_room_guess": "kitchen",
-          "navigational_hint": "Proceed through the archway where the floor changes to tile and appliances become visible.",
-          "last_scene": "Inside kitchen, tiled floor visible, appliances nearby",
+          "navigational_hint": "Proceed through the wide archway where the floor changes to tile and a plant is visible on the immediate right.",
+          "last_scene": "Inside kitchen, tiled floor, people standing ahead, plant and shelf on right",
           "confidence": 0.98,
-          "last_observed": "2026-03-09 18:02",
-          "observation_count": 6
+          "last_observed": "2026-03-10 17:35",
+          "observation_count": 11
+        },
+        "kitchen": {
+          "to_room": "hallway",
+          "doorway_landmarks": [
+            "distinctive orange arch",
+            "change in floor texture to stone tiles",
+            "orange painted arch",
+            "stone tile floor begins at arch threshold",
+            "arch is open (no door)",
+            "visible from kitchen as a distinct orange-framed opening"
+          ],
+          "inside_features": [
+            "stone tile floor immediately visible",
+            "straight path ahead",
+            "orange arch framing the entry",
+            "stone tile floor immediately underfoot",
+            "hallway corridor extending forward",
+            "orange arch visible in peripheral/rear view upon entry"
+          ],
+          "inside_room_guess": "hallway",
+          "navigational_hint": "From the kitchen, aim for the orange arch \u2014 it is an open archway leading directly into the stone-tiled hallway; continue forward through the arch to proceed toward the living room.",
+          "last_scene": "Stone tiles, orange arch \u2014 hallway reached",
+          "confidence": 0.95,
+          "last_observed": "2026-03-10 12:34",
+          "observation_count": 2
         }
       },
-      "observation_count": 6
+      "observation_count": 11
     },
     {
       "id": "hall_living_arch",
@@ -202,7 +257,8 @@
         "couch visible through opening"
       ],
       "azimuth_from": {
-        "hallway": -90
+        "hallway": -90,
+        "living_room": 90
       },
       "width_m": 1.0,
       "nav_hints": "Turn left in the hallway. Look for the arch with wooden floor beyond."
@@ -216,7 +272,8 @@
         "dining table visible"
       ],
       "azimuth_from": {
-        "kitchen": 0
+        "kitchen": 0,
+        "dining": 180
       },
       "width_m": 1.2,
       "nav_hints": "Straight through the kitchen."
@@ -230,7 +287,8 @@
         "dining table visible"
       ],
       "azimuth_from": {
-        "living_room": 90
+        "living_room": 90,
+        "dining": -90
       },
       "width_m": 1.2,
       "nav_hints": "Through the opening on the right."
@@ -259,7 +317,8 @@
         "toilet visible"
       ],
       "azimuth_from": {
-        "hallway": 0
+        "hallway": 0,
+        "bathroom": 180
       },
       "width_m": 0.7,
       "nav_hints": "Look for the bathroom door in the hallway."
@@ -276,11 +335,11 @@
     },
     {
       "a": "hallway",
-      "b": "hall_kitchen_arch"
+      "b": "hall_living_arch"
     },
     {
       "a": "hallway",
-      "b": "hall_living_arch"
+      "b": "hall_kitchen_arch"
     },
     {
       "a": "hallway",
@@ -288,11 +347,11 @@
     },
     {
       "a": "kitchen",
-      "b": "hall_kitchen_arch"
+      "b": "kitchen_dining_pass"
     },
     {
       "a": "kitchen",
-      "b": "kitchen_dining_pass"
+      "b": "hall_kitchen_arch"
     },
     {
       "a": "living_room",
@@ -300,19 +359,19 @@
     },
     {
       "a": "living_room",
-      "b": "living_dining_pass"
-    },
-    {
-      "a": "living_room",
       "b": "office_hall_door"
     },
     {
-      "a": "dining",
+      "a": "living_room",
       "b": "living_dining_pass"
     },
     {
       "a": "dining",
       "b": "kitchen_dining_pass"
+    },
+    {
+      "a": "dining",
+      "b": "living_dining_pass"
     },
     {
       "a": "bathroom",

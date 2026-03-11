@@ -16,6 +16,7 @@ from rover_brain_v2.providers.tts.groq import GroqTextToSpeech
 from rover_brain_v2.providers.vision.anthropic import AnthropicVisionClient
 from rover_brain_v2.providers.vision.llamacpp import LlamaCppVisionClient
 from rover_brain_v2.providers.vision.ollama import OllamaVisionClient
+from rover_brain_v2.providers.vision.inception import InceptionVisionClient
 from rover_brain_v2.providers.vision.openai_compat import OpenAICompatVisionClient
 
 
@@ -27,6 +28,7 @@ AVAILABLE_VLMS = [
     "ollama/qwen3-vl:2b",
     "ollama/ministral-3:14b-cloud",
     "ollama/gemma3:27b-cloud",
+    "ollama/glm-5:cloud",
     "groq/meta-llama/llama-4-scout-17b-16e-instruct",
     "groq/meta-llama/llama-4-maverick-17b-128e-instruct",
     "xai/grok-4-1-fast-reasoning",
@@ -34,6 +36,11 @@ AVAILABLE_VLMS = [
     "anthropic/claude-sonnet-4-6",
     "anthropic/claude-sonnet-4-20250514",
     "anthropic/claude-haiku-4-5-20251001",
+    "inception/mercury-2",
+    "inception/mercury-coder",
+    "gemini/gemini-3.1-pro-preview",
+    "gemini/gemini-2.5-flash",
+    "gemini/gemini-2.5-flash-lite",
     "llama.cpp/qwen3-vl:2b",
 ]
 
@@ -137,6 +144,15 @@ class ProviderRegistry:
                 model=model,
                 url="https://api.x.ai/v1/chat/completions",
                 api_key_env="XAI_API_KEY",
+            )
+        elif provider == "inception":
+            client = InceptionVisionClient(model=model)
+        elif provider == "gemini":
+            client = OpenAICompatVisionClient(
+                provider_name="gemini",
+                model=model,
+                url="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                api_key_env="GEMINI_API_KEY",
             )
         elif provider == "llama.cpp":
             client = LlamaCppVisionClient(model=model)

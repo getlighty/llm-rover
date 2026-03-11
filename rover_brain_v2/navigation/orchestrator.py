@@ -21,6 +21,13 @@ from rover_brain_v2.prompts import load_prompt, room_reorg_prompt, scene_prompt
 LEG_RETRY_ATTEMPTS = 4
 
 
+def _ra(room, key, default=""):
+    """Get room attribute whether room is a dict or an object."""
+    if isinstance(room, dict):
+        return room.get(key, default)
+    return getattr(room, key, default)
+
+
 class GraphNavigationOrchestrator:
     def __init__(self, *, llm_client, navigator, event_bus):
         self.llm = llm_client
@@ -219,7 +226,8 @@ class GraphNavigationOrchestrator:
                     payload={"legs": leg_history},
                 )
             leg = legs[leg_index]
-            instruction = self.topo.leg_instruction(leg)
+            next_leg = legs[leg_index + 1] if leg_index + 1 < len(legs) else None
+            instruction = self.topo.leg_instruction(leg, next_leg=next_leg)
             self.events.publish(
                 "plan",
                 f"Leg {leg_index + 1}/{len(legs)}: {leg.from_room} -> {leg.to_room} via {leg.transition}",
@@ -300,14 +308,84 @@ class GraphNavigationOrchestrator:
             payload={"legs": leg_history},
         )
 
+    def _visual_guidance(self, leg, instruction: dict, route_plan: str,
+                         attempt_scenes: list[str]) -> str:
+        """Ask the LLM to look at the camera and describe where the target is.
+
+        Returns a visual guidance string to prepend to the navigator's context.
+        """
+        frame = self.navigator.camera.snap(max_dim=512, quality=60)
+        if frame is None:
+            return ""
+
+        target_room = instruction.get("target_room", leg.to_room)
+        transition = leg.transition
+        visual_cues = instruction.get("visual_cues", [])
+        cues_text = ", ".join(visual_cues[:4]) if visual_cues else "unknown"
+
+        history_text = ""
+        if attempt_scenes:
+            history_text = "\nPrevious attempts saw: " + "; ".join(
+                s[:80] for s in attempt_scenes[-3:] if s)
+
+        prompt = (
+            f"You are guiding a ground rover. Look at this camera image.\n\n"
+            f"FULL ROUTE PLAN: {route_plan}\n"
+            f"CURRENT LEG: {leg.from_room} → {leg.to_room} via '{transition}'\n"
+            f"VISUAL CUES for doorway: {cues_text}\n"
+            f"{history_text}\n\n"
+            f"Answer these questions about what you see RIGHT NOW:\n"
+            f"1. Where is the doorway/exit to {target_room}? (left, center, right, not visible)\n"
+            f"2. What obstacles are between the rover and the doorway?\n"
+            f"3. What is the best path to reach the doorway from here?\n"
+            f"4. Approximate angle to the doorway (-90=far left, 0=center, +90=far right)?\n\n"
+            f"Respond with ONLY JSON:\n"
+            f'{{"direction": "center-right", "angle_deg": 30, '
+            f'"obstacles": "dining chair, pet basket", '
+            f'"best_path": "go right to avoid chair, then turn left toward arch", '
+            f'"doorway_visible": true}}'
+        )
+        try:
+            raw = self.llm.complete(
+                prompt=prompt,
+                system="You are a visual navigation guide. Respond with JSON only.",
+                image_bytes=frame,
+                max_tokens=150,
+                temperature=0.2,
+            )
+            data = extract_json_dict(raw)
+            if isinstance(data, dict):
+                direction = data.get("direction", "unknown")
+                angle = data.get("angle_deg", 0)
+                obstacles = data.get("obstacles", "none")
+                best_path = data.get("best_path", "drive forward")
+                visible = data.get("doorway_visible", False)
+                guidance = (
+                    f"ORCHESTRATOR VISUAL GUIDANCE: "
+                    f"Target doorway is {direction} (approx {angle}°). "
+                    f"Doorway visible: {visible}. "
+                    f"Obstacles: {obstacles}. "
+                    f"Recommended path: {best_path}."
+                )
+                self.events.publish("plan", f"Visual guidance: {guidance[:120]}")
+                return guidance
+        except Exception as exc:
+            self.events.publish("error", f"Visual guidance failed: {exc}")
+        return ""
+
     def _complete_leg(self, leg, instruction: dict):
         max_attempts = max(1, int(getattr(self.navigator.config, "navigation_leg_attempts", LEG_RETRY_ATTEMPTS)))
         waypoint_budget = max(getattr(self.navigator.config, "navigation_waypoint_budget", 40) * 2, 60)
         attempt_history: list[dict] = []
         last_scene = ""
         last_room_guess = None
-        # Track what each attempt saw so we can give better guidance on retries
         attempt_scenes: list[str] = []
+
+        # Build full route plan text for context
+        route_plan = self.topo.route_summary(
+            self.topo.plan_route(leg.from_room, instruction.get("target_room", leg.to_room)) or []
+        )
+
         for attempt in range(max_attempts):
             if self._stop_event.is_set():
                 return False, last_room_guess, last_scene, {
@@ -317,10 +395,28 @@ class GraphNavigationOrchestrator:
                     "status": "aborted",
                     "attempts": attempt_history,
                 }
-            # Adapt instruction for retries — widen search, add context
+
+            # Give navigator the orchestrator's LLM and route context
+            # so dot confirmation checks strategic value, not just safety
+            self.navigator.orchestrator_llm = self.llm
+            self.navigator._nav_route_context = (
+                f"Route: {route_plan}. Current leg: {leg.from_room} → {leg.to_room} "
+                f"via {leg.transition}."
+            )
+
+            # Orchestrator looks at the camera and provides visual guidance
+            visual_guidance = self._visual_guidance(
+                leg, instruction, route_plan, attempt_scenes)
+
+            # Adapt instruction for retries
             adapted = self._adapt_instruction_for_retry(
                 instruction, attempt, max_attempts, attempt_scenes,
             )
+            # Inject visual guidance into the instruction
+            if visual_guidance:
+                prev_hints = adapted.get("room_nav_hints", "")
+                adapted["room_nav_hints"] = f"{visual_guidance} {prev_hints}".strip()
+
             self.events.publish(
                 "plan",
                 f"Navigator round {attempt + 1}/{max_attempts} for {leg.transition}: "
@@ -483,15 +579,17 @@ class GraphNavigationOrchestrator:
                     score = 40 + len(alias_tokens)
                 if score > best_score:
                     best_score = score
-                    best_room = room.id
+                    best_room = _ra(room, "id")
         return best_room
 
     def _room_aliases(self, room) -> list[str]:
+        rid = _ra(room, "id", "")
+        rlabel = _ra(room, "label", "")
         aliases = {
-            self._normalize_room_text(room.id),
-            self._normalize_room_text(room.label),
-            self._normalize_room_text(room.id.replace("_", " ")),
-            self._normalize_room_text(room.label.replace("_", " ")),
+            self._normalize_room_text(rid),
+            self._normalize_room_text(rlabel),
+            self._normalize_room_text(rid.replace("_", " ")),
+            self._normalize_room_text(rlabel.replace("_", " ")),
         }
         return [alias for alias in aliases if alias]
 
@@ -516,26 +614,21 @@ class GraphNavigationOrchestrator:
                 self.topo.current_confidence = confidence
                 self.events.publish("room", f"Current room (scene): {room} ({confidence:.2f})")
                 return room
-        # Last resort: capture frame and describe scene via LLM
-        frame = self.navigator.camera.snap()
-        if frame is None:
-            return None
+        # Last resort: ask navigator to describe the scene (text only, no image LLM call)
         try:
-            raw = self.llm.complete(
-                prompt=scene_prompt("Identify the room"),
-                system=load_prompt("scene.system.md"),
-                image_bytes=frame,
-                max_tokens=220,
-            )
+            frame = self.navigator.camera.snap()
+            if frame is not None:
+                scene = self.navigator.describe_scene(frame, "Identify the room")
+                if scene:
+                    room, confidence = self._room_check(scene)
+                    if room:
+                        self.topo.current_room = room
+                        self.topo.current_confidence = confidence
+                        self.events.publish("room", f"Current room (scene fallback): {room} ({confidence:.2f})")
+                        return room
         except Exception as exc:
             self.events.publish("error", f"Current-room check failed: {exc}")
-            return None
-        room, confidence = self._room_check(raw)
-        if room:
-            self.topo.current_room = room
-            self.topo.current_confidence = confidence
-            self.events.publish("room", f"Current room (LLM fallback): {room} ({confidence:.2f})")
-        return room
+        return None
 
     def _room_check(self, scene_text: str):
         ranked = room_context.identify_room(scene_text)
@@ -600,7 +693,7 @@ class GraphNavigationOrchestrator:
             transition_id=transition_id,
         )
         self.topo.update_transition_semantics(
-            transition.id,
+            _ra(transition, "id"),
             from_room,
             actual_room,
             doorway_landmarks=doorway_landmarks,

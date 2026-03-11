@@ -10,6 +10,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
+from rover_brain_v2.hardware import bluetooth as bt
 from rover_brain_v2.models import FollowRequest, NavigationRequest
 
 
@@ -163,7 +164,16 @@ DASHBOARD_HTML = """<!doctype html>
       </section>
       <section class="statusbar">
         <div class="stat"><div class="label">Active Mode</div><div class="value" id="statMode">idle</div></div>
-        <div class="stat"><div class="label">Current Room</div><div class="value" id="statRoom">unknown</div></div>
+        <div class="stat" style="cursor:pointer" onclick="showRoomPicker()"><div class="label">Current Room ✎</div><div class="value" id="statRoom">unknown</div></div>
+        <dialog id="roomDialog" style="border-radius:12px;padding:20px;min-width:260px">
+          <h3 style="margin:0 0 12px">Set Current Room</h3>
+          <div id="roomPickList" style="display:flex;flex-direction:column;gap:6px"></div>
+          <div style="margin-top:12px;display:flex;gap:8px">
+            <input id="newRoomInput" placeholder="New room name..." style="flex:1;padding:6px;border-radius:6px;border:1px solid #ccc">
+            <button class="soft" onclick="setRoom(document.getElementById('newRoomInput').value)">Add</button>
+          </div>
+          <button class="soft" onclick="document.getElementById('roomDialog').close()" style="margin-top:12px;width:100%">Cancel</button>
+        </dialog>
         <div class="stat"><div class="label">Audio</div><div class="value" id="statAudio">checking</div></div>
         <div class="stat"><div class="label">Kill Switch</div><div class="value" id="statKill">released</div></div>
       </section>
@@ -278,6 +288,21 @@ DASHBOARD_HTML = """<!doctype html>
         </section>
 
         <section class="panel">
+          <h2>Room Map</h2>
+          <div id="roomMapWrap" style="position:relative;width:100%;height:420px;overflow:hidden;border:1px solid var(--line);border-radius:16px;background:#faf7f2;cursor:grab;touch-action:none">
+            <svg id="roomMapSvg" width="100%" height="100%" style="display:block"></svg>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-top:6px">
+            <div class="subtext" id="roomMapInfo">loading...</div>
+            <div style="display:flex;gap:4px">
+              <button class="soft" style="padding:4px 10px;min-width:0;font-size:13px" onclick="roomMapZoom(1.3)">+</button>
+              <button class="soft" style="padding:4px 10px;min-width:0;font-size:13px" onclick="roomMapZoom(1/1.3)">−</button>
+              <button class="soft" style="padding:4px 10px;min-width:0;font-size:13px" onclick="roomMapReset()">Reset</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
           <h2>LLM Log</h2>
           <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
             <label class="toggle" style="flex:0 0 auto;padding:8px 12px"><span style="font-size:12px">Auto-refresh</span><input id="llmAutoRefresh" type="checkbox" checked></label>
@@ -293,6 +318,16 @@ DASHBOARD_HTML = """<!doctype html>
             <label><div class="subtext">STT</div><select id="stt"></select></label>
             <label><div class="subtext">TTS</div><select id="tts"></select></label>
           </div>
+        </section>
+
+        <section class="panel">
+          <h2>Bluetooth Speaker</h2>
+          <div id="btPaired" style="margin-bottom:8px"></div>
+          <div style="display:flex;gap:8px;margin-bottom:8px">
+            <button class="teal" onclick="btScan()" id="btScanBtn" style="flex:1">Scan</button>
+          </div>
+          <div id="btDevices" style="max-height:200px;overflow:auto"></div>
+          <div class="subtext" id="btStatus" style="margin-top:6px"></div>
         </section>
 
         <section class="panel">
@@ -389,6 +424,36 @@ DASHBOARD_HTML = """<!doctype html>
         button.onclick=()=>post('/api/navigate',{target:'go to '+room.replaceAll('_',' ')});
         wrap.appendChild(button);
       });
+    }
+
+    function showRoomPicker(){
+      const list=document.getElementById('roomPickList');
+      list.innerHTML='';
+      const rooms=lastStatus?.known_rooms||[];
+      const current=lastStatus?.current_room||'';
+      rooms.forEach(room=>{
+        const btn=document.createElement('button');
+        btn.className='soft';
+        btn.style.textAlign='left';
+        btn.innerHTML=(room===current?'● ':'○ ')+room.replaceAll('_',' ');
+        if(room===current)btn.style.fontWeight='bold';
+        btn.onclick=()=>setRoom(room);
+        list.appendChild(btn);
+      });
+      document.getElementById('roomDialog').showModal();
+    }
+
+    async function setRoom(room){
+      if(!room||!room.trim())return;
+      room=room.trim().toLowerCase().replaceAll(' ','_');
+      document.getElementById('roomDialog').close();
+      document.getElementById('statRoom').textContent=room+' (learning...)';
+      const res=await post('/api/set_room',{room});
+      const data=await res.json();
+      if(data.learned_features){
+        document.getElementById('statRoom').textContent=room+' ✓';
+      }
+      setTimeout(refreshStatus,1000);
     }
 
     function bindProviders(providerInfo){
@@ -611,6 +676,82 @@ DASHBOARD_HTML = """<!doctype html>
     refreshLLMLog();
     setInterval(()=>{if(document.getElementById('llmAutoRefresh').checked)refreshLLMLog();},2000);
 
+    // Bluetooth Speaker
+    function _btBtn(label,cls,mac,action){
+      const b=document.createElement('button');
+      b.className=cls;b.style.cssText='padding:4px 8px;font-size:11px;margin-left:4px';
+      b.textContent=label;
+      b.onclick=function(){window['bt'+action](mac);};
+      return b;
+    }
+    async function btRefreshStatus(){
+      try{
+        const res=await post('/api/bt/status',{});
+        const wrap=document.getElementById('btPaired');
+        wrap.innerHTML='';
+        (res.paired||[]).forEach(d=>{
+          const div=document.createElement('div');
+          div.className='pill';
+          const status=d.connected?'connected':'paired';
+          const star=d.preferred?' *':'';
+          div.innerHTML='<strong>'+esc(d.name)+star+'</strong><span class="subtext">'+esc(status)+'</span>';
+          if(d.connected) div.appendChild(_btBtn('Disconnect','soft',d.mac,'Disconnect'));
+          else div.appendChild(_btBtn('Connect','teal',d.mac,'Connect'));
+          div.appendChild(_btBtn('Remove','soft',d.mac,'Remove'));
+          wrap.appendChild(div);
+        });
+        const sink=res.bt_sink;
+        document.getElementById('btStatus').textContent=sink?'Audio sink: '+sink:'No BT audio sink';
+      }catch(e){}
+    }
+    async function btScan(){
+      const btn=document.getElementById('btScanBtn');
+      btn.textContent='Scanning...';btn.disabled=true;
+      try{
+        const res=await post('/api/bt/scan',{duration:8});
+        const wrap=document.getElementById('btDevices');
+        wrap.innerHTML='';
+        (res.devices||[]).forEach(d=>{
+          const div=document.createElement('div');
+          div.className='pill';div.style.marginBottom='4px';
+          if(d.connected){
+            div.innerHTML='<strong>'+esc(d.name)+'</strong><span class="subtext">connected</span>';
+          }else if(d.paired){
+            div.innerHTML='<strong>'+esc(d.name)+'</strong><span class="subtext">paired</span>';
+            div.appendChild(_btBtn('Connect','teal',d.mac,'Connect'));
+          }else{
+            div.innerHTML='<strong>'+esc(d.name)+'</strong><span class="subtext">'+esc(d.mac)+'</span>';
+            div.appendChild(_btBtn('Pair','accent',d.mac,'Pair'));
+          }
+          wrap.appendChild(div);
+        });
+        if(!(res.devices||[]).length) wrap.innerHTML='<div class="subtext">No devices found</div>';
+      }catch(e){}
+      btn.textContent='Scan';btn.disabled=false;
+    }
+    async function btPair(mac){
+      document.getElementById('btStatus').textContent='Pairing '+mac+'...';
+      const res=await post('/api/bt/pair',{mac});
+      document.getElementById('btStatus').textContent=res.connected?'Paired and connected!':'Pair failed';
+      btRefreshStatus();
+    }
+    async function btConnect(mac){
+      document.getElementById('btStatus').textContent='Connecting...';
+      const res=await post('/api/bt/connect',{mac});
+      document.getElementById('btStatus').textContent=res.connected?'Connected!':'Connect failed';
+      btRefreshStatus();
+    }
+    async function btDisconnect(mac){
+      await post('/api/bt/disconnect',{mac});
+      btRefreshStatus();
+    }
+    async function btRemove(mac){
+      if(!confirm('Remove this device?'))return;
+      await post('/api/bt/remove',{mac});
+      btRefreshStatus();
+    }
+    btRefreshStatus();
+
     // Radar / Spatial Map
     const RADAR_COLORS={door:'#1f5d58',wall:'#6c7368',furniture:'#a4552d',open:'#2d8a4e',obstacle:'#9a1f1f',object:'#555',living:'#8b5cf6'};
     const RADAR_SCALE=1.2; // meters per half-radius
@@ -674,6 +815,266 @@ DASHBOARD_HTML = """<!doctype html>
     drawRadar();
     setInterval(drawRadar,1500);
 
+    // ── Room Map (zoomable, pannable, click-to-expand) ──
+    const _rm={layout:null,zoom:1,panX:0,panY:0,dragging:false,dragStart:null,
+      selectedRoom:null,data:null,W:580,H:420};
+    function _rmApplyView(){
+      const svg=document.getElementById('roomMapSvg');
+      const vw=_rm.W/_rm.zoom,vh=_rm.H/_rm.zoom;
+      const vx=-_rm.panX/_rm.zoom+(_rm.W-vw)/2;
+      const vy=-_rm.panY/_rm.zoom+(_rm.H-vh)/2;
+      svg.setAttribute('viewBox',vx+' '+vy+' '+vw+' '+vh);
+    }
+    function roomMapZoom(factor,cx,cy){
+      const oldZ=_rm.zoom;
+      _rm.zoom=Math.max(0.3,Math.min(5,_rm.zoom*factor));
+      if(cx!==undefined&&cy!==undefined){
+        _rm.panX+=(cx-_rm.W/2)*(1-factor)*0.5;
+        _rm.panY+=(cy-_rm.H/2)*(1-factor)*0.5;
+      }
+      _rmApplyView();
+    }
+    function roomMapReset(){_rm.zoom=1;_rm.panX=0;_rm.panY=0;_rm.selectedRoom=null;_rmApplyView();renderRoomMap();}
+    // Wheel zoom
+    document.getElementById('roomMapWrap').addEventListener('wheel',e=>{
+      e.preventDefault();
+      const rect=e.currentTarget.getBoundingClientRect();
+      roomMapZoom(e.deltaY<0?1.15:1/1.15,e.clientX-rect.left,e.clientY-rect.top);
+    },{passive:false});
+    // Pan via drag
+    document.getElementById('roomMapWrap').addEventListener('pointerdown',e=>{
+      if(e.button!==0)return;
+      _rm.dragging=true;_rm.dragStart={x:e.clientX-_rm.panX,y:e.clientY-_rm.panY};
+      e.currentTarget.setPointerCapture(e.pointerId);
+      e.currentTarget.style.cursor='grabbing';
+    });
+    document.getElementById('roomMapWrap').addEventListener('pointermove',e=>{
+      if(!_rm.dragging)return;
+      _rm.panX=e.clientX-_rm.dragStart.x;
+      _rm.panY=e.clientY-_rm.dragStart.y;
+      _rmApplyView();
+    });
+    document.getElementById('roomMapWrap').addEventListener('pointerup',e=>{
+      _rm.dragging=false;
+      e.currentTarget.style.cursor='grab';
+    });
+
+    function _rmClickRoom(roomId){
+      _rm.selectedRoom=_rm.selectedRoom===roomId?null:roomId;
+      renderRoomMap();
+    }
+
+    async function drawRoomMap(){
+      try{
+        const res=await fetch('/api/topo_map');
+        const data=await res.json();
+        if(data.error){document.getElementById('roomMapInfo').textContent=data.error;return;}
+        _rm.data=data;
+        const svg=document.getElementById('roomMapSvg');
+        _rm.W=svg.clientWidth||580;_rm.H=420;
+
+        const nodes=data.nodes||[];
+        const edges=data.edges||[];
+        const rooms=nodes.filter(n=>n.type==='room');
+        const nodeMap={};nodes.forEach(n=>{nodeMap[n.id]=n;});
+
+        // Build room-to-room edges through transitions
+        const roomEdges=[];const seen=new Set();
+        rooms.forEach(r=>{
+          edges.filter(e=>e.a===r.id||e.b===r.id).forEach(e=>{
+            const tId=e.a===r.id?e.b:e.a;const tNode=nodeMap[tId];
+            if(!tNode||tNode.type!=='transition')return;
+            edges.filter(e2=>e2.a===tId||e2.b===tId).forEach(e2=>{
+              const oId=e2.a===tId?e2.b:e2.a;
+              if(oId===r.id)return;const oNode=nodeMap[oId];
+              if(!oNode||oNode.type!=='room')return;
+              const key=[r.id,oId].sort().join('|');
+              if(seen.has(key))return;seen.add(key);
+              roomEdges.push({from:r.id,to:oId,via:tNode});
+            });
+          });
+        });
+        _rm.roomEdges=roomEdges;
+
+        // Force layout (once)
+        if(!_rm.layout||_rm.layout._roomCount!==rooms.length){
+          const pad=90,cx=_rm.W/2,cy=_rm.H/2;
+          const pos={};
+          rooms.forEach((r,i)=>{
+            const a=(2*Math.PI*i)/rooms.length-Math.PI/2;
+            pos[r.id]={x:cx+Math.cos(a)*(_rm.W/2-pad),y:cy+Math.sin(a)*(_rm.H/2-pad)};
+          });
+          const deg={};roomEdges.forEach(re=>{deg[re.from]=(deg[re.from]||0)+1;deg[re.to]=(deg[re.to]||0)+1;});
+          let hub=rooms[0]?.id,hubD=0;
+          for(const[k,v]of Object.entries(deg)){if(v>hubD){hubD=v;hub=k;}}
+          pos[hub]={x:cx,y:cy};
+          const placed=new Set([hub]);
+          const hubE=roomEdges.filter(re=>re.from===hub||re.to===hub);
+          hubE.forEach((re,i)=>{
+            const o=re.from===hub?re.to:re.from;
+            const az=re.via.azimuth_from;
+            let a=(2*Math.PI*i)/hubE.length-Math.PI/2;
+            if(az&&az[hub]!==undefined)a=(az[hub]-90)*Math.PI/180;
+            const dist=Math.min(_rm.W,_rm.H)/2-pad;
+            pos[o]={x:cx+Math.cos(a)*dist,y:cy+Math.sin(a)*dist};placed.add(o);
+          });
+          rooms.forEach(r=>{
+            if(placed.has(r.id))return;
+            const ce=roomEdges.find(re=>re.from===r.id&&placed.has(re.to)||re.to===r.id&&placed.has(re.from));
+            if(ce){const p=ce.from===r.id?ce.to:ce.from;const pp=pos[p];
+              const az=ce.via.azimuth_from;let a=Math.random()*Math.PI*2;
+              if(az&&az[p]!==undefined)a=(az[p]-90)*Math.PI/180;
+              pos[r.id]={x:pp.x+Math.cos(a)*130,y:pp.y+Math.sin(a)*130};}
+            placed.add(r.id);
+          });
+          for(let it=0;it<60;it++){
+            const f={};rooms.forEach(r=>{f[r.id]={x:0,y:0};});
+            for(let i=0;i<rooms.length;i++){
+              for(let j=i+1;j<rooms.length;j++){
+                const a=rooms[i].id,b=rooms[j].id;
+                let dx=pos[b].x-pos[a].x,dy=pos[b].y-pos[a].y;
+                const d=Math.sqrt(dx*dx+dy*dy)||1;
+                if(d<160){const ff=(160-d)*0.3;dx/=d;dy/=d;f[a].x-=dx*ff;f[a].y-=dy*ff;f[b].x+=dx*ff;f[b].y+=dy*ff;}
+              }
+            }
+            roomEdges.forEach(re=>{
+              let dx=pos[re.to].x-pos[re.from].x,dy=pos[re.to].y-pos[re.from].y;
+              const d=Math.sqrt(dx*dx+dy*dy)||1;const ideal=170;
+              if(Math.abs(d-ideal)>10){const ff=(d-ideal)*0.02;dx/=d;dy/=d;
+                f[re.from].x+=dx*ff;f[re.from].y+=dy*ff;f[re.to].x-=dx*ff;f[re.to].y-=dy*ff;}
+            });
+            rooms.forEach(r=>{f[r.id].x+=(cx-pos[r.id].x)*0.01;f[r.id].y+=(cy-pos[r.id].y)*0.01;});
+            rooms.forEach(r=>{
+              if(r.id===hub)return;
+              pos[r.id].x=Math.max(pad,Math.min(_rm.W-pad,pos[r.id].x+f[r.id].x));
+              pos[r.id].y=Math.max(40,Math.min(_rm.H-40,pos[r.id].y+f[r.id].y));
+            });
+          }
+          _rm.layout={pos,hub,_roomCount:rooms.length};
+        }
+        renderRoomMap();
+      }catch(e){document.getElementById('roomMapInfo').textContent='error: '+e.message;}
+    }
+
+    function renderRoomMap(){
+      if(!_rm.data||!_rm.layout)return;
+      const svg=document.getElementById('roomMapSvg');
+      const data=_rm.data,layout=_rm.layout.pos;
+      const nodes=data.nodes||[];const rooms=nodes.filter(n=>n.type==='room');
+      const currentRoom=data.current_room||'';
+      const sel=_rm.selectedRoom;
+      const roomEdges=_rm.roomEdges||[];
+
+      function azLabel(deg){
+        if(deg===undefined||deg===null)return'';const d=parseFloat(deg);
+        if(d>=-20&&d<=20)return'straight';if(d>20&&d<=70)return'slight R';
+        if(d>70&&d<=110)return'right';if(d>110)return'behind R';
+        if(d>=-70&&d<-20)return'slight L';if(d>=-110&&d<-70)return'left';return'behind L';
+      }
+
+      let html='<defs>'+
+        '<marker id="ah" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--teal)"/></marker>'+
+        '<filter id="roomShadow"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-opacity="0.15"/></filter>'+
+        '<filter id="expandGlow"><feDropShadow dx="0" dy="0" stdDeviation="6" flood-color="#a4552d" flood-opacity="0.3"/></filter>'+
+        '</defs>';
+
+      // Edges
+      roomEdges.forEach(re=>{
+        const fp=layout[re.from],tp=layout[re.to];if(!fp||!tp)return;
+        const mx=(fp.x+tp.x)/2,my=(fp.y+tp.y)/2;
+        const dx=tp.x-fp.x,dy=tp.y-fp.y,len=Math.sqrt(dx*dx+dy*dy)||1;
+        const nx=-dy/len,ny=dx/len;
+        const dimmed=sel&&re.from!==sel&&re.to!==sel;
+        const op=dimmed?'0.25':'1';
+        html+='<line x1="'+fp.x+'" y1="'+fp.y+'" x2="'+tp.x+'" y2="'+tp.y+'" stroke="var(--line)" stroke-width="2" stroke-dasharray="6,4" opacity="'+op+'"/>';
+        const ds=7;
+        html+='<polygon points="'+mx+','+(my-ds)+' '+(mx+ds)+','+my+' '+mx+','+(my+ds)+' '+(mx-ds)+','+my+'" fill="var(--teal-soft)" stroke="var(--teal)" stroke-width="1.5" opacity="'+op+'"/>';
+        const label=re.via.label||re.via.id;
+        const shortLabel=label.length>22?label.slice(0,20)+'…':label;
+        html+='<text x="'+(mx+nx*14)+'" y="'+(my+ny*14-4)+'" text-anchor="middle" font-size="9" fill="var(--teal)" font-weight="600" opacity="'+op+'">'+esc(shortLabel)+'</text>';
+        const az=re.via.azimuth_from||{};
+        const aOff=30;
+        if(az[re.from]!==undefined){
+          const ax1=fp.x+dx/len*aOff,ay1=fp.y+dy/len*aOff;
+          const ax2=fp.x+dx/len*(aOff+20),ay2=fp.y+dy/len*(aOff+20);
+          html+='<line x1="'+ax1+'" y1="'+ay1+'" x2="'+ax2+'" y2="'+ay2+'" stroke="var(--teal)" stroke-width="1.5" marker-end="url(#ah)" opacity="'+(dimmed?0.15:0.7)+'"/>';
+          html+='<text x="'+(ax1+nx*10)+'" y="'+(ay1+ny*10)+'" text-anchor="middle" font-size="8" fill="var(--accent)" font-weight="600" opacity="'+op+'">'+azLabel(az[re.from])+'</text>';
+        }
+        if(az[re.to]!==undefined){
+          const ax1=tp.x-dx/len*aOff,ay1=tp.y-dy/len*aOff;
+          const ax2=tp.x-dx/len*(aOff+20),ay2=tp.y-dy/len*(aOff+20);
+          html+='<line x1="'+ax1+'" y1="'+ay1+'" x2="'+ax2+'" y2="'+ay2+'" stroke="var(--teal)" stroke-width="1.5" marker-end="url(#ah)" opacity="'+(dimmed?0.15:0.7)+'"/>';
+          html+='<text x="'+(ax1-nx*10)+'" y="'+(ay1-ny*10)+'" text-anchor="middle" font-size="8" fill="var(--accent)" font-weight="600" opacity="'+op+'">'+azLabel(az[re.to])+'</text>';
+        }
+      });
+
+      // Room nodes
+      rooms.forEach(r=>{
+        const p=layout[r.id];if(!p)return;
+        const isCur=r.id===currentRoom;
+        const isExp=r.id===sel;
+        const dimmed=sel&&!isExp&&!roomEdges.some(re=>(re.from===sel&&re.to===r.id)||(re.to===sel&&re.from===r.id));
+
+        // Expanded room: larger box with full feature list
+        if(isExp){
+          const feats=r.features||[];
+          const lineH=14,padV=16,padH=12;
+          const headerH=38;
+          const boxH=headerH+padV+feats.length*lineH+padV;
+          const boxW=200;
+          const bx=p.x-boxW/2,by=p.y-headerH/2;
+          // Card background
+          html+='<g onclick="_rmClickRoom(\\x27'+r.id+'\\x27)" style="cursor:pointer" filter="url(#expandGlow)">';
+          html+='<rect x="'+bx+'" y="'+by+'" width="'+boxW+'" height="'+boxH+'" rx="14" fill="'+(isCur?'var(--accent)':'#fff')+'" stroke="'+(isCur?'var(--accent-strong)':'var(--teal)')+'" stroke-width="2"/>';
+          // Room name
+          html+='<text x="'+p.x+'" y="'+(by+18)+'" text-anchor="middle" font-size="13" font-weight="700" fill="'+(isCur?'#fff':'var(--ink)')+'">'+esc(r.label||r.id)+'</text>';
+          // Floor type
+          if(r.floor_type){
+            html+='<text x="'+p.x+'" y="'+(by+32)+'" text-anchor="middle" font-size="9" fill="'+(isCur?'rgba(255,255,255,0.7)':'var(--muted)')+'">'+esc(r.floor_type)+'</text>';
+          }
+          // Separator line
+          const sepY=by+headerH;
+          html+='<line x1="'+(bx+8)+'" y1="'+sepY+'" x2="'+(bx+boxW-8)+'" y2="'+sepY+'" stroke="'+(isCur?'rgba(255,255,255,0.3)':'var(--line)')+'" stroke-width="1"/>';
+          // Feature list
+          feats.forEach((f,i)=>{
+            const fy=sepY+padV+i*lineH;
+            const txt=f.length>26?f.slice(0,24)+'…':f;
+            html+='<text x="'+(bx+padH)+'" y="'+fy+'" font-size="10" fill="'+(isCur?'rgba(255,255,255,0.9)':'var(--ink)')+'">'+esc(txt)+'</text>';
+          });
+          // Nav hints
+          if(r.nav_hints){
+            const hy=sepY+padV+feats.length*lineH+6;
+            const hint=r.nav_hints.length>50?r.nav_hints.slice(0,48)+'…':r.nav_hints;
+            html+='<text x="'+(bx+padH)+'" y="'+hy+'" font-size="8" font-style="italic" fill="'+(isCur?'rgba(255,255,255,0.6)':'var(--muted)')+'">'+esc(hint)+'</text>';
+          }
+          html+='</g>';
+        }else{
+          // Normal collapsed room
+          const op=dimmed?'0.3':'1';
+          const rx=68,ry=26;
+          html+='<g onclick="_rmClickRoom(\\x27'+r.id+'\\x27)" style="cursor:pointer" opacity="'+op+'" filter="url(#roomShadow)">';
+          html+='<ellipse cx="'+p.x+'" cy="'+p.y+'" rx="'+rx+'" ry="'+ry+'" fill="'+(isCur?'var(--accent)':'#fff')+'" stroke="'+(isCur?'var(--accent-strong)':'var(--line)')+'" stroke-width="'+(isCur?2.5:1.5)+'"/>';
+          html+='<text x="'+p.x+'" y="'+(p.y-3)+'" text-anchor="middle" font-size="12" font-weight="700" fill="'+(isCur?'#fff':'var(--ink)')+'">'+esc(r.label||r.id)+'</text>';
+          if(r.floor_type){
+            html+='<text x="'+p.x+'" y="'+(p.y+11)+'" text-anchor="middle" font-size="8" fill="'+(isCur?'rgba(255,255,255,0.7)':'var(--muted)')+'">'+esc(r.floor_type)+'</text>';
+          }
+          if(r.features&&r.features.length>0&&!dimmed){
+            const feats=r.features.slice(0,3).join(', ');
+            const short=feats.length>30?feats.slice(0,28)+'…':feats;
+            html+='<text x="'+p.x+'" y="'+(p.y+ry+12)+'" text-anchor="middle" font-size="7" fill="var(--muted)">'+esc(short)+'</text>';
+          }
+          html+='</g>';
+        }
+      });
+
+      svg.innerHTML=html;
+      _rmApplyView();
+      const info=rooms.length+' rooms, '+roomEdges.length+' connections | current: '+(currentRoom||'unknown');
+      document.getElementById('roomMapInfo').textContent=sel?info+' | viewing: '+sel:info;
+    }
+    drawRoomMap();
+    setInterval(drawRoomMap,10000);
+
     refreshStatus();
     refreshTelemetry();
     setInterval(refreshStatus,3000);
@@ -718,7 +1119,7 @@ class RoverWebServer:
                     self._send_json(brain.landmarks())
                     return
                 if self.path == "/api/snap":
-                    frame = brain.camera.get_overlay_jpeg() if brain.flags.yolo_overlay_enabled else brain.camera.get_jpeg()
+                    frame = brain.camera.get_overlay_jpeg() if brain.flags.yolo_overlay_enabled or brain.camera.get_nav_dot() is not None else brain.camera.get_jpeg()
                     if not frame:
                         self.send_error(503)
                         return
@@ -734,7 +1135,7 @@ class RoverWebServer:
                     self.end_headers()
                     try:
                         while True:
-                            frame = brain.camera.get_overlay_jpeg() if brain.flags.yolo_overlay_enabled else brain.camera.get_jpeg()
+                            frame = brain.camera.get_overlay_jpeg() if brain.flags.yolo_overlay_enabled or brain.camera.get_nav_dot() is not None else brain.camera.get_jpeg()
                             if frame:
                                 self.wfile.write(b"--frame\r\n")
                                 self.wfile.write(b"Content-Type: image/jpeg\r\n")
@@ -744,6 +1145,36 @@ class RoverWebServer:
                             time.sleep(0.12)
                     except (BrokenPipeError, ConnectionResetError):
                         return
+                if self.path.startswith("/api/clip_query?"):
+                    query = ""
+                    for part in self.path.split("?", 1)[1].split("&"):
+                        if part.startswith("q="):
+                            from urllib.parse import unquote
+                            query = unquote(part.split("=", 1)[1])
+                    if brain.clip_map and query:
+                        results = brain.clip_map.query(query, top_k=5)
+                        self._send_json({"query": query, "results": results,
+                                         "stats": brain.clip_map.get_stats()})
+                    else:
+                        self._send_json({"error": "CLIP map not available or empty query"})
+                    return
+                if self.path == "/api/clip_stats":
+                    if brain.clip_map:
+                        self._send_json(brain.clip_map.get_stats())
+                    else:
+                        self._send_json({"error": "CLIP map not available"})
+                    return
+                if self.path == "/api/vlm_describe":
+                    if brain.vlm and brain.vlm.is_alive():
+                        frame = brain.camera.get_jpeg()
+                        if frame:
+                            result = brain.vlm.describe_scene(frame)
+                            self._send_json(result)
+                        else:
+                            self._send_json({"error": "No camera frame"})
+                    else:
+                        self._send_json({"error": "VLM server not available"})
+                    return
                 if self.path == "/api/spatial_map":
                     try:
                         arr = brain.navigator.spatial_map.to_array()
@@ -762,6 +1193,20 @@ class RoverWebServer:
                                 except ValueError:
                                     pass
                     self._send_json(brain.llm_log.entries(since_id))
+                    return
+                if self.path == "/api/topo_map":
+                    topo_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "topo_map.json")
+                    try:
+                        with open(topo_path) as f:
+                            topo_data = json.load(f)
+                        # Also include current_room from brain status
+                        try:
+                            topo_data["current_room"] = brain.status().get("room", topo_data.get("current_room", "unknown"))
+                        except Exception:
+                            pass
+                        self._send_json(topo_data)
+                    except FileNotFoundError:
+                        self._send_json({"error": "topo_map.json not found"})
                     return
                 if self.path == "/api/events":
                     self.send_response(200)
@@ -834,6 +1279,14 @@ class RoverWebServer:
                     brain.start_vlm_navigation(data.get("target", ""))
                     self._send_json({"ok": True})
                     return
+                if self.path == "/api/set_room":
+                    room = data.get("room", "").strip().lower().replace(" ", "_")
+                    if room:
+                        result = brain.set_current_room(room)
+                        self._send_json(result)
+                    else:
+                        self._send_json({"error": "no room specified"})
+                    return
                 if self.path == "/api/stop":
                     self._send_json(brain.cancel_active_task())
                     return
@@ -843,6 +1296,55 @@ class RoverWebServer:
                 if self.path == "/api/restart":
                     self._send_json({"ok": True, "restarting": True})
                     threading.Thread(target=self._do_restart, daemon=True).start()
+                    return
+                if self.path == "/api/bt/scan":
+                    devices = bt.scan(duration=int(data.get("duration", 8)))
+                    paired = [d["mac"] for d in bt.paired_devices()]
+                    for d in devices:
+                        d["paired"] = d["mac"] in paired
+                        d["connected"] = bt.is_connected(d["mac"])
+                    self._send_json({"devices": devices})
+                    return
+                if self.path == "/api/bt/pair":
+                    mac = data.get("mac", "").strip()
+                    if not mac:
+                        self._send_json({"error": "missing mac"})
+                        return
+                    result = bt.pair_and_connect(mac)
+                    self._send_json(result)
+                    return
+                if self.path == "/api/bt/connect":
+                    mac = data.get("mac", "").strip()
+                    if not mac:
+                        self._send_json({"error": "missing mac"})
+                        return
+                    result = bt.connect(mac)
+                    self._send_json(result)
+                    return
+                if self.path == "/api/bt/disconnect":
+                    mac = data.get("mac", "").strip()
+                    if not mac:
+                        self._send_json({"error": "missing mac"})
+                        return
+                    result = bt.disconnect(mac)
+                    self._send_json(result)
+                    return
+                if self.path == "/api/bt/remove":
+                    mac = data.get("mac", "").strip()
+                    if not mac:
+                        self._send_json({"error": "missing mac"})
+                        return
+                    result = bt.remove(mac)
+                    self._send_json(result)
+                    return
+                if self.path == "/api/bt/status":
+                    paired = bt.paired_devices()
+                    prefs = bt.load_preferred()
+                    for d in paired:
+                        d["connected"] = bt.is_connected(d["mac"])
+                        d["preferred"] = d["mac"] == prefs.get("mac", "")
+                    sink = bt.get_bt_audio_sink()
+                    self._send_json({"paired": paired, "bt_sink": sink})
                     return
                 self.send_error(404)
 

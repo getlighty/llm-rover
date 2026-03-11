@@ -54,6 +54,9 @@ KNOWN_WIDTHS = {
     "toolbox": 0.40, "tool": 0.15, "screwdriver": 0.03, "drill": 0.15,
     "wheel": 0.15, "robot": 0.30, "speaker": 0.20, "camera": 0.08,
     "blue basket": 0.35,
+    # Door detection classes (from train_door_detector.py)
+    "door-open": 0.90, "door-closed": 0.90, "doorframe": 0.90,
+    "open-door": 0.90, "closed-door": 0.90, "open": 0.90, "closed": 0.90,
 }
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")

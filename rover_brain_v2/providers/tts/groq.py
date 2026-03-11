@@ -33,6 +33,21 @@ class GroqTextToSpeech:
         )
         if not response.ok:
             raise ProviderError(response.text)
+        # Check for Bluetooth audio sink — use paplay if available
+        bt_sink = self._get_bt_sink()
+        if bt_sink:
+            try:
+                proc = subprocess.Popen(
+                    ["sudo", "-u", "jasper", "paplay", "--device", bt_sink,
+                     "--format=s16le", "--channels=1", "--rate=24000"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                proc.communicate(input=response.content, timeout=30)
+            except Exception:
+                pass
+            return
         if mic_card is not None:
             subprocess.run(
                 ["amixer", "-c", str(mic_card), "cset", "numid=2", "off"],
@@ -52,4 +67,18 @@ class GroqTextToSpeech:
                     ["amixer", "-c", str(mic_card), "cset", "numid=2", "on"],
                     capture_output=True,
                 )
+
+    @staticmethod
+    def _get_bt_sink() -> str | None:
+        try:
+            out = subprocess.check_output(
+                ["sudo", "-u", "jasper", "pactl", "list", "sinks", "short"],
+                text=True, timeout=3, stderr=subprocess.DEVNULL,
+            )
+            for line in out.splitlines():
+                if "bluez" in line.lower():
+                    return line.split("\t")[1] if "\t" in line else line.split()[1]
+        except Exception:
+            pass
+        return None
 

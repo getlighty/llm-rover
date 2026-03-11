@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "current_room": "kitchen",
-  "current_confidence": 0.95,
+  "current_room": "office",
+  "current_confidence": 0.9,
   "nodes": [
     {
       "id": "office",
@@ -42,7 +42,9 @@
         "desk area",
         "cables and equipment",
         "warm lighting",
-        "monitor/screen visible"
+        "monitor/screen visible",
+        "desk with monitor",
+        "enclosed workspace"
       ],
       "negative_features": [
         "stove",
@@ -58,12 +60,18 @@
       "entry_landmarks": [
         {
           "landmark": "doorway with yellow walls"
+        },
+        {
+          "landmark": "doorway frame visible from inside"
+        },
+        {
+          "landmark": "transition from wooden floor to hallway flooring"
         }
       ],
       "nav_hints": "Exit is the doorway with bright hallway light behind the desk area. Go around the chair, not through it.",
-      "last_visited": "2026-03-06 22:49",
-      "visit_count": 333,
-      "last_scene": "A home office with hardwood floors, a wooden desk with exposed wiring underneath, and an occupied rolling chair.",
+      "last_visited": "2026-03-10 23:27",
+      "visit_count": 353,
+      "last_scene": "The image shows a person sitting at a desk with a computer monitor and what appears to be an office chair. The setup is characteristic of a workspace or home office.",
       "last_yolo": "office chair(90%), sofa or bed(80%), shelving unit(70%)"
     },
     {
@@ -92,7 +100,20 @@
         "potted plant",
         "wooden door frames",
         "bright ambient lighting",
-        "long corridor layout"
+        "long corridor layout",
+        "orange archway entrance",
+        "potted plant ahead",
+        "orange archway to the right",
+        "dark opening to the left",
+        "long rectangular layout",
+        "orange-painted arch structure",
+        "hard reflective floor surface",
+        "neutral or light-colored walls flanking arch",
+        "potted plant on left side",
+        "narrow rectangular layout",
+        "archway connection to living room",
+        "minimal furniture",
+        "potted plant on left"
       ],
       "negative_features": [
         "desk",
@@ -129,9 +150,9 @@
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-09 12:37",
-      "visit_count": 56,
-      "last_scene": "Crossed threshold onto stone tiles, wooden door frame on left, bright hallway ahead with potted plant visible.",
+      "last_visited": "2026-03-10 22:38",
+      "visit_count": 81,
+      "last_scene": "The image shows a narrow passage with vertical structural elements (possibly pipes or supports) and what appears to be a trash bin, which is more consistent with a utility hallway or storage area rather than an office.",
       "last_yolo": "door(95%), door(90%), doorway(90%), table(80%), basket(70%), chair(70%), plant pot(60%)"
     },
     {
@@ -159,7 +180,17 @@
         "countertops",
         "archway entrance",
         "major appliances",
-        "cabinetry"
+        "cabinetry",
+        "orange archway entrance",
+        "white cabinetry",
+        "countertop appliances",
+        "kitchen counter on left",
+        "appliances along walls",
+        "neutral wall color",
+        "sink fixture",
+        "plant on right wall",
+        "shelf on right wall",
+        "open archway entrance"
       ],
       "negative_features": [
         "desk",
@@ -196,9 +227,9 @@
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-09 18:02",
-      "visit_count": 61,
-      "last_scene": "Inside kitchen, tiled floor visible, appliances nearby",
+      "last_visited": "2026-03-10 17:35",
+      "visit_count": 73,
+      "last_scene": "Inside kitchen, tiled floor, people standing ahead, plant and shelf on right",
       "last_yolo": "legs(32%)"
     },
     {
@@ -255,9 +286,9 @@
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-06 21:52",
-      "visit_count": 52,
-      "last_scene": "A cluttered living area with a couch and basket, viewed from a low angle. Vector scan landmarks: basket 1.5m (size 0.4x0.6m), couch 2.0m (size 1.8x0.9m), legs 1.2m (size 0.1x0.1m). Task context: go to kitchen.",
+      "last_visited": "2026-03-10 23:26",
+      "visit_count": 63,
+      "last_scene": "The image shows a person sitting on what appears to be a sofa or couch, which is typical furniture for a living room. The presence of a television screen and other household items in the background further supports this identification.",
       "last_yolo": "basket(80%), couch(30%), legs(20%)"
     },
     {
@@ -285,9 +316,9 @@
         }
       ],
       "nav_hints": "",
-      "last_visited": "2026-03-06 13:28",
-      "visit_count": 2,
-      "last_scene": "A blurry view of a hallway with a basket and a doorway leading to another room. A close-up view of a robot base and surrounding furniture in a kitchen with red flooring. Vector scan landmarks: robot base 0.5m (size 0.4x0.4m), cabinet 1.0m (size 0.6x0.5m), basket 2.5m (size 0.4x0.3m), toilet 1.2m (si",
+      "last_visited": "2026-03-10 16:17",
+      "visit_count": 3,
+      "last_scene": "The image shows a shower stall and a vanity cabinet, which are typical fixtures found in a bathroom.",
       "last_yolo": "robot base(90%), cabinet(80%), basket(80%), toilet(70%), doorway(70%)"
     }
   ],

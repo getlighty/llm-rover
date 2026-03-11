@@ -8,9 +8,11 @@ import re
 import threading
 import time
 
+from clip_map import CLIPMap, CLIPMapUpdater
 from imu import IMUPoller
 from local_detector import DepthEstimator, LocalDetector
 from place_recognition import PlaceDB
+from vlm_client import VLMClient
 
 from rover_brain_v2.command_mode import GeneralCommandController
 from rover_brain_v2.config import load_config, save_calibration
@@ -118,6 +120,39 @@ class RoverBrainV2:
             flags=self.flags,
             imu=self.imu,
         )
+        # --- CLIP spatial map ---
+        self.clip_map = None
+        self._clip_updater = None
+        try:
+            self.clip_map = CLIPMap(device="cuda")
+            map_path = os.path.join(os.path.dirname(__file__), "..", "clip_map.npz")
+            self.clip_map.load(map_path)
+
+            def _get_pose_for_clip():
+                sm = self.navigator.spatial_map
+                return {
+                    "x": sm._x,
+                    "y": sm._y,
+                    "body_yaw": sm._heading_deg,
+                    "cam_pan": self.navigator._last_gimbal_pan,
+                    "cam_tilt": self.navigator._last_gimbal_tilt,
+                }
+
+            self._clip_updater = CLIPMapUpdater(
+                self.clip_map, self.camera.get_jpeg, _get_pose_for_clip, interval=3.0
+            )
+            self._clip_updater.start()
+            self.events.publish("system", "CLIP spatial map active")
+        except Exception as exc:
+            self.events.publish("error", f"CLIP map unavailable: {exc}")
+
+        # --- Local VLM client (Ollama qwen2.5vl:3b) ---
+        self.vlm = VLMClient()
+        if self.vlm.is_alive():
+            self.events.publish("system", "VLM available (Ollama qwen2.5vl:3b)")
+        else:
+            self.events.publish("system", "VLM unavailable (ollama not running or model missing)")
+
         self._shutdown = threading.Event()
         self._task_lock = threading.Lock()
         self._active_thread: threading.Thread | None = None
@@ -126,6 +161,20 @@ class RoverBrainV2:
         self._voice_thread = threading.Thread(target=self._voice_loop, daemon=True)
         self._voice_thread.start()
         self._apply_detector_policy("idle")
+        # Room verification watchdog — re-checks room visually every 60s
+        self._room_watchdog_thread = threading.Thread(
+            target=self._room_watchdog_loop, daemon=True)
+        self._room_watchdog_thread.start()
+        # Auto-reconnect preferred Bluetooth speaker
+        threading.Thread(target=self._bt_auto_reconnect, daemon=True).start()
+
+    def _bt_auto_reconnect(self):
+        try:
+            from rover_brain_v2.hardware import bluetooth as bt_mod
+            if bt_mod.auto_reconnect():
+                self.events.publish("system", "BT speaker reconnected")
+        except Exception:
+            pass
 
     def refresh_provider_bindings(self):
         bundle = self.providers.bundle()
@@ -194,6 +243,15 @@ class RoverBrainV2:
                 target = "person"
             self.start_follow(FollowRequest(target=target, duration=60.0, target_bw=self.config.follow_target_bw))
             return {"ok": True, "mode": "follow", "target": target}
+        # If navigation is active, don't cancel it for general chatter
+        with self._task_lock:
+            if self._active_mode == "navigation":
+                # Only allow nav-related commands to interrupt navigation
+                if self._looks_like_navigation(text):
+                    pass  # Fall through to start_general_command which will reroute
+                else:
+                    self.events.publish("system", f"Ignoring voice input while navigation is active")
+                    return {"ok": True, "mode": "navigation", "ignored": True}
         # Everything else goes through the LLM
         self.start_general_command(text, speak_allowed=True)
         return {"ok": True, "mode": "general"}
@@ -262,6 +320,147 @@ class RoverBrainV2:
         self.rover.stop()
         self._apply_detector_policy("idle")
         return {"ok": True, "mode": "idle"}
+
+    def _room_watchdog_loop(self):
+        """Background thread that re-verifies the current room every 60s.
+
+        Uses the camera + LLM to visually confirm the room, updating
+        confidence and correcting misidentification. Also detects stalls
+        in active navigation tasks.
+        """
+        import room_context
+        from rover_brain_v2.json_utils import extract_json_dict
+
+        last_check = time.time()
+        last_nav_activity = time.time()
+
+        while not self._shutdown.is_set():
+            time.sleep(5.0)
+
+            now = time.time()
+            # Only check every 60 seconds
+            if now - last_check < 60.0:
+                continue
+            last_check = now
+
+            # Skip if actively navigating (navigator handles its own room checks)
+            if self._active_mode in ("navigation", "follow"):
+                last_nav_activity = now
+                continue
+
+            # Verify room visually
+            try:
+                frame = self.camera.snap(max_dim=512, quality=60)
+                if frame is None:
+                    continue
+
+                current_room = getattr(self.orchestrator.topo, "current_room", "")
+                known_rooms = [
+                    r["id"] if isinstance(r, dict) else r.id
+                    for r in self.orchestrator.topo.rooms()
+                ]
+
+                llm = self.providers.bundle().command_llm
+                raw = llm.complete(
+                    prompt=(
+                        f"Look at this camera image from a ground rover.\n"
+                        f"The rover thinks it is in: '{current_room}'\n"
+                        f"Known rooms: {known_rooms}\n\n"
+                        f"Based on what you see (floor type, furniture, walls, objects), "
+                        f"which room is the rover ACTUALLY in?\n\n"
+                        f"Respond with ONLY JSON:\n"
+                        f'{{"room": "office", "confidence": 0.9, '
+                        f'"reason": "wooden floor, desk with monitors visible"}}'
+                    ),
+                    system="You are a room identification assistant. Respond with JSON only.",
+                    image_bytes=frame,
+                    max_tokens=80,
+                    temperature=0.2,
+                )
+                data = extract_json_dict(raw)
+                if isinstance(data, dict):
+                    detected_room = str(data.get("room", "")).strip().lower().replace(" ", "_")
+                    confidence = float(data.get("confidence", 0.5))
+                    reason = data.get("reason", "")
+
+                    if detected_room and detected_room != current_room and confidence >= 0.7:
+                        self.events.publish("room",
+                            f"Room watchdog: {current_room} → {detected_room} "
+                            f"({confidence:.0%}, {reason})")
+                        self.orchestrator.topo.current_room = detected_room
+                        self.orchestrator.topo.current_confidence = confidence
+                        self.orchestrator._save_topo()
+                        # Learn the room features
+                        room_context.merge_room_observation(
+                            detected_room,
+                            scene_text=reason,
+                            mark_current=True,
+                            confidence=confidence,
+                        )
+                    elif detected_room == current_room:
+                        # Confirmed — boost confidence
+                        self.orchestrator.topo.current_confidence = max(
+                            getattr(self.orchestrator.topo, 'current_confidence', 0.5),
+                            confidence,
+                        )
+            except Exception as exc:
+                self.events.publish("error", f"Room watchdog failed: {exc}")
+
+    def set_current_room(self, room: str) -> dict:
+        """Manually set current room and learn its visual features."""
+        import room_context
+        from rover_brain_v2.json_utils import extract_json_dict
+
+        # Set room in topo state
+        self.orchestrator.topo.current_room = room
+        self.orchestrator.topo.current_confidence = 1.0
+        self.orchestrator._save_topo()
+        self.events.publish("room", f"Current room manually set: {room}")
+
+        # Capture current view and ask LLM to describe what it sees
+        learned_features = []
+        frame = self.camera.snap(max_dim=512, quality=60)
+        if frame is not None:
+            try:
+                llm = self.providers.bundle().command_llm
+                raw = llm.complete(
+                    prompt=(
+                        f"You are in the '{room}' room. Describe the key visual features "
+                        f"you see that identify this room. List 5-8 distinctive objects, "
+                        f"floor type, wall color, furniture, and landmarks.\n\n"
+                        f"Respond with ONLY JSON:\n"
+                        f'{{"features": ["wooden floor", "desk with monitors", "office chair", ...], '
+                        f'"floor": "wooden parquet", '
+                        f'"description": "Home office with desk, monitors, and wooden floor"}}'
+                    ),
+                    system="You are a room identification assistant. Respond with JSON only.",
+                    image_bytes=frame,
+                    max_tokens=200,
+                    temperature=0.2,
+                )
+                data = extract_json_dict(raw)
+                if isinstance(data, dict):
+                    learned_features = data.get("features", [])
+                    floor_type = data.get("floor", "")
+                    description = data.get("description", "")
+                    # Store the learned features in room context
+                    scene_text = f"{description}. Features: {', '.join(learned_features)}. Floor: {floor_type}"
+                    room_context.merge_room_observation(
+                        room,
+                        scene_text=scene_text,
+                        mark_current=True,
+                        confidence=1.0,
+                    )
+                    self.events.publish("room",
+                        f"Learned {room}: {', '.join(learned_features[:5])}")
+            except Exception as exc:
+                self.events.publish("error", f"Room learning failed: {exc}")
+
+        return {
+            "ok": True,
+            "room": room,
+            "learned_features": learned_features,
+        }
 
     def set_killed(self, engage: bool):
         self.flags.killed = bool(engage)
@@ -363,12 +562,14 @@ class RoverBrainV2:
             "active_mode": self._active_mode,
             "detector_mode": self._detector_mode(),
             "current_room": current_room,
-            "known_rooms": [room.id for room in self.orchestrator.topo.rooms()],
+            "known_rooms": [r["id"] if isinstance(r, dict) else r.id for r in self.orchestrator.topo.rooms()],
             "calibration": {
                 "gimbal_pan_center": self.config.gimbal_pan_center,
                 "gimbal_tilt_center": self.config.gimbal_tilt_center,
                 "turn_rate_dps": self.config.turn_rate_dps,
             },
+            "clip_map": self.clip_map.get_stats() if self.clip_map else None,
+            "vlm_alive": self.vlm.is_alive() if self.vlm else False,
         }
 
     def landmarks(self):
@@ -382,6 +583,14 @@ class RoverBrainV2:
     def shutdown(self):
         self._shutdown.set()
         self.cancel_active_task()
+        if self._clip_updater:
+            self._clip_updater.stop()
+        if self.clip_map:
+            try:
+                map_path = os.path.join(os.path.dirname(__file__), "..", "clip_map.npz")
+                self.clip_map.save(map_path)
+            except Exception:
+                pass
         try:
             self.orchestrator.shutdown()
         except Exception:
@@ -406,7 +615,7 @@ class RoverBrainV2:
         if NAV_RE.search(text):
             return True
         lower = text.lower()
-        return any(room.id.replace("_", " ") in lower for room in self.orchestrator.topo.rooms())
+        return any((r["id"] if isinstance(r, dict) else r.id).replace("_", " ") in lower for r in self.orchestrator.topo.rooms())
 
     def _spawn_task(self, mode: str, target, cancel_fn):
         self.cancel_active_task()

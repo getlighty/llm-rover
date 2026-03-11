@@ -176,8 +176,21 @@ class ContinuousNavigator:
 
             self._blocked_since = 0.0
 
-            # ── STEERING: blend LLM bias with depth safety ──
-            target_col = self._pick_steer_column(ds)
+            # ── STEERING: use tracked red dot if available, else LLM bias ──
+            dot = self.camera.get_nav_dot() if hasattr(self.camera, 'get_nav_dot') else None
+            if dot is not None:
+                # Red dot tracked at subpixel precision — convert to column
+                n = self.depth_vectors.num_columns
+                dot_col = int(round(dot[0] * (n - 1)))
+                dot_col = max(0, min(n - 1, dot_col))
+                # Use dot column if passable, otherwise fall back to depth
+                dists = ds.smoothed_distances_m
+                if dists[dot_col] >= PASSABLE_M:
+                    target_col = dot_col
+                else:
+                    target_col = self._pick_steer_column(ds)
+            else:
+                target_col = self._pick_steer_column(ds)
             self._last_steer_col = target_col
 
             # Convert column to steering differential

@@ -243,10 +243,12 @@ class TopoMap:
 
         return []
 
-    def leg_instruction(self, leg):
+    def leg_instruction(self, leg, *, next_leg=None):
         """Build navigation instruction for a single leg.
 
         Returns dict with everything the LLM needs to navigate this leg.
+        If next_leg is provided, includes directional context for where to
+        go after entering the target room.
         """
         t_node = self.nodes.get(leg.transition, {})
         to_node = self.nodes.get(leg.to_room, {})
@@ -286,17 +288,59 @@ class TopoMap:
             if semantic_view.get("confidence"):
                 instruction["relationship_confidence"] = semantic_view["confidence"]
 
+        # Add next-leg direction context so the LLM knows where to go
+        # after entering the target room (prevents wrong turns in hub rooms)
+        if next_leg:
+            next_t_node = self.nodes.get(next_leg.transition, {})
+            next_azimuth = next_t_node.get("azimuth_from", {}).get(leg.to_room)
+            next_label = next_t_node.get("label", next_leg.transition)
+            next_nav_hints = next_t_node.get("nav_hints", "")
+            direction_text = self._azimuth_to_direction(next_azimuth)
+            hint = (
+                f"AFTER entering {leg.to_room}: turn {direction_text} "
+                f"to find '{next_label}' leading to {next_leg.to_room}."
+            )
+            if next_nav_hints:
+                hint += f" {next_nav_hints}"
+            instruction["next_leg_direction"] = hint
+            if next_azimuth is not None:
+                instruction["next_leg_azimuth_deg"] = next_azimuth
+
         return instruction
 
+    @staticmethod
+    def _azimuth_to_direction(azimuth):
+        """Convert azimuth degrees to a human-readable direction word."""
+        if azimuth is None:
+            return "to find"
+        a = float(azimuth)
+        if -20 <= a <= 20:
+            return "STRAIGHT AHEAD"
+        elif 20 < a <= 70:
+            return "SLIGHTLY RIGHT"
+        elif 70 < a <= 110:
+            return "RIGHT"
+        elif a > 110:
+            return "HARD RIGHT / BEHIND-RIGHT"
+        elif -70 <= a < -20:
+            return "SLIGHTLY LEFT"
+        elif -110 <= a < -70:
+            return "LEFT"
+        else:
+            return "HARD LEFT / BEHIND-LEFT"
+
     def route_summary(self, legs):
-        """Human-readable route description."""
+        """Human-readable route description with turn directions."""
         if not legs:
             return "Already there."
         parts = []
-        for leg in legs:
+        for i, leg in enumerate(legs):
             t = self.nodes.get(leg.transition, {})
             label = t.get("label", leg.transition)
-            parts.append(f"{leg.from_room} →[{label}]→ {leg.to_room}")
+            azimuth = t.get("azimuth_from", {}).get(leg.from_room)
+            direction = self._azimuth_to_direction(azimuth) if azimuth is not None else ""
+            dir_tag = f" ({direction})" if direction else ""
+            parts.append(f"{leg.from_room} →[{label}{dir_tag}]→ {leg.to_room}")
         return " | ".join(parts)
 
     def rooms_through(self, transition_id):

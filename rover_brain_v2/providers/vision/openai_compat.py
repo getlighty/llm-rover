@@ -58,4 +58,11 @@ class OpenAICompatVisionClient:
     def _payload(self, **payload):
         if self.name == "groq":
             payload["max_completion_tokens"] = payload.pop("max_tokens")
+        elif self.name == "gemini":
+            # Gemini reasoning models use thinking tokens that count against
+            # max_tokens, so multiply the budget to leave room for output.
+            # Use low reasoning effort for speed (thinking can't be fully
+            # disabled on 3.1 Pro).
+            payload["max_tokens"] = payload["max_tokens"] * 8
+            payload["reasoning_effort"] = "low"
         return payload

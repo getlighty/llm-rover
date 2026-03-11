@@ -5,7 +5,7 @@
   "toilet": "plant pot",
   "bed": "couch",
   "surfboard": "door_frame",
-  "couch": "__false",
+  "couch": "bed",
   "vase": "potted plant",
   "potted plant": "basket",
   "basket": "__false",

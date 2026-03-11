@@ -58,6 +58,23 @@ class LocalSpatialMap:
     def set_step(self, step: int):
         self._step = step
 
+    def add_entry(self, *, label: str, bearing_deg: float, distance_m: float,
+                  feature: str = "obstacle", source: str = "manual"):
+        """Add an entry directly (e.g. from failed drive attempts)."""
+        if not self._merge_nearby(bearing_deg, label, distance_m, self._step,
+                                   threshold_deg=15, source=source):
+            self.entries.append(MapEntry(
+                label=label[:80],
+                bearing_deg=float(bearing_deg),
+                distance_m=float(distance_m),
+                feature=feature,
+                step_observed=self._step,
+                source=source,
+                confidence=0.9,
+            ))
+            if len(self.entries) > MAX_ENTRIES:
+                self.prune()
+
     def on_turn(self, angle_deg: float):
         """Body turned by angle_deg. All bearings shift."""
         self._heading_deg += angle_deg
@@ -158,8 +175,8 @@ class LocalSpatialMap:
             return
         n_cols = len(grid[0])
         floor_rows = grid[4:8]  # Bottom half = floor level
-        # Sample 3 sectors: left, center, right
-        sample_cols = [0, n_cols // 2, n_cols - 1]
+        # Sample all columns for complete coverage
+        sample_cols = list(range(n_cols))
         for col in sample_cols:
             bearing = _norm(gimbal_pan_deg + (col / max(n_cols - 1, 1) - 0.5) * fov_deg)
             vals = [row[col] for row in floor_rows if col < len(row)]
@@ -169,9 +186,14 @@ class LocalSpatialMap:
             self.observe_depth_column(bearing_deg=bearing, distance_m=min_d, step=step)
 
     def prune(self):
-        """Remove stale entries."""
+        """Remove stale entries. Drive-fail obstacles persist longer."""
         cutoff = self._step - STALE_STEPS
-        self.entries = [e for e in self.entries if e.step_observed >= cutoff]
+        long_cutoff = self._step - (STALE_STEPS * 4)  # 56 steps for drive failures
+        self.entries = [
+            e for e in self.entries
+            if e.step_observed >= cutoff
+            or (e.source == "drive_fail" and e.step_observed >= long_cutoff)
+        ]
 
     def to_array(self) -> list[dict]:
         """Return map as sorted array of dicts for the LLM."""

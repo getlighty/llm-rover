@@ -1,4 +1,4 @@
-"""General LLM command execution loop for rover_brain_v2."""
+"""General LLM command execution loop for rover_brain_v2 — tool-based."""
 
 from __future__ import annotations
 
@@ -6,12 +6,15 @@ import threading
 import time
 from pathlib import Path
 
-from rover_brain_v2.json_utils import as_float, extract_json_dict
+from rover_brain_v2.json_utils import as_float, extract_json_dict, clamp
 from rover_brain_v2.models import MotionCommandResult
 from rover_brain_v2.prompts import command_system_prompt, load_prompt
 
 
 MEMORY_FILE = Path(__file__).resolve().parent / "memory.md"
+
+TURN_SPEED = 0.35
+TURN_RATE_DPS = 200.0
 
 
 class GeneralCommandController:
@@ -24,6 +27,8 @@ class GeneralCommandController:
         self.speak = speak_fn
         self._history: list[dict] = []
         self._cancel = threading.Event()
+        self._last_gimbal_pan = 0.0
+        self._last_gimbal_tilt = 0.0
 
     def cancel(self):
         self._cancel.set()
@@ -40,9 +45,7 @@ class GeneralCommandController:
                 return MotionCommandResult(status="cancelled", rounds=rounds)
             frame = self.camera.snap()
             result = self._call_llm(pending_prompt, frame, llm_client)
-            commands = list(result.get("commands", []))
-            if result.get("duration"):
-                self._inject_duration_stop(commands, as_float(result.get("duration"), 0.0))
+            tools = list(result.get("tools") or result.get("commands") or [])
             speak_text = str(result.get("speak", "")).strip()
             remember = str(result.get("remember", "")).strip()
             observe = bool(result.get("observe", False))
@@ -51,14 +54,13 @@ class GeneralCommandController:
                 self.speak(speak_text)
             if remember:
                 self._remember(remember)
-            # If LLM wants to hand off to navigation system
             if navigate:
                 return MotionCommandResult(
                     status="navigate",
                     rounds=rounds,
                     payload=result,
                 )
-            self._execute(commands)
+            self._execute_tools(tools)
             rounds += 1
             if not observe:
                 return MotionCommandResult(
@@ -87,74 +89,115 @@ class GeneralCommandController:
             )
         except Exception as exc:
             self.events.publish("error", f"Command LLM failed: {exc}")
-            raw = '{"commands":[],"speak":"LLM unavailable","observe":false}'
+            raw = '{"tools":[],"speak":"LLM unavailable","observe":false}'
         self.events.publish("llm", raw[:600])
         parsed = extract_json_dict(raw)
         if not isinstance(parsed, dict):
-            parsed = {"commands": [], "speak": "I could not parse that.", "observe": False}
+            parsed = {"tools": [], "speak": "I could not parse that.", "observe": False}
         self._history.append({"role": "user", "content": text})
         self._history.append({"role": "assistant", "content": raw})
         self._history = self._history[-12:]
         return parsed
 
-    def _execute(self, commands: list[dict]):
-        for i, command in enumerate(commands):
+    def _execute_tools(self, tools: list):
+        for tc in tools:
             if self._cancel.is_set():
                 break
-            if not isinstance(command, dict):
+            if not isinstance(tc, dict):
                 continue
-            if "_pause" in command:
-                self._sleep(as_float(command["_pause"], 0.0))
+
+            # Legacy ESP32 raw commands (backwards compat)
+            if "T" in tc and "tool" not in tc:
+                self._execute_raw(tc)
                 continue
-            # Apply gimbal calibration offset
-            if command.get("T") == 133:
-                pc = getattr(self.config, "gimbal_pan_center", 0.0)
-                tc = getattr(self.config, "gimbal_tilt_center", 0.0)
-                command = dict(command, X=round(command.get("X", 0) + pc, 1),
-                               Y=round(command.get("Y", 0) + tc, 1))
-            self.rover.send(command)
-            # Auto-pause between commands unless an explicit _pause follows
-            next_cmd = commands[i + 1] if i + 1 < len(commands) else None
-            has_explicit_pause = isinstance(next_cmd, dict) and "_pause" in next_cmd
-            if not has_explicit_pause:
-                if command.get("T") == 133:
-                    # Gimbal: calculate travel time using servo kinematics
-                    if isinstance(next_cmd, dict) and next_cmd.get("T") == 133:
-                        pause = self._gimbal_travel_time(command, next_cmd)
-                        self._sleep(pause)
-                elif command.get("T") == 1 and (command.get("L", 0) or command.get("R", 0)):
-                    self._sleep(0.5)
+            if "_pause" in tc:
+                self._sleep(as_float(tc["_pause"], 0.0))
+                continue
+
+            tool = str(tc.get("tool", "")).strip().lower()
+
+            if tool == "drive":
+                angle = clamp(as_float(tc.get("angle"), 0), -60, 60)
+                dist = clamp(as_float(tc.get("distance"), 0.3), 0.10, 2.0)
+                speed = clamp(as_float(tc.get("speed"), 0.15), 0.10, 0.25)
+                self._gimbal_center()
+                duration = dist / max(speed, 0.05)
+                steer = clamp(angle / 60.0, -1.0, 1.0) * speed * 0.8
+                self.rover.send({"T": 1, "L": round(speed + steer, 3), "R": round(speed - steer, 3)})
+                self._sleep(duration)
+                self.rover.stop()
+
+            elif tool == "reverse":
+                dist = clamp(as_float(tc.get("distance"), 0.15), 0.10, 0.25)
+                speed = 0.12
+                duration = dist / speed
+                self._gimbal_center()
+                self.rover.send({"T": 1, "L": round(-speed, 3), "R": round(-speed, 3)})
+                self._sleep(duration)
+                self.rover.stop()
+
+            elif tool == "turn_body":
+                degrees = clamp(as_float(tc.get("angle"), 0), -180, 180)
+                self._gimbal_center()
+                self._turn(degrees)
+
+            elif tool == "stop":
+                self.rover.stop()
+
+            elif tool in ("gimbal", "look"):
+                pan = clamp(as_float(tc.get("pan"), 0), -180, 180)
+                tilt = clamp(as_float(tc.get("tilt"), 0), -30, 45)
+                self._gimbal_send(pan, tilt)
+
+            elif tool == "wait":
+                self._sleep(clamp(as_float(tc.get("seconds"), 0.3), 0.05, 3.0))
+
+            elif tool == "lights":
+                base = int(clamp(as_float(tc.get("base"), 0), 0, 255))
+                head = int(clamp(as_float(tc.get("head"), 0), 0, 255))
+                self.rover.send({"T": 132, "IO4": base, "IO5": head})
+
+            elif tool == "oled":
+                line = int(clamp(as_float(tc.get("line"), 0), 0, 3))
+                text = str(tc.get("text", ""))[:16]
+                self.rover.send({"T": 3, "lineNum": line, "Text": text})
+
         self.rover.stop()
 
-    @staticmethod
-    def _gimbal_travel_time(cmd: dict, next_cmd: dict) -> float:
-        """Estimate gimbal travel time based on angle distance and speed.
+    def _execute_raw(self, command: dict):
+        """Execute a legacy raw ESP32 command."""
+        if command.get("T") == 133:
+            pc = getattr(self.config, "gimbal_pan_center", 0.0)
+            tc = getattr(self.config, "gimbal_tilt_center", 0.0)
+            command = dict(command, X=round(command.get("X", 0) + pc, 1),
+                           Y=round(command.get("Y", 0) + tc, 1))
+            self._last_gimbal_pan = command.get("X", 0) - pc
+            self._last_gimbal_tilt = command.get("Y", 0) - tc
+        self.rover.send(command)
 
-        Empirically calibrated: at SPD=600, 180° takes ~0.8s.
-        Base rate ≈ 225 deg/s at SPD=600. Scale proportionally for other speeds.
-        Add 30% safety margin for servo lag and settling.
-        """
-        dx = abs(next_cmd.get("X", 0) - cmd.get("X", 0))
-        dy = abs(next_cmd.get("Y", 0) - cmd.get("Y", 0))
-        distance = max(dx, dy)
-        if distance < 1.0:
-            return 0.05
-        spd = max(cmd.get("SPD", 300), 50)
-        # Empirical rate: ~225 deg/s at SPD=600, scales linearly
-        rate_dps = spd * (225.0 / 600.0)
-        t = distance / rate_dps
-        # 30% safety margin + 0.08s minimum for servo response lag
-        return max(t * 1.3 + 0.08, 0.15)
+    def _gimbal_send(self, pan: float, tilt: float):
+        pc = getattr(self.config, "gimbal_pan_center", 0.0)
+        tc = getattr(self.config, "gimbal_tilt_center", 0.0)
+        self.rover.send({"T": 133, "X": round(pan + pc, 1), "Y": round(tilt + tc, 1),
+                         "SPD": 300, "ACC": 20})
+        self._last_gimbal_pan = pan
+        self._last_gimbal_tilt = tilt
 
-    def _inject_duration_stop(self, commands: list[dict], duration: float):
-        if duration <= 0:
+    def _gimbal_center(self):
+        if abs(self._last_gimbal_pan) > 5 or abs(self._last_gimbal_tilt) > 5:
+            self._gimbal_send(0, 0)
+            self._sleep(0.3)
+
+    def _turn(self, degrees: float):
+        if abs(degrees) < 1:
             return
-        for idx in range(len(commands) - 1, -1, -1):
-            command = commands[idx]
-            if isinstance(command, dict) and command.get("T") == 1 and (command.get("L", 0) or command.get("R", 0)):
-                commands.insert(idx + 1, {"_pause": min(duration, 8.0)})
-                commands.insert(idx + 2, {"T": 1, "L": 0, "R": 0})
-                return
+        sign = 1 if degrees > 0 else -1
+        speed = min(TURN_SPEED, 0.24)
+        rate = TURN_RATE_DPS * (speed / TURN_SPEED)
+        duration = abs(degrees) / max(rate, 60)
+        self.rover.send({"T": 1, "L": round(speed * sign, 3), "R": round(-speed * sign, 3)})
+        self._sleep(duration)
+        self.rover.stop()
 
     def _observe_scene(self, llm_client) -> str:
         frame = self.camera.snap()

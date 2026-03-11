@@ -44,8 +44,14 @@ class LLMCallLog:
 llm_call_log = LLMCallLog()
 
 
+LLM_CALL_TIMEOUT_S = 45  # max seconds for any LLM call
+
+
 class LoggingVLMWrapper:
-    """Wraps a VisionLanguageClient, logging every complete() call."""
+    """Wraps a VisionLanguageClient, logging every complete() call.
+
+    Enforces a hard timeout on all LLM calls to prevent stalls.
+    """
 
     def __init__(self, client, *, role: str = "unknown"):
         self._client = client
@@ -68,17 +74,39 @@ class LoggingVLMWrapper:
         error = ""
         response = ""
         try:
-            response = self._client.complete(
-                prompt=prompt,
-                system=system,
-                image_bytes=image_bytes,
-                history=history,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            # Run LLM call in a thread with hard timeout
+            result_box: list = []
+            error_box: list = []
+
+            def _call():
+                try:
+                    r = self._client.complete(
+                        prompt=prompt,
+                        system=system,
+                        image_bytes=image_bytes,
+                        history=history,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                    result_box.append(r)
+                except Exception as e:
+                    error_box.append(e)
+
+            t = threading.Thread(target=_call, daemon=True)
+            t.start()
+            t.join(timeout=LLM_CALL_TIMEOUT_S)
+
+            if t.is_alive():
+                error = f"LLM call timed out after {LLM_CALL_TIMEOUT_S}s"
+                raise TimeoutError(error)
+            if error_box:
+                error = str(error_box[0])
+                raise error_box[0]
+            response = result_box[0] if result_box else ""
             return response
         except Exception as exc:
-            error = str(exc)
+            if not error:
+                error = str(exc)
             raise
         finally:
             llm_call_log.record(

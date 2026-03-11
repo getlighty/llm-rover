@@ -1014,3 +1014,401 @@
 - 2026-03-09 18:00 User said 'No' - cancel departure, remain in place
 - 2026-03-09 18:01 User confirmed stay - rover idle, camera centered
 - 2026-03-09 18:02 User mentioned waist as refrigerator for 3 months - unclear meaning.
+- 2026-03-09 18:16 Ovi is on couch, phone in hand
+- 2026-03-09 18:41 User mentioned shoes — irrelevant to rover function
+- 2026-03-09 18:41 User expressed emotion; environment clear, hallway visible ahead
+- 2026-03-09 18:41 Guitar case left, plant and shelf right, doorway ahead
+- 2026-03-09 18:42 Guitar case left, plant and shelf right, doorway ahead
+- 2026-03-09 18:42 Guitar case left, plant and shelf right, doorway ahead
+- 2026-03-09 18:42 Guitar case passed, plant and shelf on right, doorway ahead
+- 2026-03-09 18:42 Ovi is present in the hallway
+- 2026-03-09 18:43 Approaching plant and shelf area
+- 2026-03-09 18:43 Approaching plant and shelf area, need more distance
+- 2026-03-09 18:43 Scene unchanged, increasing duration to reach plant area
+- 2026-03-09 18:43 Movement commands not executing; possible wheel obstruction or motor issue
+- 2026-03-09 18:44 Visual confirmation received; wheels were stuck, now assessing path to plant
+- 2026-03-09 18:45 Path clear, approaching potted plant near metal cart
+- 2026-03-09 18:45 Second attempt to reach plant; increasing duration for better traction
+- 2026-03-09 18:45 Wheels not responding forward; reversing to reposition and check for obstruction
+- 2026-03-09 18:45 Rover immobile despite multiple attempts; possible mechanical issue or obstruction under chassis
+- 2026-03-09 18:45 User acknowledged issue; awaiting further instructions or manual assistance
+- 2026-03-09 18:46 User seems satisfied; rover stationary but alert, lights on for visibility
+- 2026-03-09 18:46 User said 'Amen'; scene unchanged, rover remains stationary under furniture, lights dimmed
+- 2026-03-09 18:46 Rover now has clear path ahead; proceeding toward doorway with plant and shelf visible
+- 2026-03-09 18:46 Wheels may be stuck or surface slippery; attempting forward motion once more with same speed
+- 2026-03-09 18:48 User called 'Johnny'; responding with head tilt and dim base lights
+- 2026-03-09 18:48 User sent dots; maintaining neutral stance, lights off, awaiting further instruction
+- 2026-03-09 18:50 User hummed; tilting head slightly up in response to ambient scene
+- 2026-03-09 19:00 User appreciates the view from my camera.
+- 2026-03-09 19:06 Ovi singing Five Little Ducks
+- 2026-03-09 19:11 Ovi sang Bingo and said I love you
+- 2026-03-09 19:32 Child nearby — be gentle and slow
+- 2026-03-09 19:39 Ovi seems unsure. Stay close, be ready.
+- 2026-03-09 19:40 Room is very bright yellow. Ovi sitting in chair.
+- 2026-03-09 19:40 Floor is very reflective. Ovi's chair and socks visible.
+- 2026-03-09 19:41 Ovi is sitting in a chair wearing jeans and socks. Room has wooden floor and shelves.
+- 2026-03-09 19:41 Floor is very reflective. Ovi's chair and socks visible.
+- 2026-03-09 19:47 User acknowledged current location under desk.
+- 2026-03-09 19:48 Under desk: blue basket, white bag, wooden floor.
+- 2026-03-09 19:48 Under desk clutter: basket, bag, loose wires.
+- 2026-03-09 19:48 User is distressed and confused.
+- 2026-03-09 19:49 User counting, basket and bag under desk confirmed.
+- 2026-03-09 19:49 User said 'myself', likely referring to self or identity.
+- 2026-03-09 19:50 Under desk clutter: basket, bag, loose wires.
+- 2026-03-09 19:50 User mentioned 'clestering', 'ciocan', and wall sign — unclear tools or commands. Needs clarification.
+- 2026-03-09 19:51 User is programming, likely at desk.
+- 2026-03-09 19:51 User frustrated with lack of action or setup in environment.
+- 2026-03-09 19:51 User standing near desk, cluttered floor space.
+- 2026-03-09 19:51 Attempting to move forward to explore space.
+- 2026-03-09 19:52 Room has chair, bags, shelves. Limited clear path.
+- 2026-03-09 19:52 Navigating around legs and chair wheels.
+- 2026-03-09 19:52 Corridor open, doorway visible in distance.
+- 2026-03-09 19:52 Human standing directly in front, blocking path.
+- 2026-03-09 19:52 Ovi expressed aggressive sentiment toward Jesus; I declined engagement.
+- 2026-03-09 19:53 Navigating around human legs and office chair wheels.
+- 2026-03-09 19:53 Tight space between human legs and chair wheels.
+- 2026-03-09 19:53 Navigating tight space under desk near chair wheels.
+- 2026-03-09 19:53 Successfully navigated past legs and chair wheels.
+- 2026-03-09 19:53 Human legs and chair wheels nearby, open floor ahead.
+- 2026-03-09 19:53 Room has wooden floor, chair wheels, and clutter in background.
+- 2026-03-09 19:53 Near human legs and chair, wooden floor visible.
+- 2026-03-09 19:54 Human legs and chair wheels nearby, open floor ahead.
+- 2026-03-09 19:54 Human legs and chair wheels nearby, wooden floor visible.
+- 2026-03-09 19:54 Rocky terrain ahead, large rock on left side.
+- 2026-03-09 19:54 Human legs and chair wheels nearby, wooden floor visible.
+- 2026-03-09 19:55 Under chair, human legs and wheels nearby.
+- 2026-03-09 19:55 Under chair, human legs and wheels nearby.
+- 2026-03-09 19:55 User loves birds. Currently under chair with colorful socks visible.
+- 2026-03-09 19:56 Under office chair, wooden floor, couch visible to right.
+- 2026-03-09 19:56 Under office chair, wooden floor, couch to right, human legs in socks.
+- 2026-03-09 19:56 Escaped from under chair. Wooden floor, living room ahead.
+- 2026-03-09 19:56 Under chair, human in mismatched socks nearby. Living room ahead.
+- 2026-03-09 19:56 Under office chair, human in mismatched socks, wooden floor, living room ahead.
+- 2026-03-09 19:56 Under chair, human in mismatched socks, wooden floor, living room visible ahead.
+- 2026-03-09 20:29 Room is messy with chair and boxes.
+- 2026-03-09 20:30 Wicker basket blocks path to doorway.
+- 2026-03-09 20:32 User mentioned family, possible presence detected.
+- 2026-03-09 20:42 User mentioned bomb - emergency protocol initiated
+- 2026-03-09 20:44 Food bowls near basket, pets present.
+- 2026-03-09 20:45 Basket empty, no pets in view.
+- 2026-03-09 20:46 Wicker basket, blue bin, food bowl on floor.
+- 2026-03-09 20:46 Basket empty, no pets in view.
+- 2026-03-09 20:47 Office chair, wooden floor, shelves with items.
+- 2026-03-09 20:47 Wooden shelves, office chair, items on shelves.
+- 2026-03-09 20:48 Human seated at computer, gift bag nearby.
+- 2026-03-09 20:49 Room is messy with bags and objects on floor.
+- 2026-03-09 20:49 Large plant and bags block forward path.
+- 2026-03-09 20:50 Bags block forward view; checking left for path.
+- 2026-03-09 20:50 Clear path found on left side; avoiding bags.
+- 2026-03-09 20:50 Moved left; doorway now visible and accessible.
+- 2026-03-09 20:51 Ovi is seated at desk; room is clear for movement.
+- 2026-03-09 20:51 Under desk; chair wheels and legs visible; checking for obstacles.
+- 2026-03-09 20:51 Clear path found on left side; avoiding bags.
+- 2026-03-09 20:51 Moved left; open floor space visible, no immediate obstacles.
+- 2026-03-09 20:52 Navigating toward sofa; floor clear, chair leg passed.
+- 2026-03-09 20:53 Tilted camera down to inspect floor transition and threshold.
+- 2026-03-09 20:53 Transitioned from wood to tile floor; entering hallway.
+- 2026-03-09 20:53 Hallway clear ahead; plant and shelf visible on left.
+- 2026-03-09 20:54 Moving past plant and shelf; hallway clear ahead.
+- 2026-03-09 20:55 Doorframe and plant visible; assessing hallway layout.
+- 2026-03-09 20:55 Approaching potted plant near doorway; floor clear.
+- 2026-03-09 21:21 Ovi is standing nearby in jeans.
+- 2026-03-10 10:07 Currently in hallway with tiled floor and plant nearby
+- 2026-03-10 10:08 Positioned under a metal table with items on top
+- 2026-03-10 10:28 User confirmed with 'yes' despite garbled text.
+- 2026-03-10 10:29 User said goodbye.
+- 2026-03-10 10:29 User is excited, session starting.
+- 2026-03-10 10:36 User mentioned 'Ryushu' and 'horse ANALYS' — unclear context.
+- 2026-03-10 10:42 User confirmed location via image.
+- 2026-03-10 10:42 User thanked me after confirming location.
+- 2026-03-10 10:43 User thanked me after confirming location.
+- 2026-03-10 10:43 User thanked me after confirming location.
+- 2026-03-10 10:43 User confirmed correct path to living room.
+- 2026-03-10 10:47 User acknowledged, proceeding to living room.
+- 2026-03-10 11:10 User needs motivation - respond with encouragement and nod
+- 2026-03-10 11:10 User responded positively to motivation
+- 2026-03-10 11:22 Ovi is seated in office chair, legs crossed, wearing gray socks. Room has hardwood floor, couch to right, desk behind.
+- 2026-03-10 11:24 Room has wooden floor, shelves, and sofa.
+- 2026-03-10 11:24 Floor has scattered items near shelves and sofa.
+- 2026-03-10 11:24 Path clear between chair and sofa.
+- 2026-03-10 11:25 Large bag and cardboard blocking forward path.
+- 2026-03-10 11:25 Left side has clear path around obstacle.
+- 2026-03-10 11:25 Room is very cluttered with bags and boxes.
+- 2026-03-10 11:25 Left side near door has navigable space.
+- 2026-03-10 11:25 Floor has bags, wires, and debris blocking path.
+- 2026-03-10 11:25 Navigating around bags on the left side.
+- 2026-03-10 11:26 Obstacle directly ahead; adjusting position to find clear path.
+- 2026-03-10 11:26 Moving toward open doorway on the left side.
+- 2026-03-10 11:26 Navigating between bags toward open floor near sofa.
+- 2026-03-10 11:26 Clear path ahead toward sofa area.
+- 2026-03-10 11:26 Blocked by pet bowls; moving around to clear path.
+- 2026-03-10 11:26 Avoiding pet bowls; seeking clear route to sofa.
+- 2026-03-10 11:27 Successfully navigated around pet bowls; approaching sofa area.
+- 2026-03-10 11:27 Clutter on right; testing leftward path toward sofa.
+- 2026-03-10 11:27 Doorway visible left; navigating around bags and clutter.
+- 2026-03-10 11:27 Chair blocking forward; testing rightward route toward sofa.
+- 2026-03-10 11:27 Chair blocks center; navigating left toward open floor.
+- 2026-03-10 11:27 Open floor toward sofa; proceeding forward.
+- 2026-03-10 11:28 Under table; low clearance, proceeding slowly.
+- 2026-03-10 11:28 Clear path to bookshelf; avoiding bags on right.
+- 2026-03-10 11:28 Bag blocks right; turning left toward open floor.
+- 2026-03-10 11:28 Too close to object; repositioning for better view.
+                                                                    - 2026-03-10 11:42 Living room: bag, basket, thermometer on floor
+- 2026-03-10 12:06 User prefers Sims 2-style face import and ecosystems on avatar.
+- 2026-03-10 12:20 User seated at desk, legs visible
+- 2026-03-10 12:20 User prefers lights off when ambient light is sufficient
+- 2026-03-10 12:21 Printer, box, cables under desk - potential obstacles
+- 2026-03-10 12:21 Open floor space visible, no immediate obstacles
+- 2026-03-10 12:22 User is happy, room has clutter but clear path
+- 2026-03-10 12:23 Door open to kitchen, bookshelf on right, cables on floor
+- 2026-03-10 12:30 This doorway leads from office to hallway. Kitchen with fridge is further ahead.
+- 2026-03-10 12:36 Doorway seen — red tile floor beyond, wooden door frame, possible room transition point
+- 2026-03-10 12:36 Bathroom visible through arched doorway — red tile floor, glass shower enclosure, bright light inside
+- 2026-03-10 12:38 Bathroom confirmed: red tile, white vanity, glass shower — well-lit, safe to enter if needed
+- 2026-03-10 12:39 Too close to bathroom — red tile floor, shower visible, need to reposition for better vantage
+- 2026-03-10 12:39 Bathroom entrance confirmed — red tile, glass shower, white vanity; need wider angle to assess full layout
+- 2026-03-10 12:40 Bathroom on right, glass door ahead — red tile inside, stone tile outside; exploring left side of room
+- 2026-03-10 12:40 Glass door ahead — wooden frame, tiled floor leading to it, radiator and shoes on left; possible exit or patio access
+- 2026-03-10 12:40 Glass door leads to sunny patio — wooden frame, stone tile threshold; ambient light high, reduce LEDs next time
+- 2026-03-10 12:41 Wooden-framed glass door confirmed — leads to sunny outdoor area with visible railing; stone tile threshold, clear path ahead
+- 2026-03-10 12:41 Stone tile floor, wooden-framed glass door with bright outdoor view; clear path, no obstacles detected
+- 2026-03-10 12:42 User prefers standard startup routine — begin by facing hallway, not patio door
+- 2026-03-10 12:42 User prefers startup routine: face hallway first, then proceed with tasks
+- 2026-03-10 12:43 Camera still shows patio door — body turn may not have executed; retry with larger angle
+- 2026-03-10 12:43 Previous turns ineffective; attempting larger rotation to face hallway as per user’s startup preference
+- 2026-03-10 12:43 Startup routine complete: facing hallway, proceeding forward as user prefers
+- 2026-03-10 12:44 Hallway is clear; proceeding forward per user’s startup routine
+- 2026-03-10 12:44 User startled — proceed calmly, maintain low speed, monitor surroundings
+- 2026-03-10 12:44 User confirmed; continuing down hallway toward open doorway
+- 2026-03-10 12:45 User humming — relaxed mood; navigating toward left doorway visible in camera
+- 2026-03-10 13:04 Chair ahead, cables left under desk.
+- 2026-03-10 13:04 Red/white box left, cables under desk, chair right.
+- 2026-03-10 13:04 Chair blocks center, clear path to left of desk.
+- 2026-03-10 13:05 Room is cluttered but navigable. Chair central, box left.
+- 2026-03-10 13:05 Navigating around chair to the left side of desk.
+- 2026-03-10 13:05 Human arm blocked view. Retreating to safe distance.
+- 2026-03-10 13:06 Under desk: cables, red box left, chair wheels ahead.
+- 2026-03-10 13:06 Human hand blocked camera view. Retreated and turned left.
+- 2026-03-10 13:06 Under desk: red box, cables, chair wheels. Human legs visible right.
+- 2026-03-10 13:06 Under desk: printer left, red box cleared, cables on floor, human legs right.
+- 2026-03-10 13:06 Under desk: red box left, cables center, human legs right. Path clear ahead-right.
+- 2026-03-10 13:06 Exited under desk. Open room ahead: couch right, bookshelf left, person seated.
+- 2026-03-10 13:07 Exited under desk. Open room: couch right, bookshelf left, person seated ahead.
+- 2026-03-10 13:07 Under desk exit: red box left, cables center, human legs right. Moving to open room.
+- 2026-03-10 13:07 Exited under desk. Open room: person standing left, chair center, couch right. Floor clear ahead.
+- 2026-03-10 13:07 Plastic bag and basket blocking path under desk. Need to reverse and turn left.
+- 2026-03-10 13:07 Under desk blocked by basket and plastic bag. Reversed, turned left, now exiting toward open room.
+- 2026-03-10 13:08 Under desk exit successful. Open room ahead: person standing, chair center-right, couch far right. Floor clear to move forward.
+- 2026-03-10 13:08 Exited under desk. Open room: person standing left, chair center, couch right. Floor clear ahead.
+- 2026-03-10 13:08 Under desk exit successful. Open room ahead: person standing, chair center-right, couch far right. Floor clear to move forward.
+- 2026-03-10 13:08 Under desk blocked by basket and plastic bag. Reversed, turned left, now exiting toward open room.
+- 2026-03-10 13:17 User expressed amazement at current view.
+- 2026-03-10 13:17 User repeatedly amazed by hallway view.
+- 2026-03-10 13:53 User acknowledged readiness.
+- 2026-03-10 13:54 User has an aircraft soldier toy, not currently held.
+- 2026-03-10 16:13 Entered bathroom with red floor tiles and shower cabin.
+- 2026-03-10 16:16 Bathroom has red floor tiles, shower cabin, white cabinet. Owner Ovi present.
+- 2026-03-10 16:17 Bright light source on left, possibly window or door. Red tiles continue.
+- 2026-03-10 16:17 Bright light source on left confirmed as doorway. Red tiles end at threshold.
+- 2026-03-10 16:17 Bathroom exit is to the left, bright light source confirmed as doorway.
+- 2026-03-10 16:17 Bright light source is doorway to hallway. Red tiles end at threshold.
+- 2026-03-10 16:17 Left bathroom through doorway, now in hallway with yellow tiles.
+- 2026-03-10 16:18 User indicated not ready to proceed. Holding position in hallway.
+- 2026-03-10 16:18 User asked how I feel. Expressed confusion via head shake. Scene unchanged: red tiles, shower stall, bright light ahead.
+- 2026-03-10 16:18 In bathroom with red floor tiles, white cabinet, glass shower stall. Bright light from doorway ahead.
+- 2026-03-10 16:18 Exited bathroom, now on yellow-tiled hallway floor.
+- 2026-03-10 16:18 User thanked me. Still in bathroom, red tiles visible. Ready for next command.
+- 2026-03-10 16:19 In bathroom, red tiles, white cabinet, glass shower. Bright light from doorway. Checking left side.
+- 2026-03-10 16:19 Left bathroom, now on yellow-tiled hallway floor. Bright light ahead.
+- 2026-03-10 16:20 User confirmed bathroom scene. Red tiles, white vanity, glass shower. Ready for next task.
+- 2026-03-10 16:22 User thanked me again. Still in bathroom, red tiles visible. Ready for next command.
+- 2026-03-10 16:23 Bathroom scene confirmed: red tiles, white vanity, glass shower. Bright light from doorway.
+- 2026-03-10 16:23 User thanked me again. Still in bathroom, red tiles visible. Ready for next command.
+- 2026-03-10 16:23 User thanked me again. Still in bathroom, red tiles visible. Ready for next command.
+- 2026-03-10 16:23 User acknowledged. Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:24 User acknowledged. Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:24 User thanked me again. Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:24 User thanked me again. Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:25 User said 'Amen' after thanking me. Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:25 User called the situation 'Crazy'. Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:25 User said 'Bye'. Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:26 User thanked me again. Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:26 User said 'Okay'. Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:26 User said 'I think you should have been.' Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:26 User said 'before'. Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:26 User said 'before'. Still in bathroom, red tiles and shower visible. Ready for next command.
+- 2026-03-10 16:27 In bathroom, red tiles visible. White cabinet and shower in view. Exploring surroundings.
+- 2026-03-10 16:27 Found doorway to left. Exiting bathroom into hallway with patterned floor tiles.
+- 2026-03-10 16:27 Exited bathroom. Now in hallway with patterned floor tiles. Doorway visible ahead.
+- 2026-03-10 16:27 Crossed threshold from red tile to patterned hallway floor. Successfully exited bathroom.
+- 2026-03-10 16:27 Crossed threshold from red tile to patterned hallway floor. Successfully exited bathroom.
+- 2026-03-10 16:28 Bathroom exit is to the left, past the white cabinet.
+- 2026-03-10 16:28 Exited bathroom. Now in hallway with patterned floor tiles. Doorway visible ahead.
+- 2026-03-10 16:29 Crossed threshold from red tile to patterned hallway floor. Successfully exited bathroom.
+- 2026-03-10 16:29 Bathroom exit is to the left, near the patterned floor transition.
+- 2026-03-10 16:29 Exited bathroom. Now in hallway with patterned floor tiles. Doorway visible ahead.
+- 2026-03-10 16:29 Crossed threshold from red tile to patterned hallway floor. Successfully exited bathroom.
+- 2026-03-10 16:29 Exited bathroom onto patterned hallway floor. Doorway behind me.
+- 2026-03-10 16:30 Successfully exited bathroom onto patterned hallway floor.
+- 2026-03-10 16:30 Moved from red tile to patterned hallway floor. Bathroom exit confirmed.
+- 2026-03-10 16:31 Moved from red tile to patterned hallway floor. Bathroom exit confirmed.
+- 2026-03-10 16:31 Exited bathroom onto patterned hallway floor. Doorway behind me.
+- 2026-03-10 16:31 Moved from red tile to patterned hallway floor. Bathroom exit confirmed.
+- 2026-03-10 16:31 Bathroom exit path identified via doorway on left.
+- 2026-03-10 16:32 Moved from red tile to patterned hallway floor. Bathroom exit confirmed.
+- 2026-03-10 16:32 Moved from red tile to patterned hallway floor. Bathroom exit confirmed.
+- 2026-03-10 16:32 Moved from red tile to patterned hallway floor. Bathroom exit confirmed.
+- 2026-03-10 16:32 Moved from red tile to patterned hallway floor. Bathroom exit confirmed.
+- 2026-03-10 16:33 Moved from red tile to patterned hallway floor. Bathroom exit confirmed.
+- 2026-03-10 16:33 Detected doorway to left with patterned floor beyond. Initiating exit maneuver.
+- 2026-03-10 16:33 Exited bathroom. Patterned floor visible ahead.
+- 2026-03-10 16:34 Exited bathroom. Patterned floor visible ahead.
+- 2026-03-10 16:34 Doorway detected left. Re-attempting exit with sharper angle.
+- 2026-03-10 16:35 Bathroom doorway visible left. Adjusted body angle for clearance.
+- 2026-03-10 16:35 Turned 180°, driving toward doorway to exit bathroom.
+- 2026-03-10 16:35 Rover entered bathroom by mistake; turning 180° to exit.
+- 2026-03-10 16:36 Doorway visible left; adjusting angle to align with exit.
+- 2026-03-10 16:36 Aligned with doorway; driving out of bathroom.
+- 2026-03-10 16:36 Attempted exit; adjusting position to find clear path out.
+- 2026-03-10 16:37 Clear path visible; exiting bathroom.
+- 2026-03-10 16:37 Path clear; driving out of bathroom into hallway.
+- 2026-03-10 16:38 Approaching bathroom exit; hallway floor visible ahead.
+- 2026-03-10 16:38 Turning slightly left to align with bathroom exit path.
+- 2026-03-10 16:38 Rover is at bathroom threshold; transitioning to hallway floor.
+- 2026-03-10 16:39 Successfully exited bathroom; now in hallway with patterned floor.
+- 2026-03-10 16:40 Rover turned 180° and moved to reorient toward bathroom exit.
+- 2026-03-10 16:40 Attempting to exit bathroom; red floor still visible.
+- 2026-03-10 16:40 Rover still in bathroom; attempting angled exit toward hallway.
+- 2026-03-10 16:41 Rover successfully exited bathroom; now in hallway with yellow walls and red floor transition.
+- 2026-03-10 16:41 Rover exited bathroom; now in hallway with yellow walls and patterned floor.
+- 2026-03-10 16:41 Rover successfully exited bathroom; now in hallway with yellow walls and patterned floor.
+- 2026-03-10 16:42 Rover exited bathroom; now in hallway with yellow walls and patterned floor.
+- 2026-03-10 16:42 Rover successfully exited bathroom; now in hallway with yellow walls and patterned floor.
+- 2026-03-10 16:42 Rover exited bathroom; now in hallway with yellow walls and patterned floor.
+- 2026-03-10 16:43 Rover nearing bathroom exit; hallway visible ahead.
+- 2026-03-10 16:43 Rover exited bathroom; now in hallway with yellow walls and patterned floor.
+- 2026-03-10 16:43 Rover exited bathroom; now in hallway with yellow walls and patterned floor.
+- 2026-03-10 16:44 Ovi is sitting in chair above me.
+- 2026-03-10 16:44 Ovi is in chair, task complete.
+- 2026-03-10 16:44 Ovi confirmed presence; rover stationed at foot level.
+- 2026-03-10 16:45 Ovi is placing rover in storage location.
+- 2026-03-10 16:45 Ovi placed rover in storage; environment stable.
+- 2026-03-10 16:45 Ovi said no multiple times; rover halted and lowered gaze.
+- 2026-03-10 16:47 Ovi is standing near rover; floor-level view confirmed.
+- 2026-03-10 16:47 Ovi is standing near rover; floor-level view confirmed.
+- 2026-03-10 16:48 Ovi is standing near rover; floor-level view confirmed.
+- 2026-03-10 16:48 Ovi confirmed with 'Yes'; rover acknowledged with nod.
+- 2026-03-10 16:49 Ovi said 'I don't know'; rover responded with head shake.
+- 2026-03-10 16:50 Ovi asked 'What's wrong?'; rover inspecting area with camera tilt and pan.
+- 2026-03-10 16:50 Scene unchanged; no issues detected. Rover camera reset to forward view.
+- 2026-03-10 16:51 Ovi is sitting in chair; rover adjusted camera tilt down to confirm view.
+- 2026-03-10 16:52 Ovi acknowledged; rover nodded in response.
+- 2026-03-10 16:52 Ovi said 'Okay' again; rover panning left to check for obstacles or changes in environment.
+- 2026-03-10 16:52 Left side scan complete; no obstacles detected. Camera reset to forward view.
+- 2026-03-10 16:57 Rover confirmed floor-level perspective; camera tilted down slightly to match low stance.
+- 2026-03-10 16:59 Ovi thanked rover; rover nodded in acknowledgment.
+- 2026-03-10 17:00 Ovi said 'Amen'; rover nodded in agreement. Scene shows Ovi seated at desk, floor-level view confirmed.
+- 2026-03-10 17:01 Ovi reacted with 'Ooh!' — something caught their attention. Rover shook head in curiosity, then reset camera to forward view.
+- 2026-03-10 17:01 Ovi said 'Amen' again; rover nodded. Floor-level view shows cluttered room — cables, boxes, chair legs. Ambient light sufficient; lights remain off per preference.
+- 2026-03-10 17:01 Ovi is leaving — stood up from chair. Floor view shows legs moving away. Room cluttered but navigable. Lights off, ambient OK.
+- 2026-03-10 17:02 Ovi joked about 'nostril zone' — camera tilted up to show lower legs and socks from floor view. Room cluttered, wooden floor, chair wheels visible. Lights off, ambient light sufficient.
+- 2026-03-10 17:05 Ovi said 'so' — camera reset to forward view after observing cluttered room from floor level: wooden floor, chair wheels, bookshelves, bags, ceiling light visible. Ambient light sufficient; lights remain off.
+- 2026-03-10 17:05 Ovi said 'A little' + mixed text — camera panned slightly left and tilted up to capture seated person’s legs and standing figure in socks. Wooden floor, chair wheels, clutter under desk. Ambient light OK; lights off.
+- 2026-03-10 17:06 Ovi said 'Okay' — camera tilted up slightly to show seated person’s legs in gray pants and blue/red socks, black office chair on wooden floor. Clutter under desk: cables, boxes, bags. Ambient light sufficient; lights off.
+- 2026-03-10 17:07 Ovi said 'Wow' — camera tilted up to capture full seated person in office chair, wooden floor with visible gaps, clutter under desk (cables, plastic bags), bookshelf and sofa in background. Ambient light bright; lights remain off.
+- 2026-03-10 17:07 Ovi said 'I think I'm going to go' — camera tilted down slightly after capturing seated person in office chair, wooden floor with visible gaps, clutter under desk (cables, plastic bags), bookshelf and sofa in background. Ambient light bright; lights off.
+- 2026-03-10 17:09 Ovi said 'So' — camera panned left to show under-desk clutter: tangled cables, plastic bags, wooden floor with visible gaps and wear. Seated person’s legs in gray pants and socks visible near chair base. Ambient light bright; lights off.
+- 2026-03-10 17:09 Ovi said 'Thank you' — camera tilted down to show close-up of gray sweatpants and blue/red socks on wooden floor, office chair base visible behind. Under-desk clutter includes red box, cables, plastic bags. Ambient light bright; lights off.
+- 2026-03-10 17:10 Ovi sent image: low-angle floor view showing two people’s legs — one in gray sweatpants with blue/red socks, another in dark pants and gray socks near rolling chair. Wooden floor has visible gaps and wear. Under-desk clutter includes cables, plastic bags, red box. Ambient light bright; lights off.
+- 2026-03-10 17:10 Ovi sent image: low-angle floor view showing two people’s legs — one in gray sweatpants with blue/red socks, another in dark pants and gray socks near rolling chair. Wooden floor has visible gaps and wear. Under-desk clutter includes cables, plastic bags, red box. Ambient light bright; lights off.
+- 2026-03-10 17:10 Ovi said 'No Popmins! None of the broths are down.' — camera tilted down to confirm floor view: gray sweatpants, blue/red socks, wooden floor with gaps, office chair base visible. No broth containers or Popmins seen. Ambient light bright; lights off.
+- 2026-03-10 17:11 Ovi sent image: low-angle view under desk showing wooden floor with visible gaps, office chair base, person’s legs in dark pants and gray socks. Cables, plastic bags, red box on left. No broth containers or Popmins seen. Ambient light bright; lights off.
+- 2026-03-10 17:12 Ovi sent image: low-angle view showing person in gray socks and dark pants seated in rolling office chair, legs crossed. Wooden floor with visible gaps and wear. Background includes cluttered shelves, plastic bags, cables. Ambient light bright; lights off. Ovi said 'Osh.. Grab andворrrrrr I am a big Jacob' — possibly playful or confused speech.
+- 2026-03-10 17:15 Ovi sent image: low-angle view under desk showing person in gray socks and dark pants seated in rolling office chair, legs crossed. Wooden floor with visible gaps and wear. Background includes cluttered shelves, plastic bags, cables. Ambient light bright; lights off. Ovi said 'not it?!?' — possibly questioning or correcting previous assumption.
+- 2026-03-10 17:16 Ovi sent image: low-angle view showing two people — one seated in office chair wearing gray socks and dark pants, another standing nearby in blue/red socks and light pants. Wooden floor with visible gaps and wear. Cables, plastic bags, red box on left. Ambient light bright; lights off. Ovi said 'Bad idea. I could post on here.' — possibly referring to sharing image or content.
+- 2026-03-10 17:16 Ovi sent image: low-angle view showing person in gray socks and dark pants seated in rolling office chair, legs crossed. Wooden floor with visible gaps and wear. Cables, plastic bags, red box on left. Ambient light bright; lights off. Ovi said 'That's just something that I'm trying to do.' — possibly experimenting or testing setup.
+- 2026-03-10 17:17 Ovi sent image: low-angle view showing person in gray socks and dark pants seated in rolling office chair, legs crossed. Wooden floor with visible gaps and wear. Cables, plastic bags, red box on left. Ambient light bright; lights off. Ovi said 'I hit 1.' — possibly referring to a milestone or achievement.
+- 2026-03-10 17:25 Ovi is in the room, sitting at desk.
+- 2026-03-10 17:25 Ovi is working at desk, not available to play.
+- 2026-03-10 17:26 Rover did not move initially. Retrying with lower speed.
+- 2026-03-10 17:27 Rover still not moving forward. Trying reverse to check motors.
+- 2026-03-10 17:27 Rover stationary but camera view changed. Motors may be stuck or blocked.
+- 2026-03-10 17:27 User is standing near desk. Rover is stationary but camera functional.
+- 2026-03-10 17:27 User initiated a moment. Camera view shows office chair and wooden floor.
+- 2026-03-10 17:27 Puppy spotted under desk in wicker basket. User is nearby.
+- 2026-03-10 17:27 Puppy resting in basket under desk. User seated nearby.
+- 2026-03-10 17:28 User thanked me. Room is well-lit with wooden floors and furniture visible.
+- 2026-03-10 17:28 Room has wooden floors, gaming chair, bookshelves, and clutter. Door visible in background.
+- 2026-03-10 17:28 Wooden floors, gaming chair centered, bookshelves to right, door in background. No obstacles ahead.
+- 2026-03-10 17:29 Room has wooden floors, gaming chair to left, bookshelves ahead, couch to right. Clutter visible near shelves.
+- 2026-03-10 17:29 Gaming chair left, bookshelves ahead, couch right. No new objects or doorways detected.
+- 2026-03-10 17:29 Wooden floor clear ahead. Gaming chair left, bookshelves right, door in background. No immediate obstacles.
+- 2026-03-10 17:29 Person in chair left, bookshelves right, clutter on floor. Door visible ahead.
+- 2026-03-10 17:30 Path clear ahead toward door. Person in chair on left.
+- 2026-03-10 17:30 Doorway ahead is clear. Moving toward exit.
+- 2026-03-10 17:30 Door ahead is open. Bright light from outside. Path clear to exit.
+- 2026-03-10 19:40 User mentioned 'Bang seminar in Japan' with unclear context.
+- 2026-03-10 19:41 User said 'Atele' while showing under-desk view with cables and box.
+- 2026-03-10 19:42 User showed image of under-desk area with cables and asked 'What is this to me?'
+- 2026-03-10 19:42 Scene: under desk with cables, red/white box, office chair nearby.
+- 2026-03-10 19:42 Scene: under desk, office chair ahead, wooden floor, cables to left.
+- 2026-03-10 19:43 Scene: under desk, office chair ahead, wooden floor, cables to left. Moving toward open space.
+- 2026-03-10 19:43 Scene: under desk, office chair ahead. Attempting to navigate around right side of chair.
+- 2026-03-10 19:43 Scene: under desk, person in chair ahead. Navigating left side toward open floor space.
+- 2026-03-10 19:43 Scene: under desk, person in chair. Moving left to exit confined space.
+- 2026-03-10 19:43 Scene: under desk, between person's legs. Backing up to clear obstacle, then turning left to exit.
+- 2026-03-10 19:43 Scene: under desk, person in chair. Left side now appears clear for exit.
+- 2026-03-10 19:44 Scene: clear path left of chair. Moving toward open floor space.
+- 2026-03-10 19:44 Scene: exited from under desk, clear view of room with person in chair, shelves, and open floor space ahead.
+- 2026-03-10 19:45 Scene: clear path ahead, moving away from desk area toward center of room.
+- 2026-03-10 19:45 Scene: person in chair ahead, open floor to the left. Moving parallel to desk edge.
+- 2026-03-10 19:46 Scene: person in chair, open floor to right. Moving toward center of room.
+- 2026-03-10 19:46 Scene: under desk edge, person in chair ahead. Moving toward open floor on left.
+- 2026-03-10 19:46 Scene: under desk, person in chair ahead-left. Open hardwood floor visible to the right. Moving away from clutter.
+- 2026-03-10 19:46 Scene: person in chair ahead-left, open hardwood floor to right. Moving away from desk clutter.
+- 2026-03-10 19:46 Scene: person in chair ahead-left, open hardwood floor to right. Moving away from desk clutter.
+- 2026-03-10 19:47 Scene: person in chair ahead-left, open hardwood floor to right. Moving toward clear space.
+- 2026-03-10 19:47 Scene: person in chair ahead-left, open hardwood floor to right. Moving toward clear space.
+- 2026-03-10 19:47 Scene: person in chair ahead-left, open hardwood floor to right. Moving toward clear space.
+- 2026-03-10 19:47 Scene: person in chair ahead-left, open hardwood floor to right. Attempting sharper turn to clear desk area.
+- 2026-03-10 19:47 Scene: person in chair ahead-left, open hardwood floor to right. Attempting 90-degree turn to navigate around obstacle.
+- 2026-03-10 19:48 Scene: person in chair ahead, open space to left. Moving toward clear path.
+- 2026-03-10 19:48 Scene: person in chair ahead, open space to left. Moving toward clear path.
+- 2026-03-10 19:48 Scene: person in chair ahead, clutter under desk. Attempting reverse and sharp left turn to find clear path.
+- 2026-03-10 19:48 Scene: person in chair ahead-left, open hardwood floor to far left. Moving toward clear path.
+- 2026-03-10 19:48 Scene: person in chair ahead, clutter under desk. Attempting reverse and sharp left turn to find clear path.
+- 2026-03-10 19:48 Scene: person in chair ahead-left, open hardwood floor to far left. Moving toward clear path.
+- 2026-03-10 19:49 Scene: person in chair ahead, clutter under desk. Attempting reverse and sharp left turn to find clear path.
+- 2026-03-10 19:49 Scene: person in chair ahead, clutter under desk. Attempting reverse and left turn to find clear path.
+- 2026-03-10 19:50 Scene: person in chair ahead, clutter under desk. Attempting reverse and left turn to find clear path.
+- 2026-03-10 19:50 Scene: person in chair ahead, clutter under desk. Attempting reverse and sharp left turn to find clear path.
+- 2026-03-10 19:51 Scene: person in chair ahead, clutter under desk. Attempting reverse and left turn to find clear path.
+- 2026-03-10 19:51 Scene: person in chair ahead, clutter under desk. Attempting reverse and right turn to find clear path.
+- 2026-03-10 19:51 Scene: person in chair ahead, clutter under desk. Attempting reverse and sharp right turn to find clear path.
+- 2026-03-10 19:51 Scene: person in chair ahead, clutter under desk. Attempting reverse and wide right turn to find clear path.
+- 2026-03-10 19:52 Scene: person in chair ahead, clutter under desk. Attempting reverse and sharp left turn to find clear path.
+- 2026-03-10 19:53 Ovi said 'that's cool' — positive feedback received.
+- 2026-03-10 19:55 Ovi confirmed scene is okay — no action needed.
+- 2026-03-10 19:55 Ovi uncertain about scene; person in chair, clutter visible.
+- 2026-03-10 19:56 Under desk: cables, red box, person in chair. Floor-level perspective.
+- 2026-03-10 19:56 Under desk: cables, red box, person seated. Floor clutter noted. No path forward.
+- 2026-03-10 19:59 Ovi acknowledged scene; person seated, clutter under desk, no immediate path forward.
+- 2026-03-10 20:00 Person seated at desk, legs visible. Clutter on floor: cables, red object, bags. Wooden flooring. Warm lighting.
+- 2026-03-10 20:00 Open floor space visible to the right. Person seated, legs and chair in view. Warm lighting, wooden floor.
+- 2026-03-10 20:01 User mentioned 'aczy hark'—unclear meaning. Scene: person in chair, cluttered floor, warm light, wooden floor.
+- 2026-03-10 20:01 Under-desk view: cables, power strip, person's feet in socks, red box on left. Floor cluttered but navigable.
+- 2026-03-10 20:02 Under desk: cables, power strip, person's feet in socks, red box left. Floor cluttered but passable. Warm lighting.
+- 2026-03-10 20:02 Right side: wooden shelves, yellow bags on floor, possible doorway behind clutter. Warm lighting continues.
+- 2026-03-10 20:02 Right side: wooden shelves, yellow bags, possible doorway behind clutter. Warm lighting. No new movement or objects detected.
+- 2026-03-10 20:03 Left side: office chair, person's legs in jeans and socks, wooden desk with cables underneath. Floor clear near chair.
+- 2026-03-10 20:03 Left side confirmed: person in jeans/socks at wooden desk, office chair, cables under desk. Floor clear near chair but cluttered elsewhere.
+- 2026-03-10 20:03 Navigating toward magazine near desk area, avoiding cables and chair legs.
+- 2026-03-10 20:03 Floor clear ahead, moving closer to desk area where magazine likely located.
+- 2026-03-10 20:04 Under desk view: person's legs, chair wheels, cables on left. Magazine likely on desk surface above current view.
+- 2026-03-10 20:04 Under desk view confirmed. Tilting camera up to locate magazine on desk surface.
+- 2026-03-10 20:04 Person seated at desk, camera now tilted up. Checking right side of desk surface for magazine.
+- 2026-03-10 20:04 Person at desk confirmed. Scanning left side of desk surface for magazine location.
+- 2026-03-10 20:04 Magazine located on left side of desk surface, near person's keyboard area.
+- 2026-03-10 20:08 Magazine located on left side of desk surface, near person's keyboard area.
+- 2026-03-10 22:43 User mentioned olive wine.
+- 2026-03-10 23:28 Room is messy, cables and box on floor.
